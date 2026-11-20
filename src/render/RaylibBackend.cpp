@@ -1,0 +1,230 @@
+#include "render/RaylibBackend.h"
+
+#include <unordered_map>
+
+#include "raylib.h"
+
+namespace apex {
+
+namespace {
+
+::Color ToRaylib(const Color& c) {
+    return {static_cast<unsigned char>(Clampf(c.r, 0.f, 1.f) * 255.f),
+            static_cast<unsigned char>(Clampf(c.g, 0.f, 1.f) * 255.f),
+            static_cast<unsigned char>(Clampf(c.b, 0.f, 1.f) * 255.f),
+            static_cast<unsigned char>(Clampf(c.a, 0.f, 1.f) * 255.f)};
+}
+
+Vector3 ToRaylib(const Vec3& v) { return {v.x, v.y, v.z}; }
+
+// Minimal Win32 query (avoids including windows.h): raylib's InitWindow aborts
+// when the requested window does not fit any monitor, so clamp to the screen.
+extern "C" __declspec(dllimport) int __stdcall GetSystemMetrics(int nIndex);
+constexpr int kSmCxScreen = 0;
+constexpr int kSmCyScreen = 1;
+
+}  // namespace
+
+struct RaylibBackend::Impl {
+    ::Camera3D camera{};
+    std::unordered_map<MeshHandle, ::Mesh> meshes;
+    std::unordered_map<MeshHandle, ::Model> models;
+    MeshHandle nextMesh = 1;
+};
+
+RaylibBackend::~RaylibBackend() {
+    Shutdown();
+}
+
+bool RaylibBackend::Init(int width, int height, const std::string& title) {
+    if (impl_) return true;
+    SetTraceLogLevel(LOG_WARNING);
+    // Clamp to the visible screen: raylib's InitWindow terminates GLFW when the
+    // window does not fit any monitor ("Failed to determine Monitor to center").
+    width = std::min(width, GetSystemMetrics(kSmCxScreen) - 40);
+    height = std::min(height, GetSystemMetrics(kSmCyScreen) - 90);  // title bar + taskbar
+    InitWindow(width, height, title.c_str());
+    if (!IsWindowReady()) return false;
+    SetTargetFPS(0);  // uncapped; fixed-step physics is decoupled from render
+    impl_ = new Impl();
+    impl_->camera.position = {0.f, 8.f, -12.f};
+    impl_->camera.target = {0.f, 0.f, 0.f};
+    impl_->camera.up = {0.f, 1.f, 0.f};
+    impl_->camera.fovy = 65.f;
+    impl_->camera.projection = CAMERA_PERSPECTIVE;
+    return true;
+}
+
+void RaylibBackend::Shutdown() {
+    if (!impl_) return;
+    for (auto& [handle, model] : impl_->models) UnloadModel(model);
+    impl_->models.clear();
+    // Meshes owned by models are freed by UnloadModel; standalone meshes that
+    // never became models must be freed explicitly.
+    for (auto& [handle, mesh] : impl_->meshes) {
+        if (impl_->models.find(handle) == impl_->models.end()) UnloadMesh(mesh);
+    }
+    impl_->meshes.clear();
+    delete impl_;
+    impl_ = nullptr;
+    if (IsWindowReady()) CloseWindow();
+}
+
+bool RaylibBackend::ShouldClose() const {
+    return ::WindowShouldClose();
+}
+
+void RaylibBackend::BeginFrame() {
+    ::BeginDrawing();
+    ::ClearBackground({24, 26, 32, 255});
+}
+
+void RaylibBackend::BeginScene() {
+    ::BeginMode3D(impl_->camera);
+}
+
+void RaylibBackend::EndScene() {
+    ::EndMode3D();
+}
+
+void RaylibBackend::EndFrame() {
+    ::EndDrawing();
+}
+
+void RaylibBackend::SetCamera(const CameraDesc& camera) {
+    impl_->camera.position = ToRaylib(camera.position);
+    impl_->camera.target = ToRaylib(camera.target);
+    impl_->camera.up = ToRaylib(camera.up);
+    impl_->camera.fovy = camera.fovYDeg;
+}
+
+int RaylibBackend::ScreenWidth() const { return ::GetScreenWidth(); }
+int RaylibBackend::ScreenHeight() const { return ::GetScreenHeight(); }
+
+MeshHandle RaylibBackend::CreateMesh(const MeshData& data) {
+    ::Mesh mesh{};
+    mesh.vertexCount = static_cast<int>(data.positions.size());
+    mesh.triangleCount = static_cast<int>(data.indices.size() / 3);
+
+    mesh.vertices = static_cast<float*>(MemAlloc(mesh.vertexCount * 3 * sizeof(float)));
+    for (int i = 0; i < mesh.vertexCount; ++i) {
+        mesh.vertices[i * 3 + 0] = data.positions[i].x;
+        mesh.vertices[i * 3 + 1] = data.positions[i].y;
+        mesh.vertices[i * 3 + 2] = data.positions[i].z;
+    }
+
+    if (!data.normals.empty()) {
+        mesh.normals = static_cast<float*>(MemAlloc(mesh.vertexCount * 3 * sizeof(float)));
+        for (int i = 0; i < mesh.vertexCount; ++i) {
+            mesh.normals[i * 3 + 0] = data.normals[i].x;
+            mesh.normals[i * 3 + 1] = data.normals[i].y;
+            mesh.normals[i * 3 + 2] = data.normals[i].z;
+        }
+    }
+
+    if (!data.uvs.empty()) {
+        mesh.texcoords = static_cast<float*>(MemAlloc(mesh.vertexCount * 2 * sizeof(float)));
+        for (int i = 0; i < mesh.vertexCount * 2; ++i) mesh.texcoords[i] = data.uvs[i];
+    }
+
+    mesh.indices = static_cast<unsigned short*>(MemAlloc(data.indices.size() * sizeof(unsigned short)));
+    for (size_t i = 0; i < data.indices.size(); ++i) {
+        mesh.indices[i] = static_cast<unsigned short>(data.indices[i]);
+    }
+
+    UploadMesh(&mesh, false);
+
+    ::Model model = LoadModelFromMesh(mesh);
+    const MeshHandle handle = impl_->nextMesh++;
+    impl_->models[handle] = model;
+    return handle;
+}
+
+void RaylibBackend::DestroyMesh(MeshHandle handle) {
+    const auto it = impl_->models.find(handle);
+    if (it == impl_->models.end()) return;
+    UnloadModel(it->second);
+    impl_->models.erase(it);
+}
+
+void RaylibBackend::DrawMesh(MeshHandle handle, const Transform& transform, const Color& tint) {
+    const auto it = impl_->models.find(handle);
+    if (it == impl_->models.end()) return;
+    ::Model& model = it->second;
+
+    // Rebuild the model matrix from our transform each draw. Columns are the
+    // rotated basis vectors (raylib Matrix is column-major, m0..m15 row text).
+    const Quat& q = transform.rotation;
+    const float x = q.x, y = q.y, z = q.z, w = q.w;
+    model.transform = {
+        1.f - 2.f * (y * y + z * z), 2.f * (x * y + z * w), 2.f * (x * z - y * w), 0.f,
+        2.f * (x * y - z * w), 1.f - 2.f * (x * x + z * z), 2.f * (y * z + x * w), 0.f,
+        2.f * (x * z + y * w), 2.f * (y * z - x * w), 1.f - 2.f * (x * x + y * y), 0.f,
+        transform.position.x, transform.position.y, transform.position.z, 1.f};
+    DrawModel(model, {0.f, 0.f, 0.f}, 1.f, ToRaylib(tint));
+    // Restore identity so the next frame's transform starts clean.
+    model.transform = {1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f,
+                       0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f};
+}
+
+void RaylibBackend::DrawBox(const Vec3& halfExtents, const Transform& transform, const Color& color) {
+    // DrawCubeV is axis-aligned; use a wire cube rotated via DrawCubeWiresV
+    // approximation: draw the box in local space by transforming the center
+    // and using raylib's rotated cube through a temporary model-free path.
+    const Vec3 world = transform.position;
+    DrawCubeV(ToRaylib(world), {halfExtents.x * 2.f, halfExtents.y * 2.f, halfExtents.z * 2.f},
+              ToRaylib(color));
+}
+
+void RaylibBackend::DrawLine3D(const Vec3& start, const Vec3& end, const Color& color) {
+    ::DrawLine3D(ToRaylib(start), ToRaylib(end), ToRaylib(color));
+}
+
+void RaylibBackend::DrawGrid(int slices, float spacing) {
+    ::DrawGrid(slices, spacing);
+}
+
+void RaylibBackend::DrawRect2D(float x, float y, float w, float h, const Color& color) {
+    ::DrawRectangle(static_cast<int>(x), static_cast<int>(y), static_cast<int>(w),
+                    static_cast<int>(h), ToRaylib(color));
+}
+
+void RaylibBackend::DrawText2D(const std::string& text, float x, float y, int size, const Color& color) {
+    ::DrawText(text.c_str(), static_cast<int>(x), static_cast<int>(y), size, ToRaylib(color));
+}
+
+Vec2f RaylibBackend::MeasureText2D(const std::string& text, int size) const {
+    return {static_cast<float>(::MeasureText(text.c_str(), size)), static_cast<float>(size)};
+}
+
+double RaylibBackend::TimeSeconds() const { return ::GetTime(); }
+float RaylibBackend::FrameTime() const { return ::GetFrameTime(); }
+
+void RaylibBackend::CaptureScreenshot(const std::string& path) {
+    ::TakeScreenshot(path.c_str());
+}
+
+InputState RaylibBackend::Poll() {
+    InputState state;
+
+    const bool forward = IsKeyDown(KEY_W) || IsKeyDown(KEY_UP);
+    const bool back = IsKeyDown(KEY_S) || IsKeyDown(KEY_DOWN);
+    const bool left = IsKeyDown(KEY_A) || IsKeyDown(KEY_LEFT);
+    const bool right = IsKeyDown(KEY_D) || IsKeyDown(KEY_RIGHT);
+
+    state.throttle = forward ? 1.f : 0.f;
+    state.brake = back ? 1.f : 0.f;
+    state.steer = (right ? 1.f : 0.f) - (left ? 1.f : 0.f);
+    state.handbrake = IsKeyDown(KEY_SPACE);
+    state.reverse = IsKeyDown(KEY_R);
+    state.drsToggle = IsKeyPressed(KEY_F);
+    state.wingModeToggle = IsKeyPressed(KEY_V);
+    state.overtake = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+    state.cameraCycle = IsKeyPressed(KEY_C);
+    state.pause = IsKeyPressed(KEY_ESCAPE) || IsKeyPressed(KEY_P);
+    state.restart = IsKeyPressed(KEY_ENTER);
+    state.lookBack = IsKeyDown(KEY_B);
+    return state;
+}
+
+}  // namespace apex
