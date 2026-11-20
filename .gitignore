@@ -1,0 +1,12 @@
+build/
+out/
+dist/
+.vs/
+*.user
+*.suo
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.log
+config.ini
