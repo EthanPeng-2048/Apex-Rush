@@ -196,8 +196,13 @@ void Vehicle::Update(const VehicleInput& input, float dt) {
     // the geometric right side is -X and a right turn is a NEGATIVE yaw around
     // +Y. `in.steer` is defined as positive = steer right, hence the sign.
     const float speedNow = state_.speed;
-    const float steerRange =
-        21.f * kDegToRad / (1.f + 0.032f * speedNow + 0.0018f * speedNow * speedNow);
+    // Playable calibration: max wheel angle = 0.95x the grip envelope
+    // (delta_limit(v) = L * a_max(v) / v^2, a_max grows with downforce).
+    // Full lock sits AT the controllable edge instead of 1.3-1.5x beyond it —
+    // past the edge every keyboard input was a spin lottery. Slides still
+    // happen via throttle/handbrake/grass, never via gently holding a key.
+    const float steerRange = std::min(
+        21.f * kDegToRad, (2783.f / (speedNow * speedNow + 1.f) + 0.77f) * kDegToRad);
     const float steerTarget = -in.steer * steerRange;
     const float tau = std::fabs(steerTarget) < std::fabs(steerAngle_)
                           ? 0.11f
@@ -500,19 +505,19 @@ void Vehicle::UpdateAssists(VehicleInput& input) {
         }
     }
 
-    // ESC: counter-steer only when the car rotates faster than the steering
-    // asks for (bicycle-model reference yaw = v * tan(steer) / wheelbase).
-    // Never add steering on understeer: the old reference scaled with
-    // v * input and was ~10x too large at speed, so its "yaw deficit" kept
-    // ratcheting the wheel toward full lock on a straight and spun the car.
+    // ESC: stability assist — catches genuine oversteer with real
+    // counter-steer so a slide is recoverable. Acts only when yaw exceeds the
+    // bicycle-model reference AND the body is actually sliding; normal
+    // turn-in yaw overshoot must not kick the wheel ("sudden slides" feel).
+    // Never adds steering on understeer.
     if (params_.escLevel > 0.f && !input.handbrake) {
         const Vec3 angVel = world_->GetAngularVelocity(chassis_);
         const float yawRate = Dot(angVel, Vec3{0.f, 1.f, 0.f});
         const float yawRef = forwardSpeed * std::tan(steerAngle_) / params_.wheelbase;
         const float excess = std::fabs(yawRate) - std::fabs(yawRef);
-        if (excess > 0.35f) {
+        if (excess > 0.45f && std::fabs(lateralSpeed) > 2.f) {
             const float correction =
-                Clampf((yawRate - yawRef) * 0.22f * params_.escLevel, -0.32f, 0.32f);
+                Clampf((yawRate - yawRef) * 0.4f * params_.escLevel, -0.5f, 0.5f);
             input.steer = Clampf(input.steer + correction, -1.f, 1.f);
         }
     }
