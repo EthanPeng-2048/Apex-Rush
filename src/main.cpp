@@ -4,6 +4,7 @@
 #include <cstring>
 #include <string>
 
+#include "audio/MiniaudioAudio.h"
 #include "core/Config.h"
 #include "game/Game.h"
 #include "physics/Qu3eWorld.h"
@@ -569,7 +570,14 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    Game game(backend, backend, config);
+    // Interactive runs get sound (miniaudio: WASAPI/DirectSound on Windows).
+    // Tests and CLI capture paths stay silent and headless.
+    MiniaudioAudio audio;
+    if (!audio.Init(config.GetString("audio", "backend", "auto").c_str())) {
+        std::fprintf(stderr, "audio: device init failed, running silent\n");
+    }
+
+    Game game(backend, backend, config, &audio);
     if (!game.Init()) {
         backend.Shutdown();
         return 1;

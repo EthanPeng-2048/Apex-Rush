@@ -94,8 +94,8 @@ std::string Pad(const std::string& s, size_t width) {
 
 }  // namespace
 
-Game::Game(IRenderer& renderer, IInput& input, Config& config)
-    : renderer_(renderer), input_(input), config_(config) {}
+Game::Game(IRenderer& renderer, IInput& input, Config& config, IAudio* audio)
+    : renderer_(renderer), input_(input), config_(config), audio_(audio) {}
 
 bool Game::Init() {
     StartRace();
@@ -131,6 +131,12 @@ void Game::LoadSettings() {
     // Physics tick rate (fixed step).
     const int hz = std::clamp(config_.GetInt("physics", "hz", 240), 60, 1000);
     fixedDt_ = 1.f / static_cast<float>(hz);
+
+    // Audio volume / backend.
+    if (audio_) {
+        audio_->SetMasterVolume(std::clamp(config_.GetInt("audio", "volume", 80), 0, 100) / 100.f);
+        audio_->SetBackend(config_.GetString("audio", "backend", "auto").c_str());
+    }
 }
 
 void Game::SpawnRacers() {
@@ -212,6 +218,22 @@ void Game::Update() {
 
     UpdateCamera(frameDt);
     if (statusTimer_ > 0.f) statusTimer_ -= frameDt;
+
+    // Feed the audio engine with player telemetry (engine / wind / skid).
+    if (audio_ && !racers_.empty()) {
+        const VehicleState& s = racers_.front().vehicle.State();
+        AudioState audioState;
+        audioState.engineRpm = s.rpm;
+        audioState.engineLoad = s.throttle;
+        audioState.speed = s.speed;
+        for (const WheelState& wheel : s.wheels) {
+            const float slip = std::max(std::fabs(wheel.slipRatio) * 1.8f,
+                                        std::fabs(wheel.slipAngleDeg) / 18.f);
+            audioState.skid = std::max(audioState.skid, slip);
+        }
+        audioState.skid = Clampf(audioState.skid, 0.f, 1.f);
+        audio_->Update(audioState);
+    }
 }
 
 void Game::Render3D() {
@@ -399,6 +421,17 @@ void Game::StepPhysics(float dt) {
     const std::vector<ContactEvent> contacts = world_->DrainContacts();
     for (Racer& racer : racers_) {
         racer.vehicle.ProcessContacts(contacts, dt);
+    }
+
+    // Collision thump for the player's car.
+    if (audio_ && !racers_.empty()) {
+        const BodyHandle playerBody = racers_.front().vehicle.Chassis();
+        for (const ContactEvent& event : contacts) {
+            if (event.bodyA != playerBody && event.bodyB != playerBody) continue;
+            if (event.impactSpeed > 1.5f) {
+                audio_->PlayImpact(Clampf((event.impactSpeed - 1.5f) / 10.f, 0.f, 1.f));
+            }
+        }
     }
 }
 
@@ -651,6 +684,7 @@ void Game::RenderHUD() {
 
 void Game::UpdateMenu() {
     const InputState& in = rawInput_;
+    if (audio_ && (in.menuUp || in.menuDown || in.menuSelect)) audio_->PlayUIClick();
     if (in.menuUp) menuCursor_ = (menuCursor_ + 2) % 3;
     if (in.menuDown) menuCursor_ = (menuCursor_ + 1) % 3;
     if (in.menuSelect) {
@@ -673,6 +707,9 @@ void Game::UpdateMenu() {
 void Game::UpdateSettings() {
     constexpr int kRows = kSettingsRowCount;
     const InputState& in = rawInput_;
+    if (audio_ && (in.menuUp || in.menuDown || in.menuLeft || in.menuRight || in.menuSelect)) {
+        audio_->PlayUIClick();
+    }
     if (in.menuUp) settingsCursor_ = (settingsCursor_ + kRows - 1) % kRows;
     if (in.menuDown) settingsCursor_ = (settingsCursor_ + 1) % kRows;
 
@@ -774,7 +811,7 @@ void Game::UpdateSettings() {
             renderer_.ApplyVideo(video_);
             break;
         }
-        default: {
+        case 12: {
             const int hz = static_cast<int>(1.f / fixedDt_ + 0.5f);
             int idx = 1;
             for (int i = 0; i < kPhysicsPresetCount; ++i) {
@@ -783,6 +820,26 @@ void Game::UpdateSettings() {
             idx = CyclePreset(idx, kPhysicsPresetCount, dir);
             fixedDt_ = 1.f / static_cast<float>(kPhysicsPresets[idx]);
             config_.SetString("physics", "hz", std::to_string(kPhysicsPresets[idx]));
+            break;
+        }
+        case 13: {
+            const int volume =
+                std::clamp(config_.GetInt("audio", "volume", 80) + (dir != 0 ? (dir > 0 ? 20 : -20) : 20),
+                           0, 100);
+            config_.SetString("audio", "volume", std::to_string(volume));
+            if (audio_) audio_->SetMasterVolume(volume / 100.f);
+            break;
+        }
+        default: {
+            static const char* kAudioBackends[4] = {"auto", "wasapi", "directsound", "winmm"};
+            const std::string current = config_.GetString("audio", "backend", "auto");
+            int idx = 0;
+            for (int i = 0; i < 4; ++i) {
+                if (current == kAudioBackends[i]) idx = i;
+            }
+            idx = CyclePreset(idx, 4, dir);
+            config_.SetString("audio", "backend", kAudioBackends[idx]);
+            if (audio_) audio_->SetBackend(kAudioBackends[idx]);
             break;
         }
     }
@@ -847,10 +904,12 @@ void Game::RenderSettings() {
         {"QUALITY", video_.shadows ? "HIGH" : "LOW"},
         {"FPS LIMIT", video_.fpsLimit > 0 ? std::to_string(video_.fpsLimit) : "UNCAPPED"},
         {"PHYSICS RATE", std::to_string(physicsHz) + " HZ"},
+        {"SOUND VOLUME", std::to_string(config_.GetInt("audio", "volume", 80))},
+        {"AUDIO BACKEND", MapDisplayName(config_.GetString("audio", "backend", "auto"))},
         {"BACK", ""},
     };
 
-    // 14 rows fit 720p by shrinking the row height when needed.
+    // 16 rows fit 720p by shrinking the row height when needed.
     const float top = h * 0.17f;
     const float rowH = std::clamp((h - top - 90.f) / kSettingsRowCount, 26.f, 46.f);
     const int fontSize = rowH > 38.f ? 22 : 17;

@@ -31,6 +31,7 @@ add_subdirectory(third_party/enet)
 # --- Game ---------------------------------------------------------------------
 add_executable(apex-rush
     src/main.cpp
+    src/audio/MiniaudioAudio.cpp
     src/core/Config.cpp
     src/physics/Qu3eWorld.cpp
     src/render/RaylibBackend.cpp
@@ -42,7 +43,7 @@ add_executable(apex-rush
     src/game/Game.cpp
 )
 
-target_include_directories(apex-rush PRIVATE src)
+target_include_directories(apex-rush PRIVATE src third_party/miniaudio)
 target_link_libraries(apex-rush PRIVATE raylib qu3e enet)
 
 if(MSVC)

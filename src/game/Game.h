@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "audio/IAudio.h"
 #include "core/Config.h"
 #include "game/Track.h"
 #include "physics/IPhysicsWorld.h"
@@ -41,10 +42,10 @@ struct Racer {
 // Owns the world, track, racers and UI. One instance per running game.
 class Game {
 public:
-    // Settings rows: race section + video/physics section + BACK.
-    static constexpr int kSettingsRowCount = 14;
+    // Settings rows: race + video/physics + audio + BACK.
+    static constexpr int kSettingsRowCount = 16;
 
-    Game(IRenderer& renderer, IInput& input, Config& config);
+    Game(IRenderer& renderer, IInput& input, Config& config, IAudio* audio = nullptr);
 
     bool Init();
     // Update (input, physics, race), then Render3D (inside BeginScene/EndScene),
@@ -79,6 +80,7 @@ private:
     IRenderer& renderer_;
     IInput& input_;
     Config& config_;
+    IAudio* audio_ = nullptr;  // optional; null in headless tests
 
     std::unique_ptr<IPhysicsWorld> world_;
     Track track_;
