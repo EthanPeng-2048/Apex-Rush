@@ -69,6 +69,21 @@ public:
     // latch resets when leaving a DRS zone, which drives re-entry behavior).
     bool PlayerDrsWanted() const { return drsWanted_; }
 
+    // Optional section timers for --bench (off by default; zero overhead).
+    struct BenchSample {
+        double aiSec = 0.0;
+        double vehicleSec = 0.0;
+        double stepSec = 0.0;
+        double contactSec = 0.0;
+        double raceSec = 0.0;
+        double updateSec = 0.0;
+        long frames = 0;
+        long physSteps = 0;
+    };
+    void SetBench(bool on) { benchOn_ = on; }
+    void ResetBench() { bench_ = BenchSample{}; }
+    const BenchSample& Bench() const { return bench_; }
+
 private:
     void BuildWorld();
     void LoadSettings();
@@ -138,6 +153,9 @@ private:
     int menuCursor_ = 0;
     int settingsCursor_ = 0;
     int raceSetupCursor_ = 0;
+
+    bool benchOn_ = false;
+    BenchSample bench_;
 };
 
 }  // namespace apex

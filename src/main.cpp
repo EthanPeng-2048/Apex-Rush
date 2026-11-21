@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -874,6 +875,72 @@ int RunDriveTest(Config& config) {
     return failures == 0 ? 0 : 1;
 }
 
+// `apex-rush --bench [cars]`: headless performance snapshot of one physics
+// backend. Autopilot grid, fixed assist pins, N seconds of racing after the
+// countdown. Prints per-frame section means so the async-engine refactor can
+// be compared against this baseline byte-for-byte on the same workload.
+int RunBench(Config& config, int cars, const char* engine, double raceSeconds) {
+    config.SetString("physics", "engine", engine);
+    config.SetString("race", "cars", std::to_string(cars));
+    config.SetString("race", "autostart", "true");
+    config.SetString("race", "autopilot", "true");
+    config.SetString("assists", "steer", "full");
+    config.SetString("assists", "esc", "full");
+    config.SetString("assists", "tc", "sport");
+    config.SetString("assists", "abs", "sport");
+
+    NullBackend backend;
+    if (!backend.Init(1280, 720, "bench")) {
+        std::printf("[FAIL] bench backend init\n");
+        return 1;
+    }
+
+    Game game(backend, backend, config);
+    if (!game.Init()) {
+        std::printf("[FAIL] bench game init\n");
+        return 1;
+    }
+    game.SetBench(true);
+
+    auto frame = [&]() {
+        backend.scripted = InputState{};
+        backend.BeginFrame();
+        game.Update();
+        backend.EndFrame();
+    };
+
+    // Countdown + settle.
+    for (int i = 0; i < 240; ++i) frame();
+    game.ResetBench();
+
+    const int frames = static_cast<int>(raceSeconds / backend.frameDt + 0.5);
+    const auto wall0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < frames; ++i) frame();
+    const std::chrono::duration<double> wall = std::chrono::steady_clock::now() - wall0;
+
+    const Game::BenchSample& s = game.Bench();
+    const double n = s.frames > 0 ? static_cast<double>(s.frames) : 1.0;
+    const double steps = s.physSteps > 0 ? static_cast<double>(s.physSteps) : 1.0;
+    std::printf(
+        "bench[%s] cars=%d frames=%ld physSteps=%ld wall=%.3fs\n"
+        "  per-frame ms:  update=%.3f  ai=%.3f  race=%.3f\n"
+        "  per-step  ms:  vehicle=%.4f  step=%.4f  contact=%.4f\n"
+        "  sim-share:     ai=%.1f%%  vehicle=%.1f%%  step=%.1f%%  contact=%.1f%%  race=%.1f%%\n"
+        "  throughput:    %.1f steps/s wall, %.1f frames/s wall\n",
+        engine, cars, s.frames, s.physSteps, wall.count(),
+        1e3 * s.updateSec / n, 1e3 * s.aiSec / n, 1e3 * s.raceSec / n,
+        1e3 * s.vehicleSec / steps, 1e3 * s.stepSec / steps, 1e3 * s.contactSec / steps,
+        100.0 * s.aiSec / std::max(s.updateSec, 1e-12),
+        100.0 * s.vehicleSec / std::max(s.updateSec, 1e-12),
+        100.0 * s.stepSec / std::max(s.updateSec, 1e-12),
+        100.0 * s.contactSec / std::max(s.updateSec, 1e-12),
+        100.0 * s.raceSec / std::max(s.updateSec, 1e-12),
+        steps / wall.count(), n / wall.count());
+
+    backend.Shutdown();
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -887,6 +954,8 @@ int main(int argc, char** argv) {
     bool driveTest = false;
     bool menuShot = false;
     bool settingsShot = false;
+    bool bench = false;
+    int benchCars = 16;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--drive-test") == 0) {
             driveTest = true;
@@ -898,19 +967,35 @@ int main(int argc, char** argv) {
             settingsShot = true;  // open the settings screen for --shot (QA visual)
         } else if (std::strcmp(argv[i], "--dump-scene") == 0 && i + 1 < argc) {
             dumpPath = argv[++i];
+        } else if (std::strcmp(argv[i], "--bench") == 0) {
+            bench = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                benchCars = std::atoi(argv[++i]);
+                if (benchCars < 1) benchCars = 1;
+                if (benchCars > 120) benchCars = 120;
+            }
         }
     }
 
     Config config;
     config.Load(DataPath("config.ini"));
     // All CLI automation paths (tests, screenshots, scene dumps) skip the menu.
-    if ((driveTest || dumpPath || shotPath) && !menuShot && !settingsShot) {
+    if ((driveTest || dumpPath || shotPath || bench) && !menuShot && !settingsShot) {
         config.SetString("race", "autostart", "true");
     }
     if (settingsShot) config.SetString("race", "settings_qa", "true");
 
     if (driveTest) {
         return RunDriveTest(config);
+    }
+
+    if (bench) {
+        // Local config only — never Save, same rule as the test paths.
+        int rc = 0;
+        for (const char* engine : {"qu3e", "nudge"}) {
+            rc |= RunBench(config, benchCars, engine, 10.0);
+        }
+        return rc;
     }
 
     if (dumpPath) {

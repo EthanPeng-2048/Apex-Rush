@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -14,6 +15,12 @@
 namespace apex {
 
 namespace {
+
+using BenchClock = std::chrono::steady_clock;
+
+double BenchSec(BenchClock::time_point a, BenchClock::time_point b) {
+    return std::chrono::duration<double>(b - a).count();
+}
 
 // "test_circuit" -> "TEST CIRCUIT" (raylib's font has no lowercase issues,
 // but the menu looks better uppercase).
@@ -146,7 +153,9 @@ void Game::LoadSettings() {
 }
 
 void Game::SpawnRacers() {
-    const int carCount = std::clamp(config_.GetInt("race", "cars", 4), 1, 8);
+    // Large grids (up to 120) so the async bench can stress the sim;
+    // the settings CARS row cycles the same range.
+    const int carCount = std::clamp(config_.GetInt("race", "cars", 4), 1, 120);
     racers_.resize(static_cast<size_t>(carCount));
     for (int i = 0; i < carCount; ++i) {
         Racer& racer = racers_[static_cast<size_t>(i)];
@@ -209,6 +218,7 @@ void Game::BuildWorld() {
 }
 
 void Game::Update() {
+    const BenchClock::time_point benchT0 = BenchClock::now();
     const float frameDt = std::min(renderer_.FrameTime(), 0.1f);
 
     UpdatePlayerInput();
@@ -220,8 +230,16 @@ void Game::Update() {
     } else if (phase_ == RacePhase::RaceSetup) {
         UpdateRaceSetup();
     } else {
-        for (Racer& racer : racers_) {
-            if (!racer.isPlayer && !racer.finished) UpdateAI(racer, frameDt);
+        if (benchOn_) {
+            const BenchClock::time_point t0 = BenchClock::now();
+            for (Racer& racer : racers_) {
+                if (!racer.isPlayer && !racer.finished) UpdateAI(racer, frameDt);
+            }
+            bench_.aiSec += BenchSec(t0, BenchClock::now());
+        } else {
+            for (Racer& racer : racers_) {
+                if (!racer.isPlayer && !racer.finished) UpdateAI(racer, frameDt);
+            }
         }
 
         // Fixed-step physics (rate from [physics] hz, default 240).
@@ -231,7 +249,13 @@ void Game::Update() {
             accumulator_ -= fixedDt_;
         }
 
-        UpdateRace(frameDt);
+        if (benchOn_) {
+            const BenchClock::time_point t0 = BenchClock::now();
+            UpdateRace(frameDt);
+            bench_.raceSec += BenchSec(t0, BenchClock::now());
+        } else {
+            UpdateRace(frameDt);
+        }
     }
 
     UpdateCamera(frameDt);
@@ -251,6 +275,11 @@ void Game::Update() {
         }
         audioState.skid = Clampf(audioState.skid, 0.f, 1.f);
         audio_->Update(audioState);
+    }
+
+    if (benchOn_) {
+        bench_.updateSec += BenchSec(benchT0, BenchClock::now());
+        ++bench_.frames;
     }
 }
 
@@ -450,16 +479,29 @@ void Game::UpdateAI(Racer& racer, float dt) {
 }
 
 void Game::StepPhysics(float dt) {
+    const bool b = benchOn_;
+    if (b) ++bench_.physSteps;
+
+    BenchClock::time_point t = b ? BenchClock::now() : BenchClock::time_point{};
     for (Racer& racer : racers_) {
         racer.vehicle.Update(racer.input, dt);
     }
+    if (b) {
+        bench_.vehicleSec += BenchSec(t, BenchClock::now());
+        t = BenchClock::now();
+    }
 
     world_->Step(dt);
+    if (b) {
+        bench_.stepSec += BenchSec(t, BenchClock::now());
+        t = BenchClock::now();
+    }
 
     const std::vector<ContactEvent> contacts = world_->DrainContacts();
     for (Racer& racer : racers_) {
         racer.vehicle.ProcessContacts(contacts, dt);
     }
+    if (b) bench_.contactSec += BenchSec(t, BenchClock::now());
 
     // Collision thump for the player's car.
     if (audio_ && !racers_.empty()) {
@@ -955,7 +997,7 @@ void Game::UpdateRaceSetup() {
         }
         case 2: {
             const int cars = std::clamp(config_.GetInt("race", "cars", 4) + (dir != 0 ? dir : 1),
-                                        1, 8);
+                                        1, 120);
             config_.SetString("race", "cars", std::to_string(cars));
             break;
         }
