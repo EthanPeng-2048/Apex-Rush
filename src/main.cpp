@@ -8,6 +8,7 @@
 
 #include "audio/MiniaudioAudio.h"
 #include "core/Config.h"
+#include "core/Paths.h"
 #include "game/Game.h"
 #include "physics/NudgeWorld.h"
 #include "physics/Qu3eWorld.h"
@@ -155,7 +156,7 @@ int RunMenuTest() {
     }
 
     Config config;
-    config.Load("config.ini");
+    config.Load(DataPath("config.ini"));
     Game game(backend, backend, config);
     if (!game.Init()) {
         std::printf("[FAIL] menu-test game init\n");
@@ -231,7 +232,7 @@ int RunAITest(const char* engine) {
     }
 
     Config config;
-    config.Load("config.ini");
+    config.Load(DataPath("config.ini"));
     config.SetString("race", "cars", "4");
     config.SetString("race", "autostart", "true");
     config.SetString("race", "autopilot", "true");
@@ -311,7 +312,7 @@ int RunAIDifficultyIsolationTest(const char* engine) {
     }
 
     Config config;
-    config.Load("config.ini");
+    config.Load(DataPath("config.ini"));
     config.SetString("race", "cars", "2");
     config.SetString("race", "autostart", "true");
     config.SetString("physics", "engine", engine);
@@ -643,7 +644,7 @@ int main(int argc, char** argv) {
     }
 
     Config config;
-    config.Load("config.ini");
+    config.Load(DataPath("config.ini"));
     // All CLI automation paths (tests, screenshots, scene dumps) skip the menu.
     if ((driveTest || dumpPath || shotPath) && !menuShot && !settingsShot) {
         config.SetString("race", "autostart", "true");
@@ -713,7 +714,7 @@ int main(int argc, char** argv) {
     // A --shot/--settings run injects automation overrides; saving the config
     // then would leak autostart=true / settings_qa into the user's config.ini
     // and the main menu would silently disappear on the next launch.
-    if (!shotPath && !settingsShot) config.Save("config.ini");
+    if (!shotPath && !settingsShot) config.Save(DataPath("config.ini"));
     backend.Shutdown();
     return 0;
 }

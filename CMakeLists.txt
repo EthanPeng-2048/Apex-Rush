@@ -52,8 +52,13 @@ target_include_directories(nudge PUBLIC third_party/nudge)
 set_target_properties(nudge PROPERTIES C_STANDARD 23 C_STANDARD_REQUIRED ON)
 if(CMAKE_C_COMPILER_ID MATCHES "Clang")
     # -msse4.1: nudge's simd.h uses _mm_blendv_ps (clang enforces target
-    # features on always_inline intrinsics, MSVC does not).
-    target_compile_options(nudge PRIVATE -std=c23 -ffp-contract=off -msse4.1)
+    # features on always_inline intrinsics, MSVC does not). Emscripten maps
+    # the SSE intrinsics to wasm SIMD but wants -msimd128 alongside them.
+    if(EMSCRIPTEN)
+        target_compile_options(nudge PRIVATE -std=c23 -ffp-contract=off -msse4.1 -msimd128)
+    else()
+        target_compile_options(nudge PRIVATE -std=c23 -ffp-contract=off -msse4.1)
+    endif()
 elseif(MSVC)
     target_compile_options(nudge PRIVATE /std:clatest /experimental:c11atomics /fp:precise)
 endif()
@@ -63,6 +68,7 @@ add_executable(apex-rush
     src/main.cpp
     src/audio/MiniaudioAudio.cpp
     src/core/Config.cpp
+    src/core/Paths.cpp
     src/physics/Qu3eWorld.cpp
     src/physics/NudgeWorld.cpp
     src/render/RaylibBackend.cpp

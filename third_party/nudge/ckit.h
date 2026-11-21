@@ -607,9 +607,11 @@ typedef union CK_Cookie
 	 ((uint32_t)(unsigned char)(c) << 16) | ((uint32_t)(unsigned char)(d) << 24))
 
 // Portable case-insensitive string compare.
+// (vendored patch: include strings.h so strcasecmp is declared on emscripten)
 #ifdef _WIN32
 #	define ck_stricmp _stricmp
 #else
+#	include <strings.h>
 #	define ck_stricmp strcasecmp
 #endif
 

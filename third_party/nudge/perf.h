@@ -15,6 +15,12 @@
 static double perf_freq;
 static void perf_init() { LARGE_INTEGER f; QueryPerformanceFrequency(&f); perf_freq = (double)f.QuadPart; }
 static double perf_now() { LARGE_INTEGER c; QueryPerformanceCounter(&c); return (double)c.QuadPart / perf_freq; }
+#elif defined(__EMSCRIPTEN__)
+// (vendored patch: emscripten's time.h does not declare clock_gettime here;
+// emscripten_get_now is a ms-resolution monotonic clock.)
+#include <emscripten.h>
+static void perf_init() {}
+static double perf_now() { return emscripten_get_now() * 1e-3; }
 #else
 #include <time.h>
 static void perf_init() {}

@@ -1,4 +1,4 @@
-#include "game/Game.h"
+﻿#include "game/Game.h"
 
 #include <algorithm>
 #include <cctype>
@@ -7,14 +7,13 @@
 #include <cstring>
 
 #include "game/MapData.h"
+#include "core/Paths.h"
 #include "physics/NudgeWorld.h"
 #include "physics/Qu3eWorld.h"
 
 namespace apex {
 
 namespace {
-
-constexpr const char* kMapsRoot = "assets/maps";
 
 // "test_circuit" -> "TEST CIRCUIT" (raylib's font has no lowercase issues,
 // but the menu looks better uppercase).
@@ -113,7 +112,7 @@ bool Game::Init() {
 }
 
 void Game::LoadSettings() {
-    mapList_ = ListMaps(kMapsRoot);
+    mapList_ = ListMaps(DataPath("assets/maps"));
     if (mapList_.empty()) mapList_.push_back("test_circuit");
     mapName_ = config_.GetString("race", "map", mapList_.front());
     if (std::find(mapList_.begin(), mapList_.end(), mapName_) == mapList_.end()) {
@@ -195,7 +194,7 @@ void Game::StartRace() {
 }
 
 void Game::BuildWorld() {
-    const MapData map = LoadMapData(kMapsRoot, mapName_);
+    const MapData map = LoadMapData(DataPath("assets/maps"), mapName_);
     track_.Build(map, *world_, renderer_);
 }
 
@@ -736,7 +735,7 @@ void Game::UpdateSettings() {
     if (in.menuDown) settingsCursor_ = (settingsCursor_ + 1) % kRows;
 
     auto backToMenu = [this]() {
-        config_.Save("config.ini");
+        config_.Save(DataPath("config.ini"));
         phase_ = RacePhase::Menu;
         menuCursor_ = 0;
     };
@@ -857,7 +856,7 @@ void Game::UpdateRaceSetup() {
     if (in.menuDown) raceSetupCursor_ = (raceSetupCursor_ + 1) % kRows;
 
     if (in.menuBack) {
-        config_.Save("config.ini");
+        config_.Save(DataPath("config.ini"));
         phase_ = RacePhase::Menu;
         menuCursor_ = 0;
         return;
@@ -897,13 +896,13 @@ void Game::UpdateRaceSetup() {
         }
         case 4: {
             // START
-            config_.Save("config.ini");
+            config_.Save(DataPath("config.ini"));
             StartRace();
             break;
         }
         default: {
             // BACK
-            config_.Save("config.ini");
+            config_.Save(DataPath("config.ini"));
             phase_ = RacePhase::Menu;
             menuCursor_ = 0;
             break;
