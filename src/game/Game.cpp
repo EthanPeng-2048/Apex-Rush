@@ -10,7 +10,9 @@
 
 #include "game/MapData.h"
 import rush.engine.core;
+import rush.engine.job;
 import rush.engine.physics;
+import rush.engine.render;
 
 namespace apex {
 
@@ -230,16 +232,19 @@ void Game::Update() {
     } else if (phase_ == RacePhase::RaceSetup) {
         UpdateRaceSetup();
     } else {
+        // Data-parallel AI: each car only writes its own VehicleInput.
         if (benchOn_) {
             const BenchClock::time_point t0 = BenchClock::now();
-            for (Racer& racer : racers_) {
+            rush::JobSystem::Get().ParallelFor(racers_.size(), [&](std::size_t i) {
+                Racer& racer = racers_[i];
                 if (!racer.isPlayer && !racer.finished) UpdateAI(racer, frameDt);
-            }
+            });
             bench_.aiSec += BenchSec(t0, BenchClock::now());
         } else {
-            for (Racer& racer : racers_) {
+            rush::JobSystem::Get().ParallelFor(racers_.size(), [&](std::size_t i) {
+                Racer& racer = racers_[i];
                 if (!racer.isPlayer && !racer.finished) UpdateAI(racer, frameDt);
-            }
+            });
         }
 
         // Fixed-step physics (rate from [physics] hz, default 240).
@@ -486,6 +491,10 @@ void Game::StepPhysics(float dt) {
     if (b) ++bench_.physSteps;
 
     BenchClock::time_point t = b ? BenchClock::now() : BenchClock::time_point{};
+    // Vehicle::Update raycasts and applies forces on the shared IPhysicsWorld
+    // — the collision backends are not thread-safe, so this batch stays
+    // serial until the engine owns multi-island stepping (future physics
+    // customization). AI above is pure state→input and is safe to split.
     for (Racer& racer : racers_) {
         racer.vehicle.Update(racer.input, dt);
     }

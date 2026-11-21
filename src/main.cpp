@@ -7,11 +7,14 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 
 #include <rush/rush.h>
 
-#include "audio/MiniaudioAudio.h"
 import rush.engine.core;
+import rush.engine.job;
+
+#include "audio/MiniaudioAudio.h"
 #include "game/Game.h"
 import rush.engine.physics;
 import rush.engine.render;
@@ -996,8 +999,16 @@ int main(int argc, char** argv) {
     }
     if (settingsShot) config.SetString("race", "settings_qa", "true");
 
+    // JobSystem width: deterministic serial for drive-test; native parallel
+    // pool for bench (async performance) and interactive play.
     if (driveTest) {
+        rush::JobSystem::Get().Configure(0);
         return RunDriveTest(config);
+    }
+    if (bench || (!menuShot && !settingsShot && !dumpPath && !shotPath)) {
+        rush::JobSystem::Get().Configure(std::thread::hardware_concurrency());
+    } else {
+        rush::JobSystem::Get().Configure(0);
     }
 
     if (bench) {
