@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include "game/MapData.h"
+#include "physics/NudgeWorld.h"
 #include "physics/Qu3eWorld.h"
 
 namespace apex {
@@ -177,7 +178,12 @@ void Game::SpawnRacers() {
 void Game::StartRace() {
     LoadSettings();
     racers_.clear();
-    world_ = std::make_unique<Qu3eWorld>();
+    // Swap collision backends in-game via [physics] engine (qu3e | nudge).
+    if (config_.GetString("physics", "engine", "qu3e") == "nudge") {
+        world_ = std::make_unique<NudgeWorld>();
+    } else {
+        world_ = std::make_unique<Qu3eWorld>(fixedDt_);
+    }
     world_->SetGravity({0.f, -9.81f, 0.f});
     BuildWorld();
     SpawnRacers();
@@ -823,6 +829,14 @@ void Game::UpdateSettings() {
             break;
         }
         case 13: {
+            // Collision backend swap (qu3e | nudge) — rebuilt on next race.
+            const bool nudge = config_.GetString("physics", "engine", "qu3e") == "nudge";
+            config_.SetString("physics", "engine",
+                              (dir != 0) ? (dir > 0 ? "nudge" : "qu3e")
+                                         : (nudge ? "qu3e" : "nudge"));
+            break;
+        }
+        case 14: {
             const int volume =
                 std::clamp(config_.GetInt("audio", "volume", 80) + (dir != 0 ? (dir > 0 ? 20 : -20) : 20),
                            0, 100);
@@ -904,12 +918,13 @@ void Game::RenderSettings() {
         {"QUALITY", video_.shadows ? "HIGH" : "LOW"},
         {"FPS LIMIT", video_.fpsLimit > 0 ? std::to_string(video_.fpsLimit) : "UNCAPPED"},
         {"PHYSICS RATE", std::to_string(physicsHz) + " HZ"},
+        {"PHYSICS ENGINE", MapDisplayName(config_.GetString("physics", "engine", "qu3e"))},
         {"SOUND VOLUME", std::to_string(config_.GetInt("audio", "volume", 80))},
         {"AUDIO BACKEND", MapDisplayName(config_.GetString("audio", "backend", "auto"))},
         {"BACK", ""},
     };
 
-    // 16 rows fit 720p by shrinking the row height when needed.
+    // 17 rows fit 720p by shrinking the row height when needed.
     const float top = h * 0.17f;
     const float rowH = std::clamp((h - top - 90.f) / kSettingsRowCount, 26.f, 46.f);
     const int fontSize = rowH > 38.f ? 22 : 17;

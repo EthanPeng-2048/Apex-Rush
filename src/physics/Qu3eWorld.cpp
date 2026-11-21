@@ -42,9 +42,12 @@ public:
         Vec3 point;
     };
 
-    // q3Scene advances by the fixed dt given here on every Step(). The game
-    // calls Step() once per 240 Hz substep, so the scene must use 1/240 too.
-    q3Scene scene{1.f / 240.f, q3Vec3{0.f, -9.81f, 0.f}, 12};
+    explicit Impl(float stepDt)
+        // q3Scene advances by the fixed dt given here on every Step(). The
+        // game calls Step() once per physics substep, so use the same rate.
+        : scene(stepDt, q3Vec3{0.f, -9.81f, 0.f}, 12) {}
+
+    q3Scene scene;
     std::map<BodyHandle, q3Body*> bodies;
     BodyHandle nextHandle = 1;
     std::vector<ContactEvent> contacts;
@@ -120,7 +123,7 @@ public:
 
 }  // namespace
 
-Qu3eWorld::Qu3eWorld() : impl_(new Impl()) {
+Qu3eWorld::Qu3eWorld(float stepDt) : impl_(new Impl(stepDt)) {
     impl_->scene.SetContactListener(impl_.get());
     impl_->scene.SetAllowSleep(false);
     impl_->scene.SetIterations(16);

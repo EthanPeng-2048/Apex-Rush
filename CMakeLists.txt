@@ -24,9 +24,18 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(raylib)
 
-# --- Third-party: qu3e (collision) / enet (networking) -----------------------
+# --- Third-party: qu3e (collision) / enet (networking) / nudge (alt physics) --
 add_subdirectory(third_party/qu3e)
 add_subdirectory(third_party/enet)
+
+# nudge: C23 unity build of the engine core (see src/physics/nudge_unity.c).
+# Compiled with the same flags upstream nudge uses for MSVC.
+add_library(nudge STATIC src/physics/nudge_unity.c)
+target_include_directories(nudge PUBLIC third_party/nudge)
+set_target_properties(nudge PROPERTIES C_STANDARD 23 C_STANDARD_REQUIRED ON)
+if(MSVC)
+    target_compile_options(nudge PRIVATE /std:clatest /experimental:c11atomics /fp:precise)
+endif()
 
 # --- Game ---------------------------------------------------------------------
 add_executable(apex-rush
@@ -34,6 +43,7 @@ add_executable(apex-rush
     src/audio/MiniaudioAudio.cpp
     src/core/Config.cpp
     src/physics/Qu3eWorld.cpp
+    src/physics/NudgeWorld.cpp
     src/render/RaylibBackend.cpp
     src/render/NullBackend.cpp
     src/vehicle/TireModel.cpp
@@ -44,10 +54,12 @@ add_executable(apex-rush
 )
 
 target_include_directories(apex-rush PRIVATE src third_party/miniaudio)
-target_link_libraries(apex-rush PRIVATE raylib qu3e enet)
+target_link_libraries(apex-rush PRIVATE raylib qu3e enet nudge)
 
 if(MSVC)
     target_link_libraries(apex-rush PRIVATE winmm)
+    # nudge's solver uses large stack frames (upstream builds with 8 MB too).
+    target_link_options(apex-rush PRIVATE /STACK:8388608)
 endif()
 
 # --- Web (Emscripten) ---------------------------------------------------------

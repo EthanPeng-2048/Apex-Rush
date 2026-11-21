@@ -12,7 +12,9 @@ namespace apex {
 // part mapping. Swappable for a Jolt adapter later.
 class Qu3eWorld final : public IPhysicsWorld {
 public:
-    Qu3eWorld();
+    // stepDt: q3Scene advances this fixed dt on every Step() — pass the game's
+    // physics rate ([physics] hz) so the setting is real, not cosmetic.
+    explicit Qu3eWorld(float stepDt = 1.f / 240.f);
     ~Qu3eWorld() override;
 
     void SetGravity(const Vec3& gravity) override;

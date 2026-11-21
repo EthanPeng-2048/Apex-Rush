@@ -1,12 +1,15 @@
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
 
 #include "audio/MiniaudioAudio.h"
 #include "core/Config.h"
 #include "game/Game.h"
+#include "physics/NudgeWorld.h"
 #include "physics/Qu3eWorld.h"
 #include "render/NullBackend.h"
 #include "render/RaylibBackend.h"
@@ -16,6 +19,12 @@ namespace {
 
 using namespace apex;
 
+// Swap the collision backend under test ([physics] engine).
+std::unique_ptr<IPhysicsWorld> MakeWorld(const char* engine) {
+    if (engine && std::strcmp(engine, "nudge") == 0) return std::make_unique<NudgeWorld>();
+    return std::make_unique<Qu3eWorld>();
+}
+
 // High-speed steering stability on a bare ground plane. The circuit is a
 // ~120 m radius loop, so any straight run drifts into the wall within ~3 s
 // and wall contacts garble handling numbers; an infinite plane isolates the
@@ -23,8 +32,7 @@ using namespace apex;
 // a keyboard step to part lock used to ratchet to full lock (steering filter
 // jumped straight to its too-large speed limit, and the ESC reference yaw was
 // ~10x too large at speed so it kept adding steering) and snap the car.
-int RunFlatStabilityTest() {
-    Qu3eWorld world;
+int RunFlatStabilityTest(IPhysicsWorld& world) {
     world.SetGravity({0.f, -9.81f, 0.f});
 
     BodyDesc ground;
@@ -127,6 +135,8 @@ int RunFlatStabilityTest() {
 // autostart), opens settings, comes back, starts a race — plus a render
 // smoke pass over the menu screens. Uses the real config.ini but never
 // changes a value, so the settings save round-trips the user's config.
+// Deliberately backend-agnostic and free of config overrides: leaving the
+// settings screen calls Config::Save, which would persist any override.
 int RunMenuTest() {
     NullBackend backend;
     if (!backend.Init(1280, 720, "menu-test")) {
@@ -194,7 +204,7 @@ int RunMenuTest() {
 // AI autopilot regression: all four cars AI-driven must stay inside the track
 // corridor (no wall planting) and make real progress. The player car runs the
 // same AI via [race] autopilot.
-int RunAITest() {
+int RunAITest(const char* engine) {
     NullBackend backend;
     if (!backend.Init(1280, 720, "ai-test")) {
         std::printf("[FAIL] ai-test backend init\n");
@@ -206,6 +216,7 @@ int RunAITest() {
     config.SetString("race", "cars", "4");
     config.SetString("race", "autostart", "true");
     config.SetString("race", "autopilot", "true");
+    config.SetString("physics", "engine", engine);
     // Pin the autopilot player car's assists so the AI regression stays
     // deterministic regardless of the player's difficulty settings (AI cars
     // themselves run fixed assists and never read these).
@@ -273,7 +284,7 @@ int RunAITest() {
 // AI difficulty isolation: player assist settings must not leak into AI
 // cars. Regression for "AI spins at assists-off difficulty" — with every
 // player assist off the AI must still run its fixed aids and keep racing.
-int RunAIDifficultyIsolationTest() {
+int RunAIDifficultyIsolationTest(const char* engine) {
     NullBackend backend;
     if (!backend.Init(1280, 720, "ai-diff-test")) {
         std::printf("[FAIL] ai-diff-test backend init\n");
@@ -284,6 +295,7 @@ int RunAIDifficultyIsolationTest() {
     config.Load("config.ini");
     config.SetString("race", "cars", "2");
     config.SetString("race", "autostart", "true");
+    config.SetString("physics", "engine", engine);
     config.SetString("assists", "steer", "off");
     config.SetString("assists", "esc", "off");
     config.SetString("assists", "tc", "off");
@@ -336,8 +348,10 @@ int RunAIDifficultyIsolationTest() {
 // `apex-rush --drive-test`: headless physics/controls verification. Drives the
 // player car with scripted input and asserts acceleration, braking, steering
 // and reverse. Exits 0 on success, 1 on failure. No window is created, so it
-// runs on locked sessions and in CI.
-int RunDriveTest(Config& config) {
+// runs on locked sessions and in CI. The full suite runs once per physics
+// backend (qu3e and nudge must both pass it).
+int RunDriveTestForEngine(Config& config, const char* engine) {
+    config.SetString("physics", "engine", engine);
     NullBackend backend;
     if (!backend.Init(1280, 720, "drive-test")) {
         std::printf("[FAIL] NullBackend init\n");
@@ -487,19 +501,36 @@ int RunDriveTest(Config& config) {
     // 5) High-speed steering stability lives on a bare ground plane — see
     //    RunFlatStabilityTest. (The circuit loop is too tight to reach racing
     //    speed without hitting the barriers.)
-    failures += RunFlatStabilityTest();
+    {
+        std::unique_ptr<IPhysicsWorld> flatWorld = MakeWorld(engine);
+        failures += RunFlatStabilityTest(*flatWorld);
+    }
 
-    // 6) Menu / settings flow (headless).
+    // 6) Menu / settings flow (headless, backend-agnostic).
     failures += RunMenuTest();
 
     // 7) AI autopilot: no wall planting, real progress.
-    failures += RunAITest();
+    failures += RunAITest(engine);
 
     // 8) AI cars ignore player difficulty assists (never spin at assists-off).
-    failures += RunAIDifficultyIsolationTest();
+    failures += RunAIDifficultyIsolationTest(engine);
 
-    std::printf("drive-test: %s (%d failures)\n", failures == 0 ? "OK" : "FAILED", failures);
+    std::printf("drive-test[%s]: %s (%d failures)\n", engine,
+                failures == 0 ? "OK" : "FAILED", failures);
     backend.Shutdown();
+    return failures;
+}
+
+int RunDriveTest(Config& config) {
+    int failures = 0;
+    for (const char* engine : {"qu3e", "nudge"}) {
+        std::printf("=== physics backend: %s ===\n", engine);
+        const auto start = std::chrono::steady_clock::now();
+        failures += RunDriveTestForEngine(config, engine);
+        const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - start;
+        std::printf("drive-test[%s] wall time: %.2f s\n", engine, elapsed.count());
+    }
+    std::printf("drive-test: %s (%d failures)\n", failures == 0 ? "OK" : "FAILED", failures);
     return failures == 0 ? 0 : 1;
 }
 

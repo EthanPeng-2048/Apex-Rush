@@ -43,7 +43,7 @@ struct Racer {
 class Game {
 public:
     // Settings rows: race + video/physics + audio + BACK.
-    static constexpr int kSettingsRowCount = 16;
+    static constexpr int kSettingsRowCount = 17;
 
     Game(IRenderer& renderer, IInput& input, Config& config, IAudio* audio = nullptr);
 
