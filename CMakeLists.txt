@@ -47,3 +47,20 @@ target_link_libraries(apex-rush PRIVATE raylib qu3e enet)
 if(MSVC)
     target_link_libraries(apex-rush PRIVATE winmm)
 endif()
+
+# --- Web (Emscripten) ---------------------------------------------------------
+# The game loop is written in blocking form; ASYNCIFY lets it yield to the
+# browser every frame (raylib sleeps inside WaitTime at the target FPS).
+# Filesystem is in-memory MEMFS, so config.ini persists per tab session only.
+if(EMSCRIPTEN)
+    target_link_options(apex-rush PRIVATE
+        -sASYNCIFY
+        -sASYNCIFY_STACK_SIZE=65536
+        -sALLOW_MEMORY_GROWTH=1
+        -sFORCE_FILESYSTEM=1
+        -sEXIT_RUNTIME=1
+        --shell-file ${raylib_SOURCE_DIR}/src/minshell.html
+    )
+    # .html suffix makes emcc emit the shell page next to js/wasm.
+    set_target_properties(apex-rush PROPERTIES SUFFIX ".html")
+endif()

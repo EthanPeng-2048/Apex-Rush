@@ -19,9 +19,11 @@ Vector3 ToRaylib(const Vec3& v) { return {v.x, v.y, v.z}; }
 
 // Minimal Win32 query (avoids including windows.h): raylib's InitWindow aborts
 // when the requested window does not fit any monitor, so clamp to the screen.
+#ifdef _WIN32
 extern "C" __declspec(dllimport) int __stdcall GetSystemMetrics(int nIndex);
 constexpr int kSmCxScreen = 0;
 constexpr int kSmCyScreen = 1;
+#endif
 
 }  // namespace
 
@@ -39,13 +41,22 @@ RaylibBackend::~RaylibBackend() {
 bool RaylibBackend::Init(int width, int height, const std::string& title) {
     if (impl_) return true;
     SetTraceLogLevel(LOG_WARNING);
+#ifdef _WIN32
     // Clamp to the visible screen: raylib's InitWindow terminates GLFW when the
     // window does not fit any monitor ("Failed to determine Monitor to center").
     width = std::min(width, GetSystemMetrics(kSmCxScreen) - 40);
     height = std::min(height, GetSystemMetrics(kSmCyScreen) - 90);  // title bar + taskbar
+#endif
     InitWindow(width, height, title.c_str());
     if (!IsWindowReady()) return false;
+#if defined(__EMSCRIPTEN__)
+    // Web builds run the blocking loop through ASYNCIFY and must yield to the
+    // browser once per frame — raylib does that inside WaitTime at the target
+    // rate, so an uncapped loop would freeze the page.
+    SetTargetFPS(60);
+#else
     SetTargetFPS(0);  // uncapped; fixed-step physics is decoupled from render
+#endif
     impl_ = new Impl();
     impl_->camera.position = {0.f, 8.f, -12.f};
     impl_->camera.target = {0.f, 0.f, 0.f};

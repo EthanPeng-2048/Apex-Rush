@@ -30,6 +30,7 @@
 #include <float.h>		// FLT_MAX
 #include <cmath>		// abs, sqrt
 #include <cassert>		// assert
+#include <cstdlib>		// rand, RAND_MAX (not pulled in by clang/emscripten)
 #include <algorithm>	// max, min
 
 #include "../common/q3Types.h"

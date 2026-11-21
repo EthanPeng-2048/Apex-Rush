@@ -30,7 +30,11 @@ public:
         float wearDelta = 0.f;
     };
 
-    explicit TireModel(const Params& params = {});
+    // Separate default ctor: clang rejects `= {}` as a default argument here
+    // (default member initializers of Params are not yet available at that
+    // point in the enclosing class).
+    TireModel() = default;
+    explicit TireModel(const Params& params);
 
     // contactVelocity: velocity of the contact patch (world).
     // forward/right: unit wheel frame axes in world (forward = rolling dir).
