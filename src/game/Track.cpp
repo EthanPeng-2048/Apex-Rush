@@ -259,11 +259,13 @@ void Track::BuildMesh(IRenderer& renderer) {
                     kerbOut1 + up * lift, up);
 
             // Barrier wall on the outer face of the kerb (matches the physics
-            // wall boxes that sit just outside the road edge).
+            // wall boxes that sit just outside the road edge). Drawn double
+            // sided so it reads from outside the circuit too.
             const float wallH = 1.2f;
             const Vec3 base0 = s0.position + s0.right * sgn * w0;
             const Vec3 base1 = s1.position + s1.right * sgn * w1;
             addQuad(walls, base0, base1, base0 + up * wallH, base1 + up * wallH, -s0.right * sgn);
+            addQuad(walls, base0, base1, base0 + up * wallH, base1 + up * wallH, s0.right * sgn);
         }
     }
 

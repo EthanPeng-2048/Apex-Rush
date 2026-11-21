@@ -55,6 +55,7 @@ MeshData BlobToMesh(const car_model::MeshBlob& blob) {
         data.normals[static_cast<size_t>(i)] = {blob.normals[i * 3 + 0], blob.normals[i * 3 + 1],
                                                 blob.normals[i * 3 + 2]};
     }
+    data.colors.assign(blob.colors, blob.colors + blob.vertexCount * 4);
     data.indices.assign(blob.indices, blob.indices + blob.indexCount);
     return data;
 }
@@ -573,8 +574,10 @@ void Vehicle::Render(IRenderer& renderer, const Color& tint) const {
         Transform t;
         t.position = TransformPoint(transform, Vec3{draw.anchorX, -suspLen, draw.anchorZ});
         t.rotation = rot;
+        // Wheels carry the livery bake too (tire dark / rim light), so the
+        // tint is a mid gray instead of near black.
         const float wearTint = 1.f - wheel.wear * 0.45f;
-        renderer.DrawMesh(cache.wheel, t, Color{0.12f, 0.12f, 0.13f, wearTint});
+        renderer.DrawMesh(cache.wheel, t, Color{0.45f, 0.45f, 0.48f, wearTint});
     }
 }
 

@@ -128,6 +128,11 @@ MeshHandle RaylibBackend::CreateMesh(const MeshData& data) {
         for (int i = 0; i < mesh.vertexCount * 2; ++i) mesh.texcoords[i] = data.uvs[i];
     }
 
+    if (!data.colors.empty()) {
+        mesh.colors = static_cast<unsigned char*>(MemAlloc(mesh.vertexCount * 4 * sizeof(unsigned char)));
+        for (int i = 0; i < mesh.vertexCount * 4; ++i) mesh.colors[i] = data.colors[i];
+    }
+
     mesh.indices = static_cast<unsigned short*>(MemAlloc(data.indices.size() * sizeof(unsigned short)));
     for (size_t i = 0; i < data.indices.size(); ++i) {
         mesh.indices[i] = static_cast<unsigned short>(data.indices[i]);

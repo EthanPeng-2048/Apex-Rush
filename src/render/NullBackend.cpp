@@ -60,9 +60,16 @@ void NullBackend::DumpObj(const std::string& path) const {
         if (it == meshes_.end()) continue;
         const MeshData& mesh = it->second;
         std::fprintf(f, "g draw%zu\n# tint %.3f %.3f %.3f\n", d, cmd.tint.r, cmd.tint.g, cmd.tint.b);
-        for (const Vec3& p : mesh.positions) {
-            const Vec3 w = Rotate(cmd.transform.rotation, p) + cmd.transform.position;
-            std::fprintf(f, "v %.4f %.4f %.4f\n", w.x, w.y, w.z);
+        for (size_t v = 0; v < mesh.positions.size(); ++v) {
+            const Vec3 w = Rotate(cmd.transform.rotation, mesh.positions[v]) + cmd.transform.position;
+            if (!mesh.colors.empty()) {
+                const size_t ci = v * 4;
+                std::fprintf(f, "v %.4f %.4f %.4f %.3f %.3f %.3f\n", w.x, w.y, w.z,
+                             mesh.colors[ci] / 255.f, mesh.colors[ci + 1] / 255.f,
+                             mesh.colors[ci + 2] / 255.f);
+            } else {
+                std::fprintf(f, "v %.4f %.4f %.4f\n", w.x, w.y, w.z);
+            }
         }
         for (size_t i = 0; i + 2 < mesh.indices.size(); i += 3) {
             std::fprintf(f, "f %d %d %d\n", base + static_cast<int>(mesh.indices[i]),

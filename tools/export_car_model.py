@@ -5,8 +5,9 @@ The GLB stores the body with a mirroring node transform and the four wheels as
 separate meshes. This script:
   * bakes node transforms into the vertices,
   * splits body / wheels and centres the wheel geometry on its own origin,
-  * scales to game units (wheel radius 0.33 m) and centres the car on its
-    wheelbase,
+  * scales to game units (wheel radius 0.33 m) and centres the car on its wheelbase,
+  * samples the livery texture (RaceCar.jpg) into per-vertex grayscale so the
+    per-car team tint keeps the paint detail,
   * emits src/vehicle/CarModelData.h with plain arrays consumed by Vehicle::Render.
 
 Regenerate with:  python tools/export_car_model.py
@@ -17,8 +18,11 @@ import struct
 import sys
 from pathlib import Path
 
+from PIL import Image
+
 ROOT = Path(__file__).resolve().parent.parent
 GLB_PATH = ROOT / "assets" / "models" / "racecar" / "RaceCar.glb"
+TEX_PATH = ROOT / "assets" / "models" / "racecar" / "RaceCar.jpg"
 OUT_PATH = ROOT / "src" / "vehicle" / "CarModelData.h"
 
 WHEEL_RADIUS = 0.33          # must match VehicleParams::wheelRadius
@@ -91,14 +95,18 @@ def transform_point(m, t, p):
 
 
 def extract_mesh(gltf, bin_chunk, mesh_index):
-    """Return (positions, indices) with node transform baked in."""
+    """Return (positions, uvs, indices) with node transform baked in later."""
     prim = gltf["meshes"][mesh_index]["primitives"][0]
     positions = accessor_values(gltf, bin_chunk, prim["attributes"]["POSITION"])
+    if "TEXCOORD_0" in prim["attributes"]:
+        uvs = accessor_values(gltf, bin_chunk, prim["attributes"]["TEXCOORD_0"])
+    else:
+        uvs = [[0.0, 0.0] for _ in positions]
     if "indices" in prim:
         idx = [int(v[0]) for v in accessor_values(gltf, bin_chunk, prim["indices"])]
     else:
         idx = list(range(len(positions)))
-    return positions, idx
+    return positions, uvs, idx
 
 
 def recompute_normals(positions, indices):
@@ -140,7 +148,7 @@ def main():
     meshes = {}
     for name, node in [("body", body_node)] + [(n, nodes[n]) for n in wheel_names]:
         m, t, det = node_matrix(node)
-        positions, indices = extract_mesh(gltf, bin_chunk, node["mesh"])
+        positions, uvs, indices = extract_mesh(gltf, bin_chunk, node["mesh"])
         baked = [transform_point(m, t, p) for p in positions]
         if det < 0:
             # Mirroring transform inverts winding: (a,b,c) -> (a,c,b).
@@ -148,13 +156,13 @@ def main():
             for i in range(0, len(indices), 3):
                 fixed += [indices[i], indices[i + 2], indices[i + 1]]
             indices = fixed
-        meshes[name] = (baked, indices, det)
+        meshes[name] = (baked, uvs, indices)
 
     # Wheel-base centre in baked space (front/rear wheel mean z).
     wheel_z = []
     wheel_centres = {}
     for name in wheel_names:
-        positions, indices, _ = meshes[name]
+        positions, _, _ = meshes[name]
         lo, hi = bounds(positions)
         centre = [(lo[i] + hi[i]) * 0.5 for i in range(3)]
         wheel_centres[name] = centre
@@ -171,15 +179,15 @@ def main():
                 for p in positions]
 
     out = {}
-    positions, indices, _ = meshes["body"]
+    positions, uvs, indices = meshes["body"]
     body_pos = place(positions, 0.0)
-    out["body"] = (body_pos, indices)
+    out["body"] = (body_pos, uvs, indices)
 
-    positions, indices, _ = meshes[wheel_names[0]]
+    positions, uvs, indices = meshes[wheel_names[0]]
     c = wheel_centres[wheel_names[0]]
     wheel_pos = [[(p[0] - c[0]) * scale, (p[1] - c[1]) * scale, (p[2] - c[2]) * scale]
                  for p in positions]
-    out["wheel"] = (wheel_pos, indices)
+    out["wheel"] = (wheel_pos, uvs, indices)
 
     # Wheel anchor positions in model space (ground plane at y = 0).
     anchors = {}
@@ -200,20 +208,42 @@ def main():
             lines.append(", ".join(row))
         return ",\n    ".join(lines)
 
-    def mesh_block(cpp_name, positions, indices):
+    # Livery bake: sample the texture per vertex and keep its luminance as a
+    # grayscale value. The renderer multiplies this by the per-car team tint,
+    # so paint detail survives while each car keeps its colour.
+    tex = Image.open(TEX_PATH).convert("RGB")
+    tw, th = tex.size
+    texels = tex.load()
+
+    def bake_colors(uvs):
+        out_bytes = []
+        for u, v in uvs:
+            x = min(tw - 1, max(0, int(u * tw)))
+            y = min(th - 1, max(0, int(v * th)))
+            r, g, b = texels[x, y]
+            lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+            gray = int(min(255, max(0, (0.35 + 0.65 * lum) * 255)))
+            out_bytes += [gray, gray, gray, 255]
+        return out_bytes
+
+    def mesh_block(cpp_name, positions, uvs, indices):
         pos_flat = [c for p in positions for c in p]
         normals = recompute_normals(positions, indices)
         nrm_flat = [c for n in normals for c in n]
+        colors = bake_colors(uvs)
         return (
             f"const float k{cpp_name}Positions[] = {{\n    {fmt_floats(pos_flat)}\n}};\n\n"
             f"const float k{cpp_name}Normals[] = {{\n    {fmt_floats(nrm_flat)}\n}};\n\n"
+            f"const uint8_t k{cpp_name}Colors[] = {{\n    "
+            + ", ".join(str(c) for c in colors)
+            + "\n};\n\n"
             f"const uint16_t k{cpp_name}Indices[] = {{\n    "
             + ", ".join(str(i) for i in indices)
             + "\n};\n"
         )
 
-    body_pos, body_idx = out["body"]
-    wheel_pos, wheel_idx = out["wheel"]
+    body_pos, body_uvs, body_idx = out["body"]
+    wheel_pos, wheel_uvs, wheel_idx = out["wheel"]
 
     header = []
     header.append("// Generated by tools/export_car_model.py — do not edit.")
@@ -228,19 +258,20 @@ def main():
     header.append("struct MeshBlob {")
     header.append("    const float* positions;")
     header.append("    const float* normals;")
+    header.append("    const uint8_t* colors;   // RGBA per vertex, livery baked as grayscale")
     header.append("    const uint16_t* indices;")
     header.append("    int vertexCount;")
     header.append("    int indexCount;")
     header.append("};")
     header.append("")
-    header.append(mesh_block("Body", body_pos, body_idx))
+    header.append(mesh_block("Body", body_pos, body_uvs, body_idx))
     header.append("")
-    header.append(mesh_block("Wheel", wheel_pos, wheel_idx))
+    header.append(mesh_block("Wheel", wheel_pos, wheel_uvs, wheel_idx))
     header.append("")
-    header.append(f"inline constexpr MeshBlob kBody{{kBodyPositions, kBodyNormals, kBodyIndices, "
-                  f"{len(body_pos)}, {len(body_idx)}}};")
-    header.append(f"inline constexpr MeshBlob kWheel{{kWheelPositions, kWheelNormals, kWheelIndices, "
-                  f"{len(wheel_pos)}, {len(wheel_idx)}}};")
+    header.append(f"inline constexpr MeshBlob kBody{{kBodyPositions, kBodyNormals, kBodyColors, "
+                  f"kBodyIndices, {len(body_pos)}, {len(body_idx)}}};")
+    header.append(f"inline constexpr MeshBlob kWheel{{kWheelPositions, kWheelNormals, kWheelColors, "
+                  f"kWheelIndices, {len(wheel_pos)}, {len(wheel_idx)}}};")
     header.append("")
     header.append("// Wheel anchors in model space (origin = wheelbase centre on the ground).")
     for name in wheel_names:

@@ -37,7 +37,8 @@ struct CameraDesc {
 struct MeshData {
     std::vector<Vec3> positions;
     std::vector<Vec3> normals;
-    std::vector<float> uvs;  // 2 floats per vertex
+    std::vector<float> uvs;              // 2 floats per vertex
+    std::vector<uint8_t> colors;         // optional RGBA bytes per vertex
     std::vector<uint32_t> indices;
 };
 
