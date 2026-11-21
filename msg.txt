@@ -1,0 +1,9 @@
+feat: 设置扩展——无边框全屏/分辨率/画质阴影/物理频率/帧率限制
+
+- 新增 [video] mode(无边框全屏/窗口化)、分辨率预设 1280x720~2560x1440、
+  fps_limit(UNCAPPED/30/60/120/144)、quality(LOW/HIGH)
+- 画质 HIGH 开启简易阴影：车身顶视轮廓压扁投影到接地点（DrawMeshShadow）
+- [physics] hz 可调 120/240/480，物理固定步长由配置驱动
+- IRenderer 新增 ApplyVideo/ShadowsEnabled/DrawMeshShadow，Null/Raylib
+  双后端对齐；Emscripten 保持 60fps 兼容 ASYNCIFY
+- 设置菜单扩到 14 行紧凑布局，720p 可完整显示；--settings QA 截图开关

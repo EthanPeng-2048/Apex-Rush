@@ -33,6 +33,16 @@ struct CameraDesc {
     float fovYDeg = 65.f;
 };
 
+// Video settings applied at runtime from the settings menu. Backends
+// implement what they support and ignore the rest (headless = everything).
+struct VideoConfig {
+    bool borderlessFullscreen = false;
+    int width = 1280;
+    int height = 720;
+    int fpsLimit = 0;       // 0 = uncapped
+    bool shadows = true;    // quality: simple ground shadows
+};
+
 // Triangle mesh in engine-agnostic form. Winding is counter-clockwise.
 struct MeshData {
     std::vector<Vec3> positions;
@@ -66,9 +76,16 @@ public:
     virtual int ScreenWidth() const = 0;
     virtual int ScreenHeight() const = 0;
 
+    virtual void ApplyVideo(const VideoConfig& video) = 0;
+    virtual bool ShadowsEnabled() const = 0;
+
     virtual MeshHandle CreateMesh(const MeshData& data) = 0;
     virtual void DestroyMesh(MeshHandle handle) = 0;
     virtual void DrawMesh(MeshHandle handle, const Transform& transform, const Color& tint) = 0;
+    // Cheap quality-option shadow: squashes the mesh onto the ground plane at
+    // groundY (top-down footprint) and draws it translucent dark.
+    virtual void DrawMeshShadow(MeshHandle handle, const Transform& transform, float groundY,
+                                const Color& tint) = 0;
 
     // Immediate primitives for debugging, HUD and low-poly bodies.
     virtual void DrawBox(const Vec3& halfExtents, const Transform& transform, const Color& color) = 0;

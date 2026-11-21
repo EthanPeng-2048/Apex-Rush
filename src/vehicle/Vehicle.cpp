@@ -711,6 +711,22 @@ void Vehicle::Render(IRenderer& renderer, const Color& tint) const {
     // contact (static ride height below the chassis origin).
     Transform bodyT = transform;
     bodyT.position += TransformDirection(transform, Vec3{0.f, -(kStaticSuspension + params_.wheelRadius), 0.f});
+
+    // Simple quality-option shadow: the body footprint squashed onto the
+    // ground under the wheels.
+    if (renderer.ShadowsEnabled()) {
+        bool grounded = false;
+        float groundY = 0.f;
+        for (const WheelState& wheel : state_.wheels) {
+            if (!wheel.grounded) continue;
+            if (!grounded || wheel.contactPoint.y < groundY) groundY = wheel.contactPoint.y;
+            grounded = true;
+        }
+        if (grounded) {
+            renderer.DrawMeshShadow(cache.body, bodyT, groundY, Color{0.f, 0.f, 0.f, 0.32f});
+        }
+    }
+
     renderer.DrawMesh(cache.body, bodyT, tint);
 
     // Wheels follow the suspension in Y, steer around up (front) and spin

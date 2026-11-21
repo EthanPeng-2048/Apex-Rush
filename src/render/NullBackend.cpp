@@ -23,6 +23,13 @@ void NullBackend::SetCamera(const CameraDesc&) {}
 int NullBackend::ScreenWidth() const { return width_; }
 int NullBackend::ScreenHeight() const { return height_; }
 
+void NullBackend::ApplyVideo(const VideoConfig& video) {
+    video_ = video;
+    width_ = video.width;
+    height_ = video.height;
+}
+bool NullBackend::ShadowsEnabled() const { return video_.shadows; }
+
 MeshHandle NullBackend::CreateMesh(const MeshData& data) {
     const MeshHandle handle = nextMesh_++;
     meshes_[handle] = data;
@@ -33,6 +40,9 @@ void NullBackend::DestroyMesh(MeshHandle handle) { meshes_.erase(handle); }
 
 void NullBackend::DrawMesh(MeshHandle handle, const Transform& transform, const Color& tint) {
     if (captureDraws) draws_.push_back({handle, transform, tint});
+}
+void NullBackend::DrawMeshShadow(MeshHandle, const Transform&, float, const Color&) {
+    // Not captured: shadows would pollute the scene dump.
 }
 void NullBackend::DrawBox(const Vec3&, const Transform&, const Color&) {}
 void NullBackend::DrawLine3D(const Vec3&, const Vec3&, const Color&) {}

@@ -169,7 +169,12 @@ int RunMenuTest() {
 
     press = InputState{};
     press.menuDown = true;
-    for (int i = 0; i < 8 && game.Phase() == RacePhase::Settings; ++i) frame(press);
+    // Walk the whole list to the BACK row. Selecting anywhere else would
+    // change a value and Save() it into the real config.ini — the row count
+    // must stay in sync with Game::kSettingsRowCount.
+    for (int i = 0; i < Game::kSettingsRowCount - 1 && game.Phase() == RacePhase::Settings; ++i) {
+        frame(press);
+    }
     press = InputState{};
     press.menuSelect = true;  // BACK row
     frame(press);
@@ -509,6 +514,7 @@ int main(int argc, char** argv) {
     const char* dumpPath = nullptr;
     bool driveTest = false;
     bool menuShot = false;
+    bool settingsShot = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--drive-test") == 0) {
             driveTest = true;
@@ -516,6 +522,8 @@ int main(int argc, char** argv) {
             shotPath = argv[++i];
         } else if (std::strcmp(argv[i], "--menu") == 0) {
             menuShot = true;  // keep the main menu up for --shot (QA visual)
+        } else if (std::strcmp(argv[i], "--settings") == 0) {
+            settingsShot = true;  // open the settings screen for --shot (QA visual)
         } else if (std::strcmp(argv[i], "--dump-scene") == 0 && i + 1 < argc) {
             dumpPath = argv[++i];
         }
@@ -524,9 +532,10 @@ int main(int argc, char** argv) {
     Config config;
     config.Load("config.ini");
     // All CLI automation paths (tests, screenshots, scene dumps) skip the menu.
-    if ((driveTest || dumpPath || shotPath) && !menuShot) {
+    if ((driveTest || dumpPath || shotPath) && !menuShot && !settingsShot) {
         config.SetString("race", "autostart", "true");
     }
+    if (settingsShot) config.SetString("race", "settings_qa", "true");
 
     if (driveTest) {
         return RunDriveTest(config);
@@ -581,10 +590,10 @@ int main(int argc, char** argv) {
         }
     }
 
-    // A --shot run injects the autostart override for automation; saving the
-    // config then would leak autostart=true into the user's config.ini and
-    // the main menu would silently disappear on the next launch.
-    if (!shotPath) config.Save("config.ini");
+    // A --shot/--settings run injects automation overrides; saving the config
+    // then would leak autostart=true / settings_qa into the user's config.ini
+    // and the main menu would silently disappear on the next launch.
+    if (!shotPath && !settingsShot) config.Save("config.ini");
     backend.Shutdown();
     return 0;
 }

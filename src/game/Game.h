@@ -41,6 +41,9 @@ struct Racer {
 // Owns the world, track, racers and UI. One instance per running game.
 class Game {
 public:
+    // Settings rows: race section + video/physics section + BACK.
+    static constexpr int kSettingsRowCount = 14;
+
     Game(IRenderer& renderer, IInput& input, Config& config);
 
     bool Init();
@@ -94,9 +97,13 @@ private:
     Vec3 cameraPos_{0.f, 8.f, -14.f};
     Vec3 cameraTarget_;
 
-    // Fixed-step accumulator
+    // Fixed-step accumulator. Step size comes from [physics] hz (120/240/480),
+    // default 240 Hz — the tire contact damping and stiff springs are tuned
+    // for 240, lower rates trade accuracy for speed.
     float accumulator_ = 0.f;
-    static constexpr float kFixedDt = 1.f / 240.f;
+    float fixedDt_ = 1.f / 240.f;
+
+    VideoConfig video_;
 
     std::string statusText_;
     float statusTimer_ = 0.f;

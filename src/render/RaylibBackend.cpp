@@ -1,5 +1,6 @@
 #include "render/RaylibBackend.h"
 
+#include <algorithm>
 #include <unordered_map>
 
 #include "raylib.h"
@@ -30,6 +31,16 @@ extern "C" __declspec(dllimport) int __stdcall ImmDisableIME(unsigned long dwThr
 #pragma comment(lib, "imm32.lib")
 #endif
 
+// Clamp a windowed size to the visible screen: raylib's InitWindow terminates
+// GLFW when the window does not fit any monitor ("Failed to determine Monitor
+// to center").
+void ClampToScreen(int& width, int& height) {
+#ifdef _WIN32
+    width = std::min(width, GetSystemMetrics(kSmCxScreen) - 40);
+    height = std::min(height, GetSystemMetrics(kSmCyScreen) - 90);  // title bar + taskbar
+#endif
+}
+
 }  // namespace
 
 struct RaylibBackend::Impl {
@@ -37,6 +48,7 @@ struct RaylibBackend::Impl {
     std::unordered_map<MeshHandle, ::Mesh> meshes;
     std::unordered_map<MeshHandle, ::Model> models;
     MeshHandle nextMesh = 1;
+    bool shadows = true;
 };
 
 RaylibBackend::~RaylibBackend() {
@@ -46,12 +58,7 @@ RaylibBackend::~RaylibBackend() {
 bool RaylibBackend::Init(int width, int height, const std::string& title) {
     if (impl_) return true;
     SetTraceLogLevel(LOG_WARNING);
-#ifdef _WIN32
-    // Clamp to the visible screen: raylib's InitWindow terminates GLFW when the
-    // window does not fit any monitor ("Failed to determine Monitor to center").
-    width = std::min(width, GetSystemMetrics(kSmCxScreen) - 40);
-    height = std::min(height, GetSystemMetrics(kSmCyScreen) - 90);  // title bar + taskbar
-#endif
+    ClampToScreen(width, height);
     InitWindow(width, height, title.c_str());
     if (!IsWindowReady()) return false;
 #ifdef _WIN32
@@ -121,6 +128,29 @@ void RaylibBackend::SetCamera(const CameraDesc& camera) {
 int RaylibBackend::ScreenWidth() const { return ::GetScreenWidth(); }
 int RaylibBackend::ScreenHeight() const { return ::GetScreenHeight(); }
 
+void RaylibBackend::ApplyVideo(const VideoConfig& video) {
+    if (!impl_) return;
+    impl_->shadows = video.shadows;
+#if defined(__EMSCRIPTEN__)
+    // Web builds must yield to the browser through WaitTime at a bounded rate
+    // (ASYNCIFY), so the FPS cap is fixed and window mode is the canvas's.
+    (void)video;
+    SetTargetFPS(60);
+#else
+    SetTargetFPS(video.fpsLimit);
+    const bool isBorderless = IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE);
+    if (video.borderlessFullscreen != isBorderless) ToggleBorderlessWindowed();
+    if (!video.borderlessFullscreen) {
+        int width = video.width;
+        int height = video.height;
+        ClampToScreen(width, height);
+        SetWindowSize(width, height);
+    }
+#endif
+}
+
+bool RaylibBackend::ShadowsEnabled() const { return impl_ && impl_->shadows; }
+
 MeshHandle RaylibBackend::CreateMesh(const MeshData& data) {
     ::Mesh mesh{};
     mesh.vertexCount = static_cast<int>(data.positions.size());
@@ -188,6 +218,30 @@ void RaylibBackend::DrawMesh(MeshHandle handle, const Transform& transform, cons
                        m[12], m[13], m[14], m[15]};
     DrawModel(model, {0.f, 0.f, 0.f}, 1.f, ToRaylib(tint));
     // Restore identity so the next frame's transform starts clean.
+    model.transform = {1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f,
+                       0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f};
+}
+
+void RaylibBackend::DrawMeshShadow(MeshHandle handle, const Transform& transform, float groundY,
+                                   const Color& tint) {
+    const auto it = impl_->models.find(handle);
+    if (it == impl_->models.end()) return;
+    ::Model& model = it->second;
+
+    // Squash Y about the ground plane: the mesh collapses into its top-down
+    // footprint sitting just above groundY (see TransformToMatrix row layout).
+    float m[16];
+    TransformToMatrix(transform, m);
+    m[4] *= 0.01f;
+    m[5] *= 0.01f;
+    m[6] *= 0.01f;
+    m[7] = m[7] * 0.01f + groundY * 0.99f + 0.02f;
+
+    model.transform = {m[0], m[1], m[2],  m[3],
+                       m[4], m[5], m[6],  m[7],
+                       m[8], m[9], m[10], m[11],
+                       m[12], m[13], m[14], m[15]};
+    DrawModel(model, {0.f, 0.f, 0.f}, 1.f, ToRaylib(tint));
     model.transform = {1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f,
                        0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f};
 }

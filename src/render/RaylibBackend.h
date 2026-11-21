@@ -21,9 +21,13 @@ public:
     void SetCamera(const CameraDesc& camera) override;
     int ScreenWidth() const override;
     int ScreenHeight() const override;
+    void ApplyVideo(const VideoConfig& video) override;
+    bool ShadowsEnabled() const override;
     MeshHandle CreateMesh(const MeshData& data) override;
     void DestroyMesh(MeshHandle handle) override;
     void DrawMesh(MeshHandle handle, const Transform& transform, const Color& tint) override;
+    void DrawMeshShadow(MeshHandle handle, const Transform& transform, float groundY,
+                        const Color& tint) override;
     void DrawBox(const Vec3& halfExtents, const Transform& transform, const Color& color) override;
     void DrawLine3D(const Vec3& start, const Vec3& end, const Color& color) override;
     void DrawGrid(int slices, float spacing) override;

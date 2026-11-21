@@ -63,6 +63,22 @@ void SaveAssistLevel(Config& config, const char* key, AssistLevel level) {
                                                    : "off");
 }
 
+// Video / physics presets cycled by the settings rows.
+struct ResPreset {
+    int width, height;
+};
+const ResPreset kResPresets[] = {{1280, 720}, {1600, 900}, {1920, 1080}, {2560, 1440}};
+constexpr int kResPresetCount = 4;
+const int kFpsPresets[] = {0, 30, 60, 120, 144};       // 0 = uncapped
+constexpr int kFpsPresetCount = 5;
+const int kPhysicsPresets[] = {120, 240, 480};
+constexpr int kPhysicsPresetCount = 3;
+
+// Cycle a preset index by menu direction (select = next).
+int CyclePreset(int index, int count, int dir) {
+    return (index + (dir != 0 ? (dir > 0 ? 1 : -1) : 1) + count) % count;
+}
+
 std::string FormatTime(float seconds) {
     if (seconds <= 0.f) return "--:--.---";
     const int minutes = static_cast<int>(seconds / 60.f);
@@ -84,9 +100,14 @@ Game::Game(IRenderer& renderer, IInput& input, Config& config)
 bool Game::Init() {
     StartRace();
     // Tests and automation skip straight to the grid; normal launches open
-    // the main menu over the parked scene.
-    phase_ = config_.GetBool("race", "autostart", false) ? RacePhase::Countdown
-                                                         : RacePhase::Menu;
+    // the main menu over the parked scene. `race.settings_qa` opens the
+    // settings screen directly for --shot QA captures (never saved).
+    if (config_.GetBool("race", "settings_qa", false)) {
+        phase_ = RacePhase::Settings;
+    } else {
+        phase_ = config_.GetBool("race", "autostart", false) ? RacePhase::Countdown
+                                                             : RacePhase::Menu;
+    }
     return true;
 }
 
@@ -98,6 +119,18 @@ void Game::LoadSettings() {
         mapName_ = mapList_.front();
     }
     totalLaps_ = std::clamp(config_.GetInt("race", "laps", 3), 1, 20);
+
+    // Video: window mode / size / fps cap / quality shadows.
+    video_.borderlessFullscreen = config_.GetString("video", "mode", "windowed") == "borderless";
+    video_.width = std::clamp(config_.GetInt("video", "width", 1280), 640, 7680);
+    video_.height = std::clamp(config_.GetInt("video", "height", 720), 360, 4320);
+    video_.fpsLimit = std::max(0, config_.GetInt("video", "fps_limit", 0));
+    video_.shadows = config_.GetString("video", "quality", "high") != "low";
+    renderer_.ApplyVideo(video_);
+
+    // Physics tick rate (fixed step).
+    const int hz = std::clamp(config_.GetInt("physics", "hz", 240), 60, 1000);
+    fixedDt_ = 1.f / static_cast<float>(hz);
 }
 
 void Game::SpawnRacers() {
@@ -167,11 +200,11 @@ void Game::Update() {
             if (!racer.isPlayer && !racer.finished) UpdateAI(racer, frameDt);
         }
 
-        // Fixed-step physics: 240 Hz.
+        // Fixed-step physics (rate from [physics] hz, default 240).
         accumulator_ += frameDt;
-        while (accumulator_ >= kFixedDt) {
-            StepPhysics(kFixedDt);
-            accumulator_ -= kFixedDt;
+        while (accumulator_ >= fixedDt_) {
+            StepPhysics(fixedDt_);
+            accumulator_ -= fixedDt_;
         }
 
         UpdateRace(frameDt);
@@ -638,7 +671,7 @@ void Game::UpdateMenu() {
 }
 
 void Game::UpdateSettings() {
-    constexpr int kRows = 9;  // circuit, laps, cars, damage, abs, tc, esc, steer, back
+    constexpr int kRows = kSettingsRowCount;
     const InputState& in = rawInput_;
     if (in.menuUp) settingsCursor_ = (settingsCursor_ + kRows - 1) % kRows;
     if (in.menuDown) settingsCursor_ = (settingsCursor_ + 1) % kRows;
@@ -668,7 +701,7 @@ void Game::UpdateSettings() {
             for (int i = 0; i < count; ++i) {
                 if (mapList_[static_cast<size_t>(i)] == mapName_) idx = i;
             }
-            idx = (idx + (dir != 0 ? (dir > 0 ? 1 : -1) : 1) + count) % count;
+            idx = CyclePreset(idx, count, dir);
             mapName_ = mapList_[static_cast<size_t>(idx)];
             config_.SetString("race", "map", mapName_);
             break;
@@ -690,12 +723,66 @@ void Game::UpdateSettings() {
             config_.SetString("race", "damage", value ? "true" : "false");
             break;
         }
-        default: {
+        case 4:
+        case 5:
+        case 6:
+        case 7: {
             static const char* kAssistKeys[4] = {"abs", "tc", "esc", "steer"};
             const char* key = kAssistKeys[settingsCursor_ - 4];
             int level = static_cast<int>(ParseAssistLevel(config_, key, DefaultAssistLevel(key)));
-            level = (level + (dir != 0 ? (dir > 0 ? 1 : -1) : 1) + 3) % 3;
+            level = CyclePreset(level, 3, dir);
             SaveAssistLevel(config_, key, static_cast<AssistLevel>(level));
+            break;
+        }
+        case 8: {
+            video_.borderlessFullscreen =
+                (dir != 0) ? (dir > 0) : !video_.borderlessFullscreen;
+            config_.SetString("video", "mode",
+                              video_.borderlessFullscreen ? "borderless" : "windowed");
+            renderer_.ApplyVideo(video_);
+            break;
+        }
+        case 9: {
+            int idx = 0;
+            for (int i = 0; i < kResPresetCount; ++i) {
+                if (kResPresets[i].width == video_.width && kResPresets[i].height == video_.height) {
+                    idx = i;
+                }
+            }
+            idx = CyclePreset(idx, kResPresetCount, dir);
+            video_.width = kResPresets[idx].width;
+            video_.height = kResPresets[idx].height;
+            config_.SetString("video", "width", std::to_string(video_.width));
+            config_.SetString("video", "height", std::to_string(video_.height));
+            renderer_.ApplyVideo(video_);
+            break;
+        }
+        case 10: {
+            video_.shadows = (dir != 0) ? (dir > 0) : !video_.shadows;
+            config_.SetString("video", "quality", video_.shadows ? "high" : "low");
+            renderer_.ApplyVideo(video_);
+            break;
+        }
+        case 11: {
+            int idx = 0;
+            for (int i = 0; i < kFpsPresetCount; ++i) {
+                if (kFpsPresets[i] == video_.fpsLimit) idx = i;
+            }
+            idx = CyclePreset(idx, kFpsPresetCount, dir);
+            video_.fpsLimit = kFpsPresets[idx];
+            config_.SetString("video", "fps_limit", std::to_string(video_.fpsLimit));
+            renderer_.ApplyVideo(video_);
+            break;
+        }
+        default: {
+            const int hz = static_cast<int>(1.f / fixedDt_ + 0.5f);
+            int idx = 1;
+            for (int i = 0; i < kPhysicsPresetCount; ++i) {
+                if (kPhysicsPresets[i] == hz) idx = i;
+            }
+            idx = CyclePreset(idx, kPhysicsPresetCount, dir);
+            fixedDt_ = 1.f / static_cast<float>(kPhysicsPresets[idx]);
+            config_.SetString("physics", "hz", std::to_string(kPhysicsPresets[idx]));
             break;
         }
     }
@@ -736,14 +823,17 @@ void Game::RenderSettings() {
 
     const std::string title = "SETTINGS";
     const Vec2f titleSize = renderer_.MeasureText2D(title, 42);
-    renderer_.DrawText2D(title, w * 0.5f - titleSize.x * 0.5f, h * 0.14f, 42, Color::White());
+    renderer_.DrawText2D(title, w * 0.5f - titleSize.x * 0.5f, h * 0.08f, 42, Color::White());
 
     struct Row {
         const char* label;
         std::string value;
     };
     const int cars = config_.GetInt("race", "cars", 4);
-    const Row rows[9] = {
+    const int physicsHz = static_cast<int>(1.f / fixedDt_ + 0.5f);
+    char resBuffer[32];
+    std::snprintf(resBuffer, sizeof(resBuffer), "%dx%d", video_.width, video_.height);
+    const Row rows[kSettingsRowCount] = {
         {"CIRCUIT", MapDisplayName(mapName_)},
         {"LAPS", std::to_string(totalLaps_)},
         {"CARS", std::to_string(cars)},
@@ -752,23 +842,33 @@ void Game::RenderSettings() {
         {"TRACTION CTRL", AssistLevelName(ParseAssistLevel(config_, "tc", DefaultAssistLevel("tc")))},
         {"STABILITY CTRL", AssistLevelName(ParseAssistLevel(config_, "esc", DefaultAssistLevel("esc")))},
         {"STEER ASSIST", AssistLevelName(ParseAssistLevel(config_, "steer", DefaultAssistLevel("steer")))},
+        {"DISPLAY MODE", video_.borderlessFullscreen ? "BORDERLESS" : "WINDOWED"},
+        {"RESOLUTION", resBuffer},
+        {"QUALITY", video_.shadows ? "HIGH" : "LOW"},
+        {"FPS LIMIT", video_.fpsLimit > 0 ? std::to_string(video_.fpsLimit) : "UNCAPPED"},
+        {"PHYSICS RATE", std::to_string(physicsHz) + " HZ"},
         {"BACK", ""},
     };
 
-    float y = h * 0.26f;
-    for (int i = 0; i < 9; ++i) {
+    // 14 rows fit 720p by shrinking the row height when needed.
+    const float top = h * 0.17f;
+    const float rowH = std::clamp((h - top - 90.f) / kSettingsRowCount, 26.f, 46.f);
+    const int fontSize = rowH > 38.f ? 22 : 17;
+    float y = top;
+    for (int i = 0; i < kSettingsRowCount; ++i) {
         const bool selected = (i == settingsCursor_);
-        renderer_.DrawRect2D(w * 0.5f - 300.f, y - 6.f, 600.f, 40.f,
+        renderer_.DrawRect2D(w * 0.5f - 300.f, y - 2.f, 600.f, rowH - 4.f,
                              selected ? Color{1.f, 0.55f, 0.15f, 0.22f}
                                       : Color{0.f, 0.f, 0.f, 0.25f});
-        renderer_.DrawText2D(rows[i].label, w * 0.5f - 280.f, y, 22,
-                             selected ? Color::Orange() : Color::White());
+        renderer_.DrawText2D(rows[i].label, w * 0.5f - 280.f, y + (rowH - 4.f - fontSize) * 0.5f,
+                             fontSize, selected ? Color::Orange() : Color::White());
         if (!rows[i].value.empty()) {
-            const Vec2f valueSize = renderer_.MeasureText2D(rows[i].value, 22);
-            renderer_.DrawText2D(rows[i].value, w * 0.5f + 280.f - valueSize.x, y, 22,
+            const Vec2f valueSize = renderer_.MeasureText2D(rows[i].value, fontSize);
+            renderer_.DrawText2D(rows[i].value, w * 0.5f + 280.f - valueSize.x,
+                                 y + (rowH - 4.f - fontSize) * 0.5f, fontSize,
                                  selected ? Color::Yellow() : Color::Gray());
         }
-        y += 46.f;
+        y += rowH;
     }
 
     const std::string hint = "A/D CHANGE    W/S SELECT    ENTER/ESC BACK";
