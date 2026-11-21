@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <memory>
 #include <string>
@@ -97,6 +97,7 @@ private:
     void RenderRaceSetup();
     void UpdateAI(Racer& racer, float dt);
     void StepPhysics(float dt);
+    void ProcessCollisionEvents(float dt);
     void UpdateRace(float dt);
     void UpdateCamera(float dt);
 

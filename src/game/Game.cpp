@@ -1,4 +1,4 @@
-﻿#include "game/Game.h"
+#include "game/Game.h"
 
 #include <algorithm>
 #include <vector>
@@ -246,6 +246,9 @@ void Game::Update() {
         accumulator_ += frameDt;
         while (accumulator_ >= fixedDt_) {
             StepPhysics(fixedDt_);
+            // Gameplay stage: drain CollisionBus after the physics stage has
+            // published (strict async — no producer-side callbacks).
+            ProcessCollisionEvents(fixedDt_);
             accumulator_ -= fixedDt_;
         }
 
@@ -491,17 +494,20 @@ void Game::StepPhysics(float dt) {
         t = BenchClock::now();
     }
 
+    // Step only publishes CollisionEvents onto the bus; damage/audio drain
+    // in ProcessCollisionEvents (separate stage — physics never calls game).
     world_->Step(dt);
-    if (b) {
-        bench_.stepSec += BenchSec(t, BenchClock::now());
-        t = BenchClock::now();
-    }
+    if (b) bench_.stepSec += BenchSec(t, BenchClock::now());
+}
+
+void Game::ProcessCollisionEvents(float dt) {
+    const bool b = benchOn_;
+    BenchClock::time_point t = b ? BenchClock::now() : BenchClock::time_point{};
 
     const std::vector<ContactEvent> contacts = world_->DrainContacts();
     for (Racer& racer : racers_) {
         racer.vehicle.ProcessContacts(contacts, dt);
     }
-    if (b) bench_.contactSec += BenchSec(t, BenchClock::now());
 
     // Collision thump for the player's car.
     if (audio_ && !racers_.empty()) {
@@ -513,6 +519,7 @@ void Game::StepPhysics(float dt) {
             }
         }
     }
+    if (b) bench_.contactSec += BenchSec(t, BenchClock::now());
 }
 
 void Game::UpdateRace(float dt) {
