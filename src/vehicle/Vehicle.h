@@ -171,9 +171,10 @@ public:
     BodyHandle Chassis() const { return chassis_; }
 
     // Speed-sensitive full-lock road-wheel angle [deg]. Full lock sits at
-    // 0.95x the grip envelope delta = L * a_max(v) / v^2, so the extra ~5%
-    // covers bumps and surface noise instead of being a spin lottery. The
-    // same curve caps the AI speed target — keep them in one place.
+    // 1.2x the kinematic grip angle delta = L * a_max(v) / v^2 — the extra
+    // 20% covers the tire slip-angle headroom (L/R + understeer gradient) so
+    // the limit is reachable; the oversteer-gated assists catch anything past
+    // it. Derived from the tire / aero calibration, shared with the AI.
     float SteerEnvelopeDeg(float speed) const;
     float PartHealth(CarPart part) const {
         return state_.partHealth[static_cast<int>(part)];

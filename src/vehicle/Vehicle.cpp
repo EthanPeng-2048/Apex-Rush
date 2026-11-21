@@ -20,6 +20,11 @@ bool IsFront(int wheel) { return wheel < 2; }
 // origin = static suspension length + wheel radius (~0.112 + R).
 constexpr float kStaticSuspension = 0.112f;
 
+// The baked model is stubbier than the physics car (wheelbase 3.09 m vs the
+// physics 3.6 m). Scale the BODY so the visual footprint matches the physics;
+// the wheel mesh keeps the physics radius (0.33 m) and rides the suspension.
+constexpr float kBodyScale = 3.6f / 3.088f;
+
 // The source asset's left/right naming mirrors our +X=right convention, so
 // anchors are referenced by position: (xSign, zSign) -> physics wheel index.
 struct WheelDraw {
@@ -28,10 +33,10 @@ struct WheelDraw {
 };
 
 const WheelDraw kWheelDraws[4] = {
-    {kFrontLeft, -0.705f, 1.544f},   // x<0, z>0
-    {kFrontRight, 0.705f, 1.544f},   // x>0, z>0
-    {kRearLeft, -0.705f, -1.544f},   // x<0, z<0
-    {kRearRight, 0.705f, -1.544f},   // x>0, z<0
+    {kFrontLeft, -0.705f * kBodyScale, 1.544f * kBodyScale},   // x<0, z>0
+    {kFrontRight, 0.705f * kBodyScale, 1.544f * kBodyScale},   // x>0, z>0
+    {kRearLeft, -0.705f * kBodyScale, -1.544f * kBodyScale},   // x<0, z<0
+    {kRearRight, 0.705f * kBodyScale, -1.544f * kBodyScale},   // x>0, z<0
 };
 
 // Lazily-built GPU meshes shared by every car (body + one wheel drawn 4x).
@@ -45,13 +50,14 @@ ModelCache& GetModelCache() {
     return cache;
 }
 
-MeshData BlobToMesh(const car_model::MeshBlob& blob) {
+MeshData BlobToMesh(const car_model::MeshBlob& blob, float scale = 1.f) {
     MeshData data;
     data.positions.resize(static_cast<size_t>(blob.vertexCount));
     data.normals.resize(static_cast<size_t>(blob.vertexCount));
     for (int i = 0; i < blob.vertexCount; ++i) {
-        data.positions[static_cast<size_t>(i)] = {blob.positions[i * 3 + 0], blob.positions[i * 3 + 1],
-                                                  blob.positions[i * 3 + 2]};
+        data.positions[static_cast<size_t>(i)] = {blob.positions[i * 3 + 0] * scale,
+                                                  blob.positions[i * 3 + 1] * scale,
+                                                  blob.positions[i * 3 + 2] * scale};
         data.normals[static_cast<size_t>(i)] = {blob.normals[i * 3 + 0], blob.normals[i * 3 + 1],
                                                 blob.normals[i * 3 + 2]};
     }
@@ -62,7 +68,7 @@ MeshData BlobToMesh(const car_model::MeshBlob& blob) {
 
 void EnsureModel(IRenderer& renderer) {
     ModelCache& cache = GetModelCache();
-    if (cache.body == kInvalidMesh) cache.body = renderer.CreateMesh(BlobToMesh(car_model::kBody));
+    if (cache.body == kInvalidMesh) cache.body = renderer.CreateMesh(BlobToMesh(car_model::kBody, kBodyScale));
     if (cache.wheel == kInvalidMesh) cache.wheel = renderer.CreateMesh(BlobToMesh(car_model::kWheel));
 }
 
@@ -187,14 +193,16 @@ Vehicle::AeroCoefficients Vehicle::ComputeAero() const {
 }
 
 float Vehicle::SteerEnvelopeDeg(float speed) const {
-    // Full lock = 0.95x the grip envelope delta = L * a_max(v) / v^2.
-    // a_max(v) = mu*g (load-sensitivity margin) + downforce term, so the
-    // envelope follows the tire / aero calibration instead of frozen magic
-    // numbers. The same curve caps AI corner speeds.
+    // Full lock = 1.2x the kinematic grip angle delta = L * a_max(v) / v^2.
+    // The extra 20% is the tire slip-angle headroom the kinematic angle does
+    // not include (steering must cover L/R + understeer gradient), so the
+    // driver can actually reach the grip limit; the oversteer-gated assists
+    // catch anything past it. a_max(v) = mu*g (load-sensitivity margin) +
+    // downforce term, derived from the tire / aero calibration.
     const float gripRef = 0.5f * (params_.frontTire.D0 + params_.rearTire.D0);
     const float dfPerV2 = 0.5f * params_.airDensity * params_.downforceArea / params_.mass;
     const float aMax = 9.81f * gripRef * 0.92f + dfPerV2 * speed * speed;
-    return std::min(21.f, 0.95f * params_.wheelbase * aMax / (speed * speed + 1.f) * kRadToDeg);
+    return std::min(21.f, 1.2f * params_.wheelbase * aMax / (speed * speed + 1.f) * kRadToDeg);
 }
 
 void Vehicle::Update(const VehicleInput& input, float dt) {
@@ -225,19 +233,26 @@ void Vehicle::Update(const VehicleInput& input, float dt) {
     float steerTarget = -in.steer * steerRange;
 
     // Steering assist ("转向与反打辅助"): counter-steer toward the velocity
-    // vector once the body actually slips. A dead zone (beta < ~3 deg) keeps
-    // ordinary cornering untouched; past it the correction ramps to a large
-    // fraction of the envelope and unwinds slides by itself. Strength mirrors
-    // the reference game's Full / Sport scaling.
+    // vector — but ONLY on genuine oversteer. Balanced cornering runs a body
+    // slip angle of 5-8 deg at the limit (beta = alpha_rear + b/R, physics),
+    // so a naive beta ramp fights every hard corner ("转不动弯"). The trigger
+    // therefore requires yaw past the steering reference together with slip,
+    // or a deep slide on its own; the demand steers toward the velocity
+    // vector and damps the yaw error.
     if (params_.steerLevel != AssistLevel::Off && speed > 6.f && !in.handbrake) {
         const float vRight = Dot(velocity, TransformDirection(transform, Vec3{-1.f, 0.f, 0.f}));
         const float beta = std::atan2(vRight, std::max(std::fabs(forwardSpeed), 3.f));
-        const bool full = params_.steerLevel == AssistLevel::Full;
-        const float maxCorr = (full ? 0.85f : 0.45f) * steerRange;
-        const float slip = std::fabs(beta) > 0.05f
-                               ? (beta - std::copysign(0.05f, beta)) * (maxCorr / 0.07f)
-                               : 0.f;
-        steerTarget -= Clampf(slip, -maxCorr, maxCorr);
+        const float yawRate = Dot(world_->GetAngularVelocity(chassis_), Vec3{0.f, 1.f, 0.f});
+        const float yawRef = forwardSpeed * std::tan(steerAngle_) / params_.wheelbase;
+        const float excess = yawRate - yawRef;
+        const bool oversteer = (std::fabs(excess) > 0.2f && std::fabs(beta) > 0.06f) ||
+                               std::fabs(beta) > 0.18f;
+        if (oversteer) {
+            const bool full = params_.steerLevel == AssistLevel::Full;
+            const float maxCorr = (full ? 0.85f : 0.45f) * steerRange;
+            const float demand = beta / 0.15f + excess / 0.6f;
+            steerTarget -= Clampf(demand, -1.f, 1.f) * maxCorr;
+        }
     }
 
     const float tau = std::fabs(steerTarget) < std::fabs(steerAngle_)
@@ -575,10 +590,10 @@ void Vehicle::UpdateAssists(VehicleInput& input) {
     // ABS is applied per wheel in UpdateWheels (it modulates the brake split
     // where the wheel's slip ratio is known).
 
-    // ESC: preventive stability. Steps in as soon as the body slips past a
-    // small beta or the yaw drifts off the steering reference — long before
-    // a spin develops. Counter-steer + yaw damping + lateral damping; the
-    // rear-brake reserve lives in UpdatePowertrain.
+    // ESC: preventive stability. Steps in on genuine oversteer (same gate as
+    // the steering assist — balanced cornering must stay untouched), long
+    // before a spin develops. Counter-steer + yaw damping + lateral damping;
+    // the rear-brake reserve lives in UpdatePowertrain.
     escStrength_ = 0.f;
     if (params_.escLevel != AssistLevel::Off && !input.handbrake && speed > 5.f) {
         const float beta = std::atan2(vRight, std::max(std::fabs(forwardSpeed), 3.f));
@@ -586,9 +601,10 @@ void Vehicle::UpdateAssists(VehicleInput& input) {
         const float yawRef = forwardSpeed * std::tan(steerAngle_) / params_.wheelbase;
         const float excess = yawRate - yawRef;
         const bool full = params_.escLevel == AssistLevel::Full;
-        const float betaThresh = full ? 0.064f : 0.125f;
         const float strength = full ? 1.f : 0.58f;
-        if (std::fabs(beta) > betaThresh || std::fabs(excess) > 0.31f) {
+        const bool oversteer = (std::fabs(excess) > 0.25f && std::fabs(beta) > 0.06f) ||
+                               std::fabs(beta) > (full ? 0.14f : 0.18f);
+        if (oversteer) {
             escStrength_ = strength;
             // Small steer trim on top (the steering assist owns the big
             // counter-steer); ESC's main actuators are the yaw torque and

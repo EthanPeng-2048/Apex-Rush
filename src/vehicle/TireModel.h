@@ -42,12 +42,14 @@ public:
         float wearGripLoss = 0.35f;
         float minGrip = 0.55f;
 
-        // F1-style split: the front is the steering tire (slower lateral
-        // build-up), the rear is stiffer and more load-sensitive so heavy
-        // throttle / load transfer walks the car into gentle oversteer.
+        // F1-style split calibrated to real racing-slick behaviour: the
+        // lateral curve peaks at 6.5-7.5 deg slip (By at C=1.35), the front
+        // is the steering tire (slower build-up), the rear is stiffer and
+        // more load-sensitive so heavy throttle / load transfer walks the
+        // car into gentle oversteer.
         static Params Front() {
             Params p;
-            p.By = 10.5f;
+            p.By = 18.f;
             p.D0 = 1.58f;
             p.loadExp = 0.87f;
             p.wheelInertia = 1.2f;
@@ -56,7 +58,7 @@ public:
         }
         static Params Rear() {
             Params p;
-            p.By = 12.4f;
+            p.By = 20.f;
             p.D0 = 1.62f;
             p.loadExp = 0.83f;
             p.wheelInertia = 1.5f;
