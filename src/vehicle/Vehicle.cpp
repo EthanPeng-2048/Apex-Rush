@@ -674,8 +674,13 @@ void Vehicle::UpdateDamageFromContact(const ContactEvent& event) {
     // whose region contains it. Local axes: +X right, +Y up, +Z forward.
     const Vec3 local = RotateInv(transform.rotation, event.worldPoint - transform.position);
 
-    const float impact = Clampf(event.impactSpeed / 28.f, 0.f, 1.f);
-    if (impact < 0.06f) return;
+    // Closing-speed damage. Crash energy scales with v^2: a 145 km/h
+    // straight-on hit costs over half the part and a 200 km/h wall slam is
+    // near-fatal, while scrapes (tiny closing speed) stay harmless. The old
+    // linear formula capped at 0.42 per event and counted the full driving
+    // speed as impact — every corner scrape hit like a wall crash.
+    const float speed01 = Clampf(event.impactSpeed / 40.f, 0.f, 1.5f);
+    if (speed01 < 0.05f) return;
 
     // Barrier hits bruise the car less than car-to-car or ground strikes
     // (the wall's low restitution already scrubs the speed).
@@ -690,12 +695,12 @@ void Vehicle::UpdateDamageFromContact(const ContactEvent& event) {
     else if (std::fabs(local.x) > 0.52f) part = CarPart::Sidepods;
     else part = CarPart::Floor;
 
-    const float damage = impact * (wallHit ? 0.21f : 0.42f);
+    const float damage = speed01 * speed01 * (wallHit ? 0.70f : 0.55f);
     const int index = static_cast<int>(part);
     state_.partHealth[index] = Clampf(state_.partHealth[index] - damage, 0.f, 1.f);
 
     // Side impacts may also clip the floor edge.
-    if (part == CarPart::Sidepods && impact > 0.35f) {
+    if (part == CarPart::Sidepods && speed01 > 0.35f) {
         const int floorIndex = static_cast<int>(CarPart::Floor);
         state_.partHealth[floorIndex] = Clampf(state_.partHealth[floorIndex] - damage * 0.3f, 0.f, 1.f);
     }

@@ -126,6 +126,16 @@ int RunFlatStabilityTest(IPhysicsWorld& world) {
         check(turnDeg < 20.f, "flat: no snap spin at racing speed", turnDeg, 20.f);
         check(sideSlip() < 3.5f, "flat: low side slip at racing speed", sideSlip(), 3.5f);
         std::printf("       high-speed tap: v=%.1f km/h\n", s.speedKmh);
+
+        // Regression "cornering at speed blows half the car off": contact
+        // damage used to count the full driving speed as impact speed, so a
+        // floor/kerb scrape while cornering at 200+ km/h dealt wall-crash
+        // damage to the outer side. A clean high-speed run on open tarmac
+        // must leave all bodywork untouched.
+        for (int i = 0; i < 4; ++i) {
+            const float health = car.PartHealth(static_cast<CarPart>(i));
+            check(health > 0.95f, "flat: no phantom damage at racing speed", health, 1.f);
+        }
     }
 
     return failures;
@@ -193,9 +203,18 @@ int RunMenuTest() {
                RacePhase::Menu);
 
     press = InputState{};
-    press.menuSelect = true;  // START RACE
+    press.menuSelect = true;  // START RACE -> pre-race setup
     frame(press);
-    checkPhase(game.Phase() == RacePhase::Countdown, "menu: start race -> countdown", game.Phase(),
+    checkPhase(game.Phase() == RacePhase::RaceSetup, "menu: start race opens race setup",
+               game.Phase(), RacePhase::RaceSetup);
+
+    press = InputState{};
+    press.menuDown = true;
+    for (int i = 0; i < 4; ++i) frame(press);  // cursor -> START RACE row
+    press = InputState{};
+    press.menuSelect = true;
+    frame(press);
+    checkPhase(game.Phase() == RacePhase::Countdown, "setup: start -> countdown", game.Phase(),
                RacePhase::Countdown);
 
     return failures;
@@ -343,6 +362,62 @@ int RunAIDifficultyIsolationTest(const char* engine) {
           "diff: ai does not spin at off difficulty",
           Dot(fwd, track.ForwardAt(track.ProjectDistance(s.transform.position))), 0.3f);
     return failures;
+}
+
+// Wall slam: a high-speed head-on impact must destroy bodywork. Regression
+// for two bugs at once — "cornering blows half the car off" (impact speed
+// must be the normal closing speed, not the driving speed) and "wall rams
+// deal no damage" (damage must scale with crash energy and the normal sign
+// must be right).
+int RunWallCrashTest(IPhysicsWorld& world) {
+    world.SetGravity({0.f, -9.81f, 0.f});
+
+    BodyDesc ground;
+    ground.transform.position = {0.f, -1.f, 0.f};
+    ground.halfExtents = {2000.f, 1.f, 2000.f};
+    ground.friction = 0.8f;
+    world.CreateBody(ground);
+
+    BodyDesc wall;
+    wall.transform.position = {0.f, 1.f, 30.f};
+    wall.halfExtents = {40.f, 2.f, 1.f};
+    wall.friction = 0.4f;
+    wall.restitution = 0.1f;
+    wall.userData = SurfaceTag(SurfaceType::Wall);
+    world.CreateBody(wall);
+
+    VehicleParams params;
+    Transform pose;
+    pose.position = {0.f, 0.55f, 0.f};
+    Vehicle car;
+    car.Spawn(world, pose, params);
+    world.SetLinearVelocity(car.Chassis(), {0.f, 0.f, 50.f});  // 180 km/h
+
+    const float dt = 1.f / 240.f;
+    int contactEvents = 0;
+    float maxImpact = 0.f;
+    for (int i = 0; i < 480; ++i) {  // 2 s: reach the wall, crash, settle
+        VehicleInput in;
+        car.Update(in, dt);
+        world.Step(dt);
+        const std::vector<ContactEvent> contacts = world.DrainContacts();
+        for (const ContactEvent& e : contacts) {
+            ++contactEvents;
+            maxImpact = std::max(maxImpact, e.impactSpeed);
+        }
+        car.ProcessContacts(contacts, dt);
+    }
+
+    float worst = 1.f;
+    for (int i = 0; i < 4; ++i) {
+        worst = std::min(worst, car.PartHealth(static_cast<CarPart>(i)));
+    }
+    std::printf("       wall slam: worst part health %.2f, %d contact events, max impact %.1f m/s\n",
+                worst, contactEvents, maxImpact);
+    const bool ok = worst < 0.5f;
+    std::printf("[%s] wall slam at 180 km/h destroys bodywork (got %.2f, target < 0.50)\n",
+                ok ? "PASS" : "FAIL", worst);
+    return ok ? 0 : 1;
 }
 
 // `apex-rush --drive-test`: headless physics/controls verification. Drives the
@@ -504,6 +579,12 @@ int RunDriveTestForEngine(Config& config, const char* engine) {
     {
         std::unique_ptr<IPhysicsWorld> flatWorld = MakeWorld(engine);
         failures += RunFlatStabilityTest(*flatWorld);
+    }
+
+    // 5b) Wall slam must hurt (damage calibration / normal sign).
+    {
+        std::unique_ptr<IPhysicsWorld> crashWorld = MakeWorld(engine);
+        failures += RunWallCrashTest(*crashWorld);
     }
 
     // 6) Menu / settings flow (headless, backend-agnostic).

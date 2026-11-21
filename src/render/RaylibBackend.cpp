@@ -61,6 +61,10 @@ bool RaylibBackend::Init(int width, int height, const std::string& title) {
     ClampToScreen(width, height);
     InitWindow(width, height, title.c_str());
     if (!IsWindowReady()) return false;
+    // raylib closes the window on ESC by default, which hijacked the game's
+    // pause/back-to-menu handling ("ESC quits instead of pausing"). Hand ESC
+    // to the game instead.
+    SetExitKey(KEY_NULL);
 #ifdef _WIN32
     ImmDisableIME(0xFFFFFFFFul);  // current thread
 #endif

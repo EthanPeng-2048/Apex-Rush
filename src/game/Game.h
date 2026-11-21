@@ -17,6 +17,7 @@ namespace apex {
 enum class RacePhase {
     Menu,
     Settings,
+    RaceSetup,   // pre-race config (circuit / laps / cars / damage)
     Countdown,
     Racing,
     Finished,
@@ -42,8 +43,10 @@ struct Racer {
 // Owns the world, track, racers and UI. One instance per running game.
 class Game {
 public:
-    // Settings rows: race + video/physics + audio + BACK.
-    static constexpr int kSettingsRowCount = 17;
+    // Race-setup rows: circuit, laps, cars, damage, start, back.
+    static constexpr int kRaceSetupRowCount = 6;
+    // Global settings rows: assists + video/physics + audio + BACK.
+    static constexpr int kSettingsRowCount = 13;
 
     Game(IRenderer& renderer, IInput& input, Config& config, IAudio* audio = nullptr);
 
@@ -70,8 +73,10 @@ private:
     void UpdatePlayerInput();
     void UpdateMenu();
     void UpdateSettings();
+    void UpdateRaceSetup();
     void RenderMenu();
     void RenderSettings();
+    void RenderRaceSetup();
     void UpdateAI(Racer& racer, float dt);
     void StepPhysics(float dt);
     void UpdateRace(float dt);
@@ -111,10 +116,15 @@ private:
     float statusTimer_ = 0.f;
     bool wantsQuit_ = false;
 
+    // Latched DRS request: F is edge-triggered, DRS must stay open across
+    // frames until toggled off (it still auto-closes when unavailable).
+    bool drsWanted_ = false;
+
     // Menu / settings state.
     InputState rawInput_;
     int menuCursor_ = 0;
     int settingsCursor_ = 0;
+    int raceSetupCursor_ = 0;
 };
 
 }  // namespace apex

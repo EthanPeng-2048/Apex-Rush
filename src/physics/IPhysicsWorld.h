@@ -54,6 +54,9 @@ struct RayHit {
 
 // Contact reported for damage mapping. `localPointA/B` are contact points in
 // each body's local space so the game layer can map them to car parts.
+// `impactSpeed` is the CLOSING speed along worldNormal (relative velocity at
+// the contact point projected on the normal) — resting/scraping contacts
+// report ~0 even at 250 km/h, real crashes report their approach speed.
 struct ContactEvent {
     BodyHandle bodyA = kInvalidBody;
     BodyHandle bodyB = kInvalidBody;

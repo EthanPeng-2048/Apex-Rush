@@ -178,6 +178,7 @@ void Game::SpawnRacers() {
 void Game::StartRace() {
     LoadSettings();
     racers_.clear();
+    drsWanted_ = false;
     // Swap collision backends in-game via [physics] engine (qu3e | nudge).
     if (config_.GetString("physics", "engine", "qu3e") == "nudge") {
         world_ = std::make_unique<NudgeWorld>();
@@ -207,6 +208,8 @@ void Game::Update() {
         UpdateMenu();
     } else if (phase_ == RacePhase::Settings) {
         UpdateSettings();
+    } else if (phase_ == RacePhase::RaceSetup) {
+        UpdateRaceSetup();
     } else {
         for (Racer& racer : racers_) {
             if (!racer.isPlayer && !racer.finished) UpdateAI(racer, frameDt);
@@ -258,8 +261,10 @@ void Game::UpdatePlayerInput() {
     rawInput_ = input_.Poll();
     const InputState& raw = rawInput_;
 
-    // Menus own their input (UpdateMenu / UpdateSettings); cars stay parked.
-    if (phase_ == RacePhase::Menu || phase_ == RacePhase::Settings) {
+    // Menus own their input (UpdateMenu / UpdateSettings / UpdateRaceSetup);
+    // cars stay parked.
+    if (phase_ == RacePhase::Menu || phase_ == RacePhase::Settings ||
+        phase_ == RacePhase::RaceSetup) {
         player.input = VehicleInput{};
         return;
     }
@@ -275,12 +280,13 @@ void Game::UpdatePlayerInput() {
     }
 
     if (phase_ == RacePhase::Racing && !player.finished) {
+        if (raw.drsToggle) drsWanted_ = !drsWanted_;
         player.input.throttle = raw.throttle;
         player.input.brake = raw.brake;
         player.input.steer = raw.steer;
         player.input.handbrake = raw.handbrake;
         player.input.reverse = raw.reverse;
-        player.input.drsRequest = raw.drsToggle;
+        player.input.drsRequest = drsWanted_;
         player.input.wingToggle = raw.wingModeToggle;
         player.input.overtake = raw.overtake;
     } else if (phase_ == RacePhase::Countdown) {
@@ -526,7 +532,8 @@ void Game::UpdateCamera(float dt) {
     const Vec3 up{0.f, 1.f, 0.f};
 
     // Menus get a slow orbit around the parked car.
-    if (phase_ == RacePhase::Menu || phase_ == RacePhase::Settings) {
+    if (phase_ == RacePhase::Menu || phase_ == RacePhase::Settings ||
+        phase_ == RacePhase::RaceSetup) {
         const float angle = static_cast<float>(renderer_.TimeSeconds()) * 0.18f;
         const Vec3 desiredPos = state.transform.position +
                                 Vec3{std::cos(angle) * 13.f, 5.f, std::sin(angle) * 13.f};
@@ -546,13 +553,13 @@ void Game::UpdateCamera(float dt) {
     Vec3 desiredPos;
     Vec3 desiredTarget;
     switch (cameraMode_) {
-        case 0:  // chase
+        case 0:  // chase — aim above the car so it sits below screen centre
             desiredPos = state.transform.position - forward * 9.5f + up * 3.4f;
-            desiredTarget = state.transform.position + forward * 6.f;
+            desiredTarget = state.transform.position + forward * 6.f + up * 1.8f;
             break;
         case 1:  // far chase
             desiredPos = state.transform.position - forward * 15.f + up * 6.5f;
-            desiredTarget = state.transform.position + forward * 4.f;
+            desiredTarget = state.transform.position + forward * 4.f + up * 2.6f;
             break;
         case 2:  // hood
             desiredPos = state.transform.position + forward * 1.2f + up * 1.1f;
@@ -568,10 +575,13 @@ void Game::UpdateCamera(float dt) {
         }
     }
 
+    // Tight follow on the look target (a lagged target drops the car toward
+    // the top of the frame while accelerating), looser on the camera itself.
     const float blend = (cameraSmooth_ <= 0.f) ? 1.f : Clampf(dt * 6.f, 0.f, 1.f);
+    const float targetBlend = (cameraSmooth_ <= 0.f) ? 1.f : Clampf(dt * 12.f, 0.f, 1.f);
     cameraSmooth_ = 1.f;
     cameraPos_ += (desiredPos - cameraPos_) * blend;
-    cameraTarget_ += (desiredTarget - cameraTarget_) * blend;
+    cameraTarget_ += (desiredTarget - cameraTarget_) * targetBlend;
 
     CameraDesc cam;
     cam.position = cameraPos_;
@@ -591,6 +601,10 @@ void Game::RenderHUD() {
     }
     if (phase_ == RacePhase::Settings) {
         RenderSettings();
+        return;
+    }
+    if (phase_ == RacePhase::RaceSetup) {
+        RenderRaceSetup();
         return;
     }
     if (racers_.empty()) return;
@@ -696,7 +710,9 @@ void Game::UpdateMenu() {
     if (in.menuSelect) {
         switch (menuCursor_) {
             case 0:
-                StartRace();
+                // START RACE opens the pre-race setup, not the race itself.
+                phase_ = RacePhase::RaceSetup;
+                raceSetupCursor_ = 0;
                 break;
             case 1:
                 phase_ = RacePhase::Settings;
@@ -738,6 +754,119 @@ void Game::UpdateSettings() {
     if (dir == 0 && !in.menuSelect) return;
 
     switch (settingsCursor_) {
+        case 0:
+        case 1:
+        case 2:
+        case 3: {
+            static const char* kAssistKeys[4] = {"abs", "tc", "esc", "steer"};
+            const char* key = kAssistKeys[settingsCursor_];
+            int level = static_cast<int>(ParseAssistLevel(config_, key, DefaultAssistLevel(key)));
+            level = CyclePreset(level, 3, dir);
+            SaveAssistLevel(config_, key, static_cast<AssistLevel>(level));
+            break;
+        }
+        case 4: {
+            video_.borderlessFullscreen =
+                (dir != 0) ? (dir > 0) : !video_.borderlessFullscreen;
+            config_.SetString("video", "mode",
+                              video_.borderlessFullscreen ? "borderless" : "windowed");
+            renderer_.ApplyVideo(video_);
+            break;
+        }
+        case 5: {
+            int idx = 0;
+            for (int i = 0; i < kResPresetCount; ++i) {
+                if (kResPresets[i].width == video_.width && kResPresets[i].height == video_.height) {
+                    idx = i;
+                }
+            }
+            idx = CyclePreset(idx, kResPresetCount, dir);
+            video_.width = kResPresets[idx].width;
+            video_.height = kResPresets[idx].height;
+            config_.SetString("video", "width", std::to_string(video_.width));
+            config_.SetString("video", "height", std::to_string(video_.height));
+            renderer_.ApplyVideo(video_);
+            break;
+        }
+        case 6: {
+            video_.shadows = (dir != 0) ? (dir > 0) : !video_.shadows;
+            config_.SetString("video", "quality", video_.shadows ? "high" : "low");
+            renderer_.ApplyVideo(video_);
+            break;
+        }
+        case 7: {
+            int idx = 0;
+            for (int i = 0; i < kFpsPresetCount; ++i) {
+                if (kFpsPresets[i] == video_.fpsLimit) idx = i;
+            }
+            idx = CyclePreset(idx, kFpsPresetCount, dir);
+            video_.fpsLimit = kFpsPresets[idx];
+            config_.SetString("video", "fps_limit", std::to_string(video_.fpsLimit));
+            renderer_.ApplyVideo(video_);
+            break;
+        }
+        case 8: {
+            const int hz = static_cast<int>(1.f / fixedDt_ + 0.5f);
+            int idx = 1;
+            for (int i = 0; i < kPhysicsPresetCount; ++i) {
+                if (kPhysicsPresets[i] == hz) idx = i;
+            }
+            idx = CyclePreset(idx, kPhysicsPresetCount, dir);
+            fixedDt_ = 1.f / static_cast<float>(kPhysicsPresets[idx]);
+            config_.SetString("physics", "hz", std::to_string(kPhysicsPresets[idx]));
+            break;
+        }
+        case 9: {
+            // Collision backend swap (qu3e | nudge) — rebuilt on next race.
+            const bool nudge = config_.GetString("physics", "engine", "qu3e") == "nudge";
+            config_.SetString("physics", "engine",
+                              (dir != 0) ? (dir > 0 ? "nudge" : "qu3e")
+                                         : (nudge ? "qu3e" : "nudge"));
+            break;
+        }
+        case 10: {
+            const int volume =
+                std::clamp(config_.GetInt("audio", "volume", 80) + (dir != 0 ? (dir > 0 ? 20 : -20) : 20),
+                           0, 100);
+            config_.SetString("audio", "volume", std::to_string(volume));
+            if (audio_) audio_->SetMasterVolume(volume / 100.f);
+            break;
+        }
+        default: {
+            static const char* kAudioBackends[4] = {"auto", "wasapi", "directsound", "winmm"};
+            const std::string current = config_.GetString("audio", "backend", "auto");
+            int idx = 0;
+            for (int i = 0; i < 4; ++i) {
+                if (current == kAudioBackends[i]) idx = i;
+            }
+            idx = CyclePreset(idx, 4, dir);
+            config_.SetString("audio", "backend", kAudioBackends[idx]);
+            if (audio_) audio_->SetBackend(kAudioBackends[idx]);
+            break;
+        }
+    }
+}
+
+void Game::UpdateRaceSetup() {
+    constexpr int kRows = kRaceSetupRowCount;
+    const InputState& in = rawInput_;
+    if (audio_ && (in.menuUp || in.menuDown || in.menuLeft || in.menuRight || in.menuSelect)) {
+        audio_->PlayUIClick();
+    }
+    if (in.menuUp) raceSetupCursor_ = (raceSetupCursor_ + kRows - 1) % kRows;
+    if (in.menuDown) raceSetupCursor_ = (raceSetupCursor_ + 1) % kRows;
+
+    if (in.menuBack) {
+        config_.Save("config.ini");
+        phase_ = RacePhase::Menu;
+        menuCursor_ = 0;
+        return;
+    }
+
+    const int dir = (in.menuRight ? 1 : 0) - (in.menuLeft ? 1 : 0);
+    if (dir == 0 && !in.menuSelect) return;
+
+    switch (raceSetupCursor_) {
         case 0: {
             const int count = static_cast<int>(mapList_.size());
             int idx = 0;
@@ -766,94 +895,17 @@ void Game::UpdateSettings() {
             config_.SetString("race", "damage", value ? "true" : "false");
             break;
         }
-        case 4:
-        case 5:
-        case 6:
-        case 7: {
-            static const char* kAssistKeys[4] = {"abs", "tc", "esc", "steer"};
-            const char* key = kAssistKeys[settingsCursor_ - 4];
-            int level = static_cast<int>(ParseAssistLevel(config_, key, DefaultAssistLevel(key)));
-            level = CyclePreset(level, 3, dir);
-            SaveAssistLevel(config_, key, static_cast<AssistLevel>(level));
-            break;
-        }
-        case 8: {
-            video_.borderlessFullscreen =
-                (dir != 0) ? (dir > 0) : !video_.borderlessFullscreen;
-            config_.SetString("video", "mode",
-                              video_.borderlessFullscreen ? "borderless" : "windowed");
-            renderer_.ApplyVideo(video_);
-            break;
-        }
-        case 9: {
-            int idx = 0;
-            for (int i = 0; i < kResPresetCount; ++i) {
-                if (kResPresets[i].width == video_.width && kResPresets[i].height == video_.height) {
-                    idx = i;
-                }
-            }
-            idx = CyclePreset(idx, kResPresetCount, dir);
-            video_.width = kResPresets[idx].width;
-            video_.height = kResPresets[idx].height;
-            config_.SetString("video", "width", std::to_string(video_.width));
-            config_.SetString("video", "height", std::to_string(video_.height));
-            renderer_.ApplyVideo(video_);
-            break;
-        }
-        case 10: {
-            video_.shadows = (dir != 0) ? (dir > 0) : !video_.shadows;
-            config_.SetString("video", "quality", video_.shadows ? "high" : "low");
-            renderer_.ApplyVideo(video_);
-            break;
-        }
-        case 11: {
-            int idx = 0;
-            for (int i = 0; i < kFpsPresetCount; ++i) {
-                if (kFpsPresets[i] == video_.fpsLimit) idx = i;
-            }
-            idx = CyclePreset(idx, kFpsPresetCount, dir);
-            video_.fpsLimit = kFpsPresets[idx];
-            config_.SetString("video", "fps_limit", std::to_string(video_.fpsLimit));
-            renderer_.ApplyVideo(video_);
-            break;
-        }
-        case 12: {
-            const int hz = static_cast<int>(1.f / fixedDt_ + 0.5f);
-            int idx = 1;
-            for (int i = 0; i < kPhysicsPresetCount; ++i) {
-                if (kPhysicsPresets[i] == hz) idx = i;
-            }
-            idx = CyclePreset(idx, kPhysicsPresetCount, dir);
-            fixedDt_ = 1.f / static_cast<float>(kPhysicsPresets[idx]);
-            config_.SetString("physics", "hz", std::to_string(kPhysicsPresets[idx]));
-            break;
-        }
-        case 13: {
-            // Collision backend swap (qu3e | nudge) — rebuilt on next race.
-            const bool nudge = config_.GetString("physics", "engine", "qu3e") == "nudge";
-            config_.SetString("physics", "engine",
-                              (dir != 0) ? (dir > 0 ? "nudge" : "qu3e")
-                                         : (nudge ? "qu3e" : "nudge"));
-            break;
-        }
-        case 14: {
-            const int volume =
-                std::clamp(config_.GetInt("audio", "volume", 80) + (dir != 0 ? (dir > 0 ? 20 : -20) : 20),
-                           0, 100);
-            config_.SetString("audio", "volume", std::to_string(volume));
-            if (audio_) audio_->SetMasterVolume(volume / 100.f);
+        case 4: {
+            // START
+            config_.Save("config.ini");
+            StartRace();
             break;
         }
         default: {
-            static const char* kAudioBackends[4] = {"auto", "wasapi", "directsound", "winmm"};
-            const std::string current = config_.GetString("audio", "backend", "auto");
-            int idx = 0;
-            for (int i = 0; i < 4; ++i) {
-                if (current == kAudioBackends[i]) idx = i;
-            }
-            idx = CyclePreset(idx, 4, dir);
-            config_.SetString("audio", "backend", kAudioBackends[idx]);
-            if (audio_) audio_->SetBackend(kAudioBackends[idx]);
+            // BACK
+            config_.Save("config.ini");
+            phase_ = RacePhase::Menu;
+            menuCursor_ = 0;
             break;
         }
     }
@@ -900,15 +952,10 @@ void Game::RenderSettings() {
         const char* label;
         std::string value;
     };
-    const int cars = config_.GetInt("race", "cars", 4);
     const int physicsHz = static_cast<int>(1.f / fixedDt_ + 0.5f);
     char resBuffer[32];
     std::snprintf(resBuffer, sizeof(resBuffer), "%dx%d", video_.width, video_.height);
     const Row rows[kSettingsRowCount] = {
-        {"CIRCUIT", MapDisplayName(mapName_)},
-        {"LAPS", std::to_string(totalLaps_)},
-        {"CARS", std::to_string(cars)},
-        {"DAMAGE", config_.GetBool("race", "damage", true) ? "ON" : "OFF"},
         {"ABS", AssistLevelName(ParseAssistLevel(config_, "abs", DefaultAssistLevel("abs")))},
         {"TRACTION CTRL", AssistLevelName(ParseAssistLevel(config_, "tc", DefaultAssistLevel("tc")))},
         {"STABILITY CTRL", AssistLevelName(ParseAssistLevel(config_, "esc", DefaultAssistLevel("esc")))},
@@ -924,7 +971,7 @@ void Game::RenderSettings() {
         {"BACK", ""},
     };
 
-    // 17 rows fit 720p by shrinking the row height when needed.
+    // The row height shrinks so the list fits 720p.
     const float top = h * 0.17f;
     const float rowH = std::clamp((h - top - 90.f) / kSettingsRowCount, 26.f, 46.f);
     const int fontSize = rowH > 38.f ? 22 : 17;
@@ -946,6 +993,58 @@ void Game::RenderSettings() {
     }
 
     const std::string hint = "A/D CHANGE    W/S SELECT    ENTER/ESC BACK";
+    const Vec2f hintSize = renderer_.MeasureText2D(hint, 18);
+    renderer_.DrawText2D(hint, w * 0.5f - hintSize.x * 0.5f, h - 52.f, 18, Color::Gray());
+}
+
+void Game::RenderRaceSetup() {
+    const float w = static_cast<float>(renderer_.ScreenWidth());
+    const float h = static_cast<float>(renderer_.ScreenHeight());
+
+    renderer_.DrawRect2D(0.f, 0.f, w, h, Color{0.f, 0.f, 0.f, 0.45f});
+
+    const std::string title = "RACE SETUP";
+    const Vec2f titleSize = renderer_.MeasureText2D(title, 42);
+    renderer_.DrawText2D(title, w * 0.5f - titleSize.x * 0.5f, h * 0.18f, 42, Color::White());
+
+    struct Row {
+        const char* label;
+        std::string value;
+    };
+    const Row rows[kRaceSetupRowCount] = {
+        {"CIRCUIT", MapDisplayName(mapName_)},
+        {"LAPS", std::to_string(totalLaps_)},
+        {"CARS", std::to_string(config_.GetInt("race", "cars", 4))},
+        {"DAMAGE", config_.GetBool("race", "damage", true) ? "ON" : "OFF"},
+        {"START RACE", ""},
+        {"BACK", ""},
+    };
+
+    const float top = h * 0.32f;
+    const float rowH = std::clamp((h - top - 110.f) / kRaceSetupRowCount, 34.f, 52.f);
+    const int fontSize = rowH > 42.f ? 24 : 20;
+    float y = top;
+    for (int i = 0; i < kRaceSetupRowCount; ++i) {
+        const bool selected = (i == raceSetupCursor_);
+        const bool action = (i >= 4);  // START / BACK rows
+        renderer_.DrawRect2D(w * 0.5f - 300.f, y - 2.f, 600.f, rowH - 4.f,
+                             selected ? Color{1.f, 0.55f, 0.15f, 0.22f}
+                                      : Color{0.f, 0.f, 0.f, 0.25f});
+        renderer_.DrawText2D(rows[i].label,
+                             action ? w * 0.5f - renderer_.MeasureText2D(rows[i].label, fontSize).x * 0.5f
+                                    : w * 0.5f - 280.f,
+                             y + (rowH - 4.f - fontSize) * 0.5f, fontSize,
+                             selected ? Color::Orange() : Color::White());
+        if (!rows[i].value.empty()) {
+            const Vec2f valueSize = renderer_.MeasureText2D(rows[i].value, fontSize);
+            renderer_.DrawText2D(rows[i].value, w * 0.5f + 280.f - valueSize.x,
+                                 y + (rowH - 4.f - fontSize) * 0.5f, fontSize,
+                                 selected ? Color::Yellow() : Color::Gray());
+        }
+        y += rowH;
+    }
+
+    const std::string hint = "A/D CHANGE    W/S SELECT    ENTER CONFIRM    ESC BACK";
     const Vec2f hintSize = renderer_.MeasureText2D(hint, 18);
     renderer_.DrawText2D(hint, w * 0.5f - hintSize.x * 0.5f, h - 52.f, 18, Color::Gray());
 }

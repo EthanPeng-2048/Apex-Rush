@@ -68,7 +68,14 @@ public:
         // q3Contact::position is already a world-space contact point.
         event.worldPoint = FromQ3(contact->manifold.contacts[0].position);
         event.worldNormal = FromQ3(contact->manifold.normal);
-        event.impactSpeed = Length(FromQ3(a->GetLinearVelocity() - b->GetLinearVelocity()));
+        // Closing speed along the normal only. Full relative velocity counts
+        // the driving speed as "impact" — a floor scrape at 250 km/h used to
+        // report 70 m/s and blow half the car's health off in a corner.
+        const Vec3 point = event.worldPoint;
+        const Vec3 rel = FromQ3(a->GetVelocityAtWorldPoint(ToQ3(point)) -
+                                b->GetVelocityAtWorldPoint(ToQ3(point)));
+        // normal runs A -> B, so Dot(rel, n) > 0 means A closes on B.
+        event.impactSpeed = std::max(0.f, Dot(rel, event.worldNormal));
         event.userDataA = const_cast<void*>(a->GetUserData());
         event.userDataB = const_cast<void*>(b->GetUserData());
         contacts.push_back(event);
