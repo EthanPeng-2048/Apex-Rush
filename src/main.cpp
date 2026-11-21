@@ -1001,16 +1001,21 @@ int main(int argc, char** argv) {
     if (settingsShot) config.SetString("race", "settings_qa", "true");
 
     // JobSystem width: deterministic serial for drive-test; native parallel
-    // pool for bench (async performance) and interactive play.
+    // pool for bench (async performance) and interactive play. Emscripten
+    // has no pthreads in our build (no COOP/COEP) — always serial there.
     if (driveTest) {
         rush::JobSystem::Get().Configure(0);
         return RunDriveTest(config);
     }
+#if defined(__EMSCRIPTEN__)
+    rush::JobSystem::Get().Configure(0);
+#else
     if (bench || (!menuShot && !settingsShot && !dumpPath && !shotPath)) {
         rush::JobSystem::Get().Configure(std::thread::hardware_concurrency());
     } else {
         rush::JobSystem::Get().Configure(0);
     }
+#endif
 
     if (bench) {
         // Local config only — never Save, same rule as the test paths.
@@ -1059,7 +1064,9 @@ int main(int argc, char** argv) {
     Game game(backend, backend, config, &audio);
     // Native play: race stages run on the sim worker; menus stay on main.
     // Headless tests / --bench keep inline (deterministic pump).
+    #if !defined(__EMSCRIPTEN__)
     game.SetThreadedSim(true);
+#endif
     if (!game.Init()) {
         backend.Shutdown();
         return 1;
