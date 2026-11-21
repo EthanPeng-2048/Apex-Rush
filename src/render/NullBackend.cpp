@@ -1,5 +1,7 @@
 #include "render/NullBackend.h"
 
+#include <cstdio>
+
 namespace apex {
 
 bool NullBackend::Init(int width, int height, const std::string&) {
@@ -29,7 +31,9 @@ MeshHandle NullBackend::CreateMesh(const MeshData& data) {
 
 void NullBackend::DestroyMesh(MeshHandle handle) { meshes_.erase(handle); }
 
-void NullBackend::DrawMesh(MeshHandle, const Transform&, const Color&) {}
+void NullBackend::DrawMesh(MeshHandle handle, const Transform& transform, const Color& tint) {
+    if (captureDraws) draws_.push_back({handle, transform, tint});
+}
 void NullBackend::DrawBox(const Vec3&, const Transform&, const Color&) {}
 void NullBackend::DrawLine3D(const Vec3&, const Vec3&, const Color&) {}
 void NullBackend::DrawGrid(int, float) {}
@@ -45,5 +49,29 @@ float NullBackend::FrameTime() const { return frameDt; }
 void NullBackend::CaptureScreenshot(const std::string&) {}
 
 InputState NullBackend::Poll() { return scripted; }
+
+void NullBackend::DumpObj(const std::string& path) const {
+    std::FILE* f = std::fopen(path.c_str(), "w");
+    if (!f) return;
+    int base = 1;
+    for (size_t d = 0; d < draws_.size(); ++d) {
+        const DrawCmd& cmd = draws_[d];
+        const auto it = meshes_.find(cmd.mesh);
+        if (it == meshes_.end()) continue;
+        const MeshData& mesh = it->second;
+        std::fprintf(f, "g draw%zu\n# tint %.3f %.3f %.3f\n", d, cmd.tint.r, cmd.tint.g, cmd.tint.b);
+        for (const Vec3& p : mesh.positions) {
+            const Vec3 w = Rotate(cmd.transform.rotation, p) + cmd.transform.position;
+            std::fprintf(f, "v %.4f %.4f %.4f\n", w.x, w.y, w.z);
+        }
+        for (size_t i = 0; i + 2 < mesh.indices.size(); i += 3) {
+            std::fprintf(f, "f %d %d %d\n", base + static_cast<int>(mesh.indices[i]),
+                         base + static_cast<int>(mesh.indices[i + 1]),
+                         base + static_cast<int>(mesh.indices[i + 2]));
+        }
+        base += static_cast<int>(mesh.positions.size());
+    }
+    std::fclose(f);
+}
 
 }  // namespace apex

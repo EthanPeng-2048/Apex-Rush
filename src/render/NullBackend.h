@@ -46,12 +46,24 @@ public:
     // IInput --------------------------------------------------------------
     InputState Poll() override;
 
+    // Debug capture: record DrawMesh calls so the composed scene can be
+    // exported (DumpObj) and inspected without a GPU/window.
+    bool captureDraws = false;
+    void DumpObj(const std::string& path) const;
+
 private:
+    struct DrawCmd {
+        MeshHandle mesh = kInvalidMesh;
+        Transform transform;
+        Color tint;
+    };
+
     int width_ = 1280;
     int height_ = 720;
     double time_ = 0.0;
     MeshHandle nextMesh_ = 1;
     std::unordered_map<MeshHandle, MeshData> meshes_;
+    std::vector<DrawCmd> draws_;
     bool closeRequested_ = false;
 };
 

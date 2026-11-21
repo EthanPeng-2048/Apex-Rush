@@ -200,15 +200,15 @@ void Track::BuildMesh(IRenderer& renderer) {
             mesh.indices.push_back(base + 0);
             mesh.indices.push_back(base + 1);
             mesh.indices.push_back(base + 2);
-            mesh.indices.push_back(base + 2);
             mesh.indices.push_back(base + 1);
             mesh.indices.push_back(base + 3);
+            mesh.indices.push_back(base + 2);
         } else {
             mesh.indices.push_back(base + 0);
             mesh.indices.push_back(base + 2);
             mesh.indices.push_back(base + 1);
-            mesh.indices.push_back(base + 3);
             mesh.indices.push_back(base + 2);
+            mesh.indices.push_back(base + 3);
             mesh.indices.push_back(base + 1);
         }
     };

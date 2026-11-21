@@ -126,14 +126,18 @@ int main(int argc, char** argv) {
     using namespace apex;
 
     // `apex-rush --shot <path>`: run 90 frames, save a screenshot, exit.
-    // Used for automated visual verification.
+    // `apex-rush --dump-scene <path.obj>`: headless, export the composed scene
+    // (track + cars with draw transforms) for offline inspection.
     const char* shotPath = nullptr;
+    const char* dumpPath = nullptr;
     bool driveTest = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--drive-test") == 0) {
             driveTest = true;
         } else if (std::strcmp(argv[i], "--shot") == 0 && i + 1 < argc) {
             shotPath = argv[++i];
+        } else if (std::strcmp(argv[i], "--dump-scene") == 0 && i + 1 < argc) {
+            dumpPath = argv[++i];
         }
     }
 
@@ -142,6 +146,25 @@ int main(int argc, char** argv) {
 
     if (driveTest) {
         return RunDriveTest(config);
+    }
+
+    if (dumpPath) {
+        NullBackend backend;
+        backend.captureDraws = true;
+        backend.Init(1280, 720, "dump-scene");
+        config.SetString("race", "cars", "2");
+        Game game(backend, backend, config);
+        if (!game.Init()) return 1;
+        for (int i = 0; i < 260; ++i) {  // settle past the countdown
+            backend.BeginFrame();
+            game.Update();
+            backend.EndFrame();
+        }
+        game.Render3D();
+        backend.DumpObj(dumpPath);
+        backend.Shutdown();
+        std::printf("scene dumped to %s\n", dumpPath);
+        return 0;
     }
 
     RaylibBackend backend;
