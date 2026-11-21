@@ -69,7 +69,7 @@ bool RaylibBackend::Init(int width, int height, const std::string& title) {
     impl_->camera.position = {0.f, 8.f, -12.f};
     impl_->camera.target = {0.f, 0.f, 0.f};
     impl_->camera.up = {0.f, 1.f, 0.f};
-    impl_->camera.fovy = 65.f;
+    impl_->camera.fovy = 50.f;
     impl_->camera.projection = CAMERA_PERSPECTIVE;
     return true;
 }

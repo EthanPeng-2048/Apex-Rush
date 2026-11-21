@@ -200,6 +200,13 @@ int RunAITest() {
     config.SetString("race", "cars", "4");
     config.SetString("race", "autostart", "true");
     config.SetString("race", "autopilot", "true");
+    // Pin the autopilot player car's assists so the AI regression stays
+    // deterministic regardless of the player's difficulty settings (AI cars
+    // themselves run fixed assists and never read these).
+    config.SetString("assists", "steer", "full");
+    config.SetString("assists", "esc", "full");
+    config.SetString("assists", "tc", "sport");
+    config.SetString("assists", "abs", "sport");
 
     Game game(backend, backend, config);
     if (!game.Init()) {
@@ -254,6 +261,69 @@ int RunAITest() {
         std::snprintf(name, sizeof(name), "ai[%zu]: stays in corridor", k);
         check(maxOffset[k] < bound, name, maxOffset[k], bound);
     }
+    return failures;
+}
+
+// AI difficulty isolation: player assist settings must not leak into AI
+// cars. Regression for "AI spins at assists-off difficulty" — with every
+// player assist off the AI must still run its fixed aids and keep racing.
+int RunAIDifficultyIsolationTest() {
+    NullBackend backend;
+    if (!backend.Init(1280, 720, "ai-diff-test")) {
+        std::printf("[FAIL] ai-diff-test backend init\n");
+        return 1;
+    }
+
+    Config config;
+    config.Load("config.ini");
+    config.SetString("race", "cars", "2");
+    config.SetString("race", "autostart", "true");
+    config.SetString("assists", "steer", "off");
+    config.SetString("assists", "esc", "off");
+    config.SetString("assists", "tc", "off");
+    config.SetString("assists", "abs", "off");
+
+    Game game(backend, backend, config);
+    if (!game.Init()) {
+        std::printf("[FAIL] ai-diff-test game init\n");
+        return 1;
+    }
+
+    int failures = 0;
+    auto check = [&failures](bool ok, const char* what, float got, float want) {
+        std::printf("[%s] %s (got %.2f, target %.2f)\n", ok ? "PASS" : "FAIL", what, got, want);
+        if (!ok) ++failures;
+    };
+
+    const VehicleParams& aiParams = game.Racers()[1].vehicle.Params();
+    const VehicleParams& playerParams = game.Racers()[0].vehicle.Params();
+    check(playerParams.steerLevel == AssistLevel::Off, "diff: player keeps off assists",
+          static_cast<float>(playerParams.steerLevel), 0.f);
+    check(aiParams.steerLevel == AssistLevel::Full, "diff: ai steer assist fixed",
+          static_cast<float>(aiParams.steerLevel), 2.f);
+    check(aiParams.escLevel == AssistLevel::Full, "diff: ai esc assist fixed",
+          static_cast<float>(aiParams.escLevel), 2.f);
+
+    const Track& track = game.GetTrack();
+    const float d0 = track.ProjectDistance(game.Racers()[1].vehicle.State().transform.position);
+    // The player starts one grid slot ahead, so drive it away at full
+    // throttle — a parked player car would trip the AI traffic limiter.
+    InputState driveAway;
+    driveAway.throttle = 1.f;
+    for (int i = 0; i < 720; ++i) {
+        backend.scripted = driveAway;
+        backend.BeginFrame();
+        game.Update();
+        backend.EndFrame();
+    }
+    const VehicleState& s = game.Racers()[1].vehicle.State();
+    float traveled = track.ProjectDistance(s.transform.position) - d0;
+    if (traveled < -track.TotalLength() * 0.5f) traveled += track.TotalLength();
+    check(traveled > 150.f, "diff: ai makes progress at off difficulty", traveled, 150.f);
+    const Vec3 fwd = TransformDirection(s.transform, Vec3{0.f, 0.f, 1.f});
+    check(Dot(fwd, track.ForwardAt(track.ProjectDistance(s.transform.position))) > 0.3f,
+          "diff: ai does not spin at off difficulty",
+          Dot(fwd, track.ForwardAt(track.ProjectDistance(s.transform.position))), 0.3f);
     return failures;
 }
 
@@ -418,6 +488,9 @@ int RunDriveTest(Config& config) {
 
     // 7) AI autopilot: no wall planting, real progress.
     failures += RunAITest();
+
+    // 8) AI cars ignore player difficulty assists (never spin at assists-off).
+    failures += RunAIDifficultyIsolationTest();
 
     std::printf("drive-test: %s (%d failures)\n", failures == 0 ? "OK" : "FAILED", failures);
     backend.Shutdown();

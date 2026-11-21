@@ -109,10 +109,21 @@ void Game::SpawnRacers() {
         racer.isPlayer = (i == 0);
 
         VehicleParams params;
-        params.absLevel = ParseAssistLevel(config_, "abs", DefaultAssistLevel("abs"));
-        params.tcLevel = ParseAssistLevel(config_, "tc", DefaultAssistLevel("tc"));
-        params.escLevel = ParseAssistLevel(config_, "esc", DefaultAssistLevel("esc"));
-        params.steerLevel = ParseAssistLevel(config_, "steer", DefaultAssistLevel("steer"));
+        if (racer.isPlayer) {
+            // Difficulty assists only apply to the player's car.
+            params.absLevel = ParseAssistLevel(config_, "abs", DefaultAssistLevel("abs"));
+            params.tcLevel = ParseAssistLevel(config_, "tc", DefaultAssistLevel("tc"));
+            params.escLevel = ParseAssistLevel(config_, "esc", DefaultAssistLevel("esc"));
+            params.steerLevel = ParseAssistLevel(config_, "steer", DefaultAssistLevel("steer"));
+        } else {
+            // AI cars run a fixed assist set so player difficulty settings
+            // never change their behavior. Without the counter-steer / yaw
+            // aids the AI spins at the assists-off difficulty.
+            params.absLevel = AssistLevel::Sport;
+            params.tcLevel = AssistLevel::Sport;
+            params.escLevel = AssistLevel::Full;
+            params.steerLevel = AssistLevel::Full;
+        }
         params.damageEnabled = config_.GetBool("race", "damage", true);
 
         Transform pose;
@@ -455,7 +466,7 @@ void Game::UpdateCamera(float dt) {
         cam.position = cameraPos_;
         cam.target = cameraTarget_;
         cam.up = up;
-        cam.fovYDeg = 58.f;
+        cam.fovYDeg = 50.f;
         renderer_.SetCamera(cam);
         return;
     }
@@ -494,7 +505,10 @@ void Game::UpdateCamera(float dt) {
     cam.position = cameraPos_;
     cam.target = cameraTarget_;
     cam.up = up;
-    cam.fovYDeg = 62.f + Clampf(state.speed * 0.12f, 0.f, 10.f);
+    // Narrow vertical FOV: the old 62+speed*0.12 fisheyed to 72 deg at racing
+    // speed, shrinking the road ahead into the distance. Keep it tight and let
+    // speed widen it only slightly so the sense of speed survives.
+    cam.fovYDeg = 50.f + Clampf(state.speed * 0.03f, 0.f, 2.f);
     renderer_.SetCamera(cam);
 }
 
