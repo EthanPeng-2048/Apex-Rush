@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -9,6 +10,7 @@ import rush.engine.core;
 #include "game/Track.h"
 import rush.engine.physics;
 import rush.engine.render;
+import rush.engine.runtime;
 
 namespace apex {
 
@@ -49,6 +51,7 @@ public:
     static constexpr int kSettingsRowCount = 17;
 
     Game(IRenderer& renderer, IInput& input, Config& config, IAudio* audio = nullptr);
+    ~Game();
 
     bool Init();
     // Update (input, physics, race), then Render3D (inside BeginScene/EndScene),
@@ -83,6 +86,25 @@ public:
     void ResetBench() { bench_ = BenchSample{}; }
     const BenchSample& Bench() const { return bench_; }
 
+    // Async runtime: when enabled, race phases run on a worker thread and
+    // Render3D reads a published snapshot (double buffer). Menu phases stay
+    // on the caller thread. drive-test / WASM keep this off (inline pump).
+    struct CarPose {
+        Transform chassis;
+        VehicleState state;
+        VehicleParams params;
+        bool isPlayer = false;
+        Color tint{1.f, 1.f, 1.f, 1.f};
+    };
+    struct RaceSnapshot {
+        std::vector<CarPose> cars;
+        RacePhase phase = RacePhase::Menu;
+        float raceClock = 0.f;
+        bool valid = false;
+    };
+    void SetThreadedSim(bool on);
+    bool ThreadedSim() const { return threadedSim_; }
+
 private:
     void BuildWorld();
     void LoadSettings();
@@ -100,6 +122,13 @@ private:
     void ProcessCollisionEvents(float dt);
     void UpdateRace(float dt);
     void UpdateCamera(float dt);
+    // Sim half of the frame (AI + fixed-step physics + race rules). Runs on
+    // the caller thread in inline mode, or on the sim worker when threaded.
+    void UpdateSim(float frameDt);
+    void PublishSnapshot();
+    void StartSimWorker();
+    void StopSimWorker();
+    void UpdateCameraFrom(const VehicleState& player, float dt);
 
     IRenderer& renderer_;
     IInput& input_;
@@ -156,6 +185,17 @@ private:
 
     bool benchOn_ = false;
     BenchSample bench_;
+
+    // Async sim worker + snapshot handshake (rush.engine.runtime).
+    bool threadedSim_ = false;
+    rush::SnapshotDoubleBuffer<RaceSnapshot> snapshots_;
+    rush::SimThread simWorker_;
+    std::atomic<bool> simRun_{false};
+    // Player input written by the main thread, read by the sim worker.
+    std::atomic<float> asyncThrottle_{0.f};
+    std::atomic<float> asyncBrake_{0.f};
+    std::atomic<float> asyncSteer_{0.f};
+    std::atomic<uint32_t> asyncBits_{0};  // VehicleInput flag bits
 };
 
 }  // namespace apex

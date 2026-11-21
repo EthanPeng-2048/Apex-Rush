@@ -933,6 +933,7 @@ int RunBench(Config& config, int cars, const char* engine, double raceSeconds) {
     const Game::BenchSample& s = game.Bench();
     const double n = s.frames > 0 ? static_cast<double>(s.frames) : 1.0;
     const double steps = s.physSteps > 0 ? static_cast<double>(s.physSteps) : 1.0;
+    std::printf("bench racers=%zu\n", game.Racers().size());
     std::printf(
         "bench[%s] cars=%d frames=%ld physSteps=%ld wall=%.3fs\n"
         "  per-frame ms:  update=%.3f  ai=%.3f  race=%.3f\n"
@@ -1056,6 +1057,9 @@ int main(int argc, char** argv) {
     }
 
     Game game(backend, backend, config, &audio);
+    // Native play: race stages run on the sim worker; menus stay on main.
+    // Headless tests / --bench keep inline (deterministic pump).
+    game.SetThreadedSim(true);
     if (!game.Init()) {
         backend.Shutdown();
         return 1;

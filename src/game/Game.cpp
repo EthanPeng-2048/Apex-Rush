@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <thread>
 #include <cstring>
 
 #include "game/MapData.h"
@@ -214,6 +215,8 @@ void Game::StartRace() {
     accumulator_ = 0.f;
 }
 
+Game::~Game() { StopSimWorker(); }
+
 void Game::BuildWorld() {
     const MapData map = LoadMapData(DataPath("assets/maps"), mapName_);
     track_.Build(map, *world_, renderer_);
@@ -225,64 +228,73 @@ void Game::Update() {
 
     UpdatePlayerInput();
 
-    if (phase_ == RacePhase::Menu) {
-        UpdateMenu();
-    } else if (phase_ == RacePhase::Settings) {
-        UpdateSettings();
-    } else if (phase_ == RacePhase::RaceSetup) {
-        UpdateRaceSetup();
+    const bool menuPhase = phase_ == RacePhase::Menu || phase_ == RacePhase::Settings ||
+                           phase_ == RacePhase::RaceSetup;
+
+    if (menuPhase) {
+        // Menus always own the caller thread; park the sim worker.
+        StopSimWorker();
+        if (phase_ == RacePhase::Menu) {
+            UpdateMenu();
+        } else if (phase_ == RacePhase::Settings) {
+            UpdateSettings();
+        } else {
+            UpdateRaceSetup();
+        }
+    } else if (threadedSim_) {
+        // Race on the worker: main only feeds input bits + camera/audio from
+        // the published snapshot. UpdateSim runs on simWorker_.
+        if (!simWorker_.Running()) StartSimWorker();
+        // Player input is already applied to racers_[0].input by
+        // UpdatePlayerInput (same memory the worker reads — single-writer
+        // after the main thread finishes this call; worker publishes after).
+        // Camera / status / audio consume the latest snapshot below.
     } else {
-        // Data-parallel AI: each car only writes its own VehicleInput.
-        if (benchOn_) {
-            const BenchClock::time_point t0 = BenchClock::now();
-            rush::JobSystem::Get().ParallelFor(racers_.size(), [&](std::size_t i) {
-                Racer& racer = racers_[i];
-                if (!racer.isPlayer && !racer.finished) UpdateAI(racer, frameDt);
-            });
-            bench_.aiSec += BenchSec(t0, BenchClock::now());
-        } else {
-            rush::JobSystem::Get().ParallelFor(racers_.size(), [&](std::size_t i) {
-                Racer& racer = racers_[i];
-                if (!racer.isPlayer && !racer.finished) UpdateAI(racer, frameDt);
-            });
-        }
-
-        // Fixed-step physics (rate from [physics] hz, default 240).
-        accumulator_ += frameDt;
-        while (accumulator_ >= fixedDt_) {
-            StepPhysics(fixedDt_);
-            // Gameplay stage: drain CollisionBus after the physics stage has
-            // published (strict async — no producer-side callbacks).
-            ProcessCollisionEvents(fixedDt_);
-            accumulator_ -= fixedDt_;
-        }
-
-        if (benchOn_) {
-            const BenchClock::time_point t0 = BenchClock::now();
-            UpdateRace(frameDt);
-            bench_.raceSec += BenchSec(t0, BenchClock::now());
-        } else {
-            UpdateRace(frameDt);
-        }
+        UpdateSim(frameDt);
     }
 
-    UpdateCamera(frameDt);
-    if (statusTimer_ > 0.f) statusTimer_ -= frameDt;
-
-    // Feed the audio engine with player telemetry (engine / wind / skid).
-    if (audio_ && !racers_.empty()) {
-        const VehicleState& s = racers_.front().vehicle.State();
-        AudioState audioState;
-        audioState.engineRpm = s.rpm;
-        audioState.engineLoad = s.throttle;
-        audioState.speed = s.speed;
-        for (const WheelState& wheel : s.wheels) {
-            const float slip = std::max(std::fabs(wheel.slipRatio) * 1.8f,
-                                        std::fabs(wheel.slipAngleDeg) / 18.f);
-            audioState.skid = std::max(audioState.skid, slip);
+    if (threadedSim_ && !menuPhase) {
+        // Main-thread half of the race frame: camera + status + audio from
+        // snapshot (never touches racers_ while the worker owns them).
+        const RaceSnapshot& snap = snapshots_.Front();
+        if (snap.valid && !snap.cars.empty()) {
+            const VehicleState& s = snap.cars[0].state;
+            // Lightweight camera follow using the snapshot player pose.
+            UpdateCameraFrom(s, frameDt);
         }
-        audioState.skid = Clampf(audioState.skid, 0.f, 1.f);
-        audio_->Update(audioState);
+        if (statusTimer_ > 0.f) statusTimer_ -= frameDt;
+        if (audio_ && snap.valid && !snap.cars.empty()) {
+            const VehicleState& s = snap.cars[0].state;
+            AudioState audioState;
+            audioState.engineRpm = s.rpm;
+            audioState.engineLoad = s.throttle;
+            audioState.speed = s.speed;
+            for (const WheelState& wheel : s.wheels) {
+                const float slip = std::max(std::fabs(wheel.slipRatio) * 1.8f,
+                                            std::fabs(wheel.slipAngleDeg) / 18.f);
+                audioState.skid = std::max(audioState.skid, slip);
+            }
+            audioState.skid = Clampf(audioState.skid, 0.f, 1.f);
+            audio_->Update(audioState);
+        }
+    } else {
+        UpdateCamera(frameDt);
+        if (statusTimer_ > 0.f) statusTimer_ -= frameDt;
+
+        if (audio_ && !racers_.empty()) {
+            const VehicleState& s = racers_.front().vehicle.State();
+            AudioState audioState;
+            audioState.engineRpm = s.rpm;
+            audioState.engineLoad = s.throttle;
+            audioState.speed = s.speed;
+            for (const WheelState& wheel : s.wheels) {
+                const float slip = std::max(std::fabs(wheel.slipRatio) * 1.8f,
+                                            std::fabs(wheel.slipAngleDeg) / 18.f);
+                audioState.skid = std::max(audioState.skid, slip);
+            }
+            audioState.skid = Clampf(audioState.skid, 0.f, 1.f);
+            audio_->Update(audioState);
+        }
     }
 
     if (benchOn_) {
@@ -291,8 +303,115 @@ void Game::Update() {
     }
 }
 
+void Game::UpdateSim(float frameDt) {
+    // Data-parallel AI: each car only writes its own VehicleInput.
+    if (benchOn_) {
+        const BenchClock::time_point t0 = BenchClock::now();
+        rush::JobSystem::Get().ParallelFor(racers_.size(), [&](std::size_t i) {
+            Racer& racer = racers_[i];
+            if (!racer.isPlayer && !racer.finished) UpdateAI(racer, frameDt);
+        });
+        bench_.aiSec += BenchSec(t0, BenchClock::now());
+    } else {
+        rush::JobSystem::Get().ParallelFor(racers_.size(), [&](std::size_t i) {
+            Racer& racer = racers_[i];
+            if (!racer.isPlayer && !racer.finished) UpdateAI(racer, frameDt);
+        });
+    }
+
+    // Fixed-step physics (rate from [physics] hz, default 240).
+    accumulator_ += frameDt;
+    while (accumulator_ >= fixedDt_) {
+        StepPhysics(fixedDt_);
+        // Gameplay stage: drain CollisionBus after the physics stage has
+        // published (strict async — no producer-side callbacks).
+        ProcessCollisionEvents(fixedDt_);
+        accumulator_ -= fixedDt_;
+    }
+
+    if (benchOn_) {
+        const BenchClock::time_point t0 = BenchClock::now();
+        UpdateRace(frameDt);
+        bench_.raceSec += BenchSec(t0, BenchClock::now());
+    } else {
+        UpdateRace(frameDt);
+    }
+
+    // Inline mode draws straight from racers_ — only the async path needs
+    // a published snapshot (and pays the copy cost).
+    if (threadedSim_) PublishSnapshot();
+}
+
+void Game::PublishSnapshot() {
+    RaceSnapshot& snap = snapshots_.Back();
+    snap.cars.resize(racers_.size());
+    snap.phase = phase_;
+    snap.raceClock = raceClock_;
+    for (std::size_t i = 0; i < racers_.size(); ++i) {
+        Racer& racer = racers_[i];
+        CarPose& pose = snap.cars[i];
+        pose.chassis = world_ ? world_->GetTransform(racer.vehicle.Chassis())
+                              : racer.vehicle.State().transform;
+        pose.state = racer.vehicle.State();
+        pose.state.transform = pose.chassis;
+        pose.params = racer.vehicle.Params();
+        pose.isPlayer = racer.isPlayer;
+        pose.tint = racer.isPlayer ? Color{0.15f, 0.55f, 1.f, 1.f}
+                                   : Color{0.9f, 0.45f, 0.12f, 1.f};
+    }
+    snap.valid = true;
+    snapshots_.Publish();
+}
+
+void Game::SetThreadedSim(bool on) {
+    if (on == threadedSim_) return;
+    threadedSim_ = on;
+    if (!on) StopSimWorker();
+}
+
+void Game::StartSimWorker() {
+    if (simWorker_.Running()) return;
+    simRun_.store(true, std::memory_order_release);
+    // Publish an initial snapshot so render has data before the first tick.
+    PublishSnapshot();
+    simWorker_.Start([this] {
+        using clock = std::chrono::steady_clock;
+        auto next = clock::now();
+        while (simRun_.load(std::memory_order_acquire)) {
+            if (!threadedSim_ || phase_ == RacePhase::Menu ||
+                phase_ == RacePhase::Settings || phase_ == RacePhase::RaceSetup) {
+                break;
+            }
+            const float frameDt = 1.f / 60.f;
+            UpdateSim(frameDt);
+            next += std::chrono::microseconds(16667);
+            const auto now = clock::now();
+            if (next > now) {
+                std::this_thread::sleep_until(next);
+            } else {
+                next = now;  // fell behind — don't spiral
+            }
+        }
+        simRun_.store(false, std::memory_order_release);
+    });
+}
+
+void Game::StopSimWorker() {
+    if (!simWorker_.Running()) return;
+    simRun_.store(false, std::memory_order_release);
+    simWorker_.Stop();
+}
+
 void Game::Render3D() {
     track_.Render(renderer_);
+
+    if (threadedSim_) {
+        const RaceSnapshot& snap = snapshots_.Front();
+        for (const CarPose& pose : snap.cars) {
+            Vehicle::RenderPose(renderer_, pose.chassis, pose.state, pose.params, pose.tint);
+        }
+        return;
+    }
 
     for (Racer& racer : racers_) {
         Color tint = racer.isPlayer ? Color{0.15f, 0.55f, 1.f, 1.f} : Color{0.9f, 0.45f, 0.12f, 1.f};
@@ -611,7 +730,10 @@ void Game::UpdateRace(float dt) {
 
 void Game::UpdateCamera(float dt) {
     if (racers_.empty()) return;
-    const VehicleState& state = racers_.front().vehicle.State();
+    UpdateCameraFrom(racers_.front().vehicle.State(), dt);
+}
+
+void Game::UpdateCameraFrom(const VehicleState& state, float dt) {
     const Vec3 forward = TransformDirection(state.transform, Vec3{0.f, 0.f, 1.f});
     const Vec3 up{0.f, 1.f, 0.f};
 
