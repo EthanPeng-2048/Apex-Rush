@@ -3,27 +3,24 @@
 #include <vector>
 
 #include "core/Math.h"
+#include "game/MapData.h"
 #include "physics/IPhysicsWorld.h"
 #include "render/IRenderer.h"
 
 namespace apex {
 
-// A closed circuit generated from control points. Produces:
-//  - a render mesh (road surface + kerbs)
-//  - static collision boxes along both walls
+// A closed circuit built from authored map data (MapData). Produces:
+//  - layered render meshes: asphalt + edge lines + kerbs, per-side grass and
+//    gravel runoff bands, barrier walls at the outer band edge, terrain base
+//    grid (height posts + track-corridor blend) and tree decor
+//  - layered static collision bodies with SurfaceType userData (road / grass
+//    / gravel / wall) so the vehicle picks grip per surface
 //  - start/finish line and DRS zone ranges expressed as spline arc length
 class Track {
 public:
-    struct ControlPoint {
-        Vec3 position;
-        float width = 12.f;
-    };
-
-    // Build the circuit from control points (closed loop, Catmull-Rom).
-    // Safe to call again on an existing track (settings change): previous
-    // meshes are destroyed and body lists cleared first.
-    void Build(const std::vector<ControlPoint>& controlPoints, IPhysicsWorld& world,
-               IRenderer& renderer);
+    // Build from map data. Safe to call again on an existing track (settings
+    // change): previous meshes are destroyed and body lists cleared first.
+    void Build(const MapData& map, IPhysicsWorld& world, IRenderer& renderer);
 
     // Release render meshes (called by Build before rebuilding).
     void Dispose(IRenderer& renderer);
@@ -61,19 +58,22 @@ private:
         Vec3 position;
         Vec3 forward;
         Vec3 right;
-        float width;
-        float distance;
+        float width = 12.f;
+        float grassL = 0.f, gravelL = 0.f;
+        float grassR = 0.f, gravelR = 0.f;
+        float distance = 0.f;
         float curvature = 0.f;  // 1/radius, horizontal
     };
 
-    void Resample(const std::vector<ControlPoint>& controlPoints, float spacing);
-    void BuildPhysics(IPhysicsWorld& world);
-    void BuildMesh(IRenderer& renderer);
+    void Resample(const MapData& map, float spacing);
+    void BuildPhysics(const MapData& map, IPhysicsWorld& world);
+    void BuildMesh(const MapData& map, IRenderer& renderer);
 
     std::vector<Sample> samples_;
     std::vector<Zone> drsZones_;
     std::vector<Zone> overtakeZones_;
     std::vector<BodyHandle> wallBodies_;
+    std::vector<BodyHandle> groundBodies_;
     float totalLength_ = 0.f;
     float spacing_ = 4.f;
     MeshHandle roadMesh_ = kInvalidMesh;
@@ -81,12 +81,23 @@ private:
     MeshHandle kerbRedMesh_ = kInvalidMesh;
     MeshHandle kerbWhiteMesh_ = kInvalidMesh;
     MeshHandle wallMesh_ = kInvalidMesh;
-    MeshHandle grassMesh_ = kInvalidMesh;
+    MeshHandle grassBandMesh_ = kInvalidMesh;
+    MeshHandle gravelBandMesh_ = kInvalidMesh;
+    MeshHandle terrainMesh_ = kInvalidMesh;
+    MeshHandle treeMesh_ = kInvalidMesh;
+    MeshHandle treeMeshLarge_ = kInvalidMesh;
     MeshHandle startLineWhiteMesh_ = kInvalidMesh;
     MeshHandle startLineBlackMesh_ = kInvalidMesh;
-};
 
-// Three built-in circuits (small/medium/techy) generated procedurally.
-std::vector<Track::ControlPoint> MakeCircuit(int index);
+    // Tree instances split by size bucket (Transform has no scale).
+    struct TreeInstance {
+        Vec3 position;
+        float scale;
+    };
+    std::vector<TreeInstance> trees_;
+
+    // Build-time helper: nearest centerline lateral distance + station height.
+    void CorridorLookup(const Vec3& pos, float& lateralDist, float& corridorY) const;
+};
 
 }  // namespace apex

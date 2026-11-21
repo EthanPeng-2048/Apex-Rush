@@ -6,11 +6,28 @@
 #include <cstdio>
 #include <cstring>
 
+#include "game/MapData.h"
 #include "physics/Qu3eWorld.h"
 
 namespace apex {
 
 namespace {
+
+constexpr const char* kMapsRoot = "assets/maps";
+
+// "test_circuit" -> "TEST CIRCUIT" (raylib's font has no lowercase issues,
+// but the menu looks better uppercase).
+std::string MapDisplayName(const std::string& id) {
+    std::string out;
+    for (char c : id) {
+        if (c == '_' || c == '-') {
+            out.push_back(' ');
+        } else {
+            out.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+        }
+    }
+    return out;
+}
 
 // Assist levels are stored as "off" / "sport" / "full"; legacy "true"/"false"
 // values map to sport / off so old config files keep working.
@@ -74,7 +91,12 @@ bool Game::Init() {
 }
 
 void Game::LoadSettings() {
-    circuitIndex_ = std::clamp(config_.GetInt("race", "circuit", 0), 0, 2);
+    mapList_ = ListMaps(kMapsRoot);
+    if (mapList_.empty()) mapList_.push_back("test_circuit");
+    mapName_ = config_.GetString("race", "map", mapList_.front());
+    if (std::find(mapList_.begin(), mapList_.end(), mapName_) == mapList_.end()) {
+        mapName_ = mapList_.front();
+    }
     totalLaps_ = std::clamp(config_.GetInt("race", "laps", 3), 1, 20);
 }
 
@@ -116,8 +138,8 @@ void Game::StartRace() {
 }
 
 void Game::BuildWorld() {
-    const std::vector<Track::ControlPoint> points = MakeCircuit(circuitIndex_);
-    track_.Build(points, *world_, renderer_);
+    const MapData map = LoadMapData(kMapsRoot, mapName_);
+    track_.Build(map, *world_, renderer_);
 }
 
 void Game::Update() {
@@ -237,7 +259,9 @@ void Game::UpdateAI(Racer& racer, float dt) {
     // --- Steering: heading error toward a speed-scaled lookahead point,
     // damped by lateral velocity (anti-sideslip). This is what keeps the car
     // off the walls — lateral-offset steering alone cuts corners too hard.
-    const float lookahead = 14.f + state.speed * 0.72f;
+    // The lookahead is short enough to hold a real hairpin line: pure pursuit
+    // with a long aim point sweeps wide through tight corners.
+    const float lookahead = std::min(10.f + state.speed * 0.32f, 30.f);
     const Vec3 target = track_.PositionAt(d + lookahead);
     const Vec3 toTarget = target - state.transform.position;
     float yawErr = std::atan2(toTarget.x, toTarget.z) - std::atan2(forward.x, forward.z);
@@ -251,13 +275,14 @@ void Game::UpdateAI(Racer& racer, float dt) {
     // --- Speed target from the sharpest corner inside the braking horizon.
     // The grip budget is derived from the car's own tire / aero calibration:
     // max lateral a(v) = aLatBase + dfPerV2*v^2 must cover the corner demand
-    // v^2*curv (curvMax already carries a 1.2x margin). The vehicle's steering
-    // envelope is 0.95x the same grip curve (see Vehicle::SteerEnvelopeDeg),
+    // v^2*curv (curvMax carries a 1.6x margin — slaloms punish optimistic
+    // entries through the direction changes). The vehicle's steering
+    // envelope is 1.2x the same grip curve (see Vehicle::SteerEnvelopeDeg),
     // so one constraint covers both.
     const float horizon = std::max(60.f, state.speed * state.speed / 24.f);
     float curvMax = 0.f;
     for (float dd = 0.f; dd <= horizon; dd += 10.f) {
-        curvMax = std::max(curvMax, track_.CurvatureAt(d + dd) * 1.2f);
+        curvMax = std::max(curvMax, track_.CurvatureAt(d + dd) * 1.6f);
     }
     curvMax = std::max(curvMax, 0.0012f);
     const VehicleParams& p = racer.vehicle.Params();
@@ -624,8 +649,14 @@ void Game::UpdateSettings() {
 
     switch (settingsCursor_) {
         case 0: {
-            circuitIndex_ = std::clamp(circuitIndex_ + (dir != 0 ? dir : 1), 0, 2);
-            config_.SetString("race", "circuit", std::to_string(circuitIndex_));
+            const int count = static_cast<int>(mapList_.size());
+            int idx = 0;
+            for (int i = 0; i < count; ++i) {
+                if (mapList_[static_cast<size_t>(i)] == mapName_) idx = i;
+            }
+            idx = (idx + (dir != 0 ? (dir > 0 ? 1 : -1) : 1) + count) % count;
+            mapName_ = mapList_[static_cast<size_t>(idx)];
+            config_.SetString("race", "map", mapName_);
             break;
         }
         case 1: {
@@ -699,7 +730,7 @@ void Game::RenderSettings() {
     };
     const int cars = config_.GetInt("race", "cars", 4);
     const Row rows[9] = {
-        {"CIRCUIT", std::to_string(circuitIndex_ + 1) + "/3"},
+        {"CIRCUIT", MapDisplayName(mapName_)},
         {"LAPS", std::to_string(totalLaps_)},
         {"CARS", std::to_string(cars)},
         {"DAMAGE", config_.GetBool("race", "damage", true) ? "ON" : "OFF"},

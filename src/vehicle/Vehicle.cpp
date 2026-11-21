@@ -273,9 +273,13 @@ void Vehicle::Update(const VehicleInput& input, float dt) {
     }
     wingTogglePrev_ = in.wingToggle;
 
-    // DRS: only when requested, moving forward fast, and pointed reasonably
-    // straight (mirrors real activation windows).
-    state_.drsAvailable = speed > 55.f && std::fabs(steerAngle_) < 6.f * kDegToRad;
+    // DRS: only when requested, moving forward fast, and basically straight.
+    // The threshold is relative to the speed-sensitive steering envelope —
+    // a fixed angle never trips at speed (the envelope is only a few degrees
+    // up there) and the car would keep straight-line aero through fast
+    // corners.
+    state_.drsAvailable =
+        speed > 55.f && std::fabs(steerAngle_) < 0.35f * SteerEnvelopeDeg(speed) * kDegToRad;
     state_.drsActive = in.drsRequest && state_.drsAvailable;
 
     // ERS: deploy on overtake button when charge remains; regenerate under braking.
@@ -481,9 +485,9 @@ void Vehicle::UpdateWheels(float dt) {
         -kStaticCamber + camberShiftR,
     };
 
+    int gravelWheels = 0;
     for (int i = 0; i < 4; ++i) {
         const Vec3 hardpoint = TransformPoint(transform, hardpoints_[i]);
-
         // Steering: front wheels yaw around the hardpoint.
         Vec3 wheelForward = forward;
         Vec3 wheelRight = right;
@@ -527,11 +531,11 @@ void Vehicle::UpdateWheels(float dt) {
             // Suspension force along the strut (chassis up).
             world_->ApplyForce(chassis_, up * normalForce, hit.point);
 
-            // Tire forces in the wheel plane. Off-track contacts (below the
-            // road surface, i.e. the grass plane) get reduced grip so cutting
-            // through the grass is never faster than staying on the asphalt.
-            // ABS releases brake pressure per wheel on lock-up (previous
-            // substep's slip ratio — the fresh kappa comes out of Compute).
+            // Tire forces in the wheel plane. The contact body carries a
+            // SurfaceType tag (road / grass / gravel) so grip per surface is
+            // data-driven, not a coordinate hack. ABS releases brake pressure
+            // per wheel on lock-up (previous substep's slip ratio — the fresh
+            // kappa comes out of Compute).
             float brakeForce = brakePerWheel_[i];
             if (params_.absLevel != AssistLevel::Off && brakeForce > 1.f) {
                 const float thresh = (params_.absLevel == AssistLevel::Full) ? 0.115f : 0.18f;
@@ -540,7 +544,14 @@ void Vehicle::UpdateWheels(float dt) {
                                           : 0.f;
                 brakeForce *= 1.f - release;
             }
-            const float surfaceGrip = hit.point.y < -0.02f ? 0.55f : 1.f;
+            const SurfaceType surface = SurfaceFromTag(hit.userData);
+            float surfaceGrip = 1.f;
+            if (surface == SurfaceType::Grass) {
+                surfaceGrip = 0.55f;
+            } else if (surface == SurfaceType::Gravel) {
+                surfaceGrip = 0.30f;
+                ++gravelWheels;
+            }
             const TireModel::Output tire = tires_[i].Compute(
                 normalForce * surfaceGrip, wheel.contactVelocity, wheelForward, wheelRight,
                 drivePerWheel_[i], brakeForce, dt, camber[i]);
@@ -562,6 +573,19 @@ void Vehicle::UpdateWheels(float dt) {
             // compression rate huge and spiked the damper (car launch).
             wheel.load = 0.f;
             wheel.force = Vec3{};
+        }
+    }
+
+    // Gravel drag: a car crawling through a gravel trap bleeds speed hard
+    // (the tire model already loses grip there).
+    if (gravelWheels > 0) {
+        const Vec3 velocity = world_->GetLinearVelocity(chassis_);
+        const float speed = Length(velocity);
+        if (speed > 0.3f) {
+            const float k = static_cast<float>(gravelWheels) * 0.25f;
+            world_->ApplyForce(chassis_,
+                               Normalize(velocity) * (-(0.7f + 0.08f * speed) * params_.mass * k),
+                               transform.position);
         }
     }
 }
@@ -648,6 +672,11 @@ void Vehicle::UpdateDamageFromContact(const ContactEvent& event) {
     const float impact = Clampf(event.impactSpeed / 28.f, 0.f, 1.f);
     if (impact < 0.06f) return;
 
+    // Barrier hits bruise the car less than car-to-car or ground strikes
+    // (the wall's low restitution already scrubs the speed).
+    const bool wallHit = SurfaceFromTag(event.userDataA) == SurfaceType::Wall ||
+                         SurfaceFromTag(event.userDataB) == SurfaceType::Wall;
+
     // Region pick: front z > +1.1 => front wing; z < -1.1 => rear wing;
     // |z| <= 1.1 and |x| > 0.55 => sidepods; else floor/floor area.
     CarPart part;
@@ -656,7 +685,7 @@ void Vehicle::UpdateDamageFromContact(const ContactEvent& event) {
     else if (std::fabs(local.x) > 0.52f) part = CarPart::Sidepods;
     else part = CarPart::Floor;
 
-    const float damage = impact * 0.42f;
+    const float damage = impact * (wallHit ? 0.21f : 0.42f);
     const int index = static_cast<int>(part);
     state_.partHealth[index] = Clampf(state_.partHealth[index] - damage, 0.f, 1.f);
 

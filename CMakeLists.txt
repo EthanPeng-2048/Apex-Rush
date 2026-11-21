@@ -37,6 +37,7 @@ add_executable(apex-rush
     src/render/NullBackend.cpp
     src/vehicle/TireModel.cpp
     src/vehicle/Vehicle.cpp
+    src/game/MapData.cpp
     src/game/Track.cpp
     src/game/Game.cpp
 )
@@ -60,6 +61,7 @@ if(EMSCRIPTEN)
         -sFORCE_FILESYSTEM=1
         -sEXIT_RUNTIME=1
         --shell-file ${raylib_SOURCE_DIR}/src/minshell.html
+        --preload-file ${CMAKE_SOURCE_DIR}/assets/maps@/assets/maps
     )
     # .html suffix makes emcc emit the shell page next to js/wasm.
     set_target_properties(apex-rush PROPERTIES SUFFIX ".html")

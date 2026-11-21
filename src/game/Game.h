@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "core/Config.h"
@@ -84,7 +85,8 @@ private:
     float phaseTimer_ = 3.5f;
     float raceClock_ = 0.f;
     int totalLaps_ = 3;
-    int circuitIndex_ = 0;
+    std::string mapName_ = "test_circuit";
+    std::vector<std::string> mapList_;
 
     // Camera
     int cameraMode_ = 0;  // 0 chase, 1 far chase, 2 hood, 3 orbit

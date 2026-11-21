@@ -11,6 +11,26 @@ namespace apex {
 using BodyHandle = uint32_t;
 constexpr BodyHandle kInvalidBody = 0;
 
+// Convention for BodyDesc.userData on track surfaces: the pointer carries a
+// SurfaceType value cast through uintptr_t — never a real pointer. Ray hits
+// and contact events report it back so the vehicle can pick grip / damage
+// per surface without coordinate hacks.
+enum class SurfaceType : uintptr_t {
+    None = 0,
+    Road = 1,
+    Grass = 2,
+    Gravel = 3,
+    Wall = 4,
+};
+
+inline void* SurfaceTag(SurfaceType type) {
+    return reinterpret_cast<void*>(static_cast<uintptr_t>(type));
+}
+
+inline SurfaceType SurfaceFromTag(const void* tag) {
+    return static_cast<SurfaceType>(reinterpret_cast<uintptr_t>(tag));
+}
+
 struct BodyDesc {
     Transform transform;
     Vec3 halfExtents{0.5f, 0.5f, 0.5f};
