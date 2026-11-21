@@ -1,9 +1,9 @@
-#pragma once
+﻿#pragma once
 
 #include <string>
 #include <vector>
 
-#include "core/Math.h"
+import rush.engine.core;
 
 namespace apex {
 

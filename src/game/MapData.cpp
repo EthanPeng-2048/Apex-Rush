@@ -1,6 +1,7 @@
-#include "game/MapData.h"
+﻿#include "game/MapData.h"
 
 #include <algorithm>
+#include <vector>
 #include <cctype>
 #include <cmath>
 #include <cstdio>

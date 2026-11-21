@@ -1,14 +1,14 @@
-#pragma once
+﻿#pragma once
 
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "audio/IAudio.h"
-#include "core/Config.h"
+import rush.engine.core;
 #include "game/Track.h"
-#include "physics/IPhysicsWorld.h"
-#include "render/IRenderer.h"
+import rush.engine.physics;
+import rush.engine.render;
 #include "vehicle/Vehicle.h"
 
 namespace apex {

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.28)
 project(ApexRushOnline CXX C)
 
-# C++23: rush-engine / exstl need std::expected (and later named modules).
+# C++23: rush-engine / exstl need std::expected (and named modules).
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_SCAN_FOR_MODULES ON)
@@ -43,41 +43,18 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(raylib)
 
-# --- Third-party: qu3e (collision) / enet (networking) / nudge (alt physics) --
-add_subdirectory(third_party/qu3e)
+# --- Third-party: enet (networking) ------------------------------------------
 add_subdirectory(third_party/enet)
 
-# --- Rush Engine (git submodule: render + physics + async runtime) ------------
+# --- Rush Engine (git submodule: modules + physics + render) ------------------
+# Provide raylib before the engine so the raylib backend compiles in.
+set(RUSH_ENGINE_RAYLIB_TARGET raylib CACHE STRING "" FORCE)
 add_subdirectory(rush-engine)
-
-# nudge: C23 unity build of the engine core (see src/physics/nudge_unity.c).
-# Compiled with the same flags upstream nudge uses for MSVC.
-add_library(nudge STATIC src/physics/nudge_unity.c)
-target_include_directories(nudge PUBLIC third_party/nudge)
-set_target_properties(nudge PROPERTIES C_STANDARD 23 C_STANDARD_REQUIRED ON)
-if(CMAKE_C_COMPILER_ID MATCHES "Clang")
-    # -msse4.1: nudge's simd.h uses _mm_blendv_ps (clang enforces target
-    # features on always_inline intrinsics, MSVC does not). Emscripten maps
-    # the SSE intrinsics to wasm SIMD but wants -msimd128 alongside them.
-    if(EMSCRIPTEN)
-        target_compile_options(nudge PRIVATE -std=c23 -ffp-contract=off -msse4.1 -msimd128)
-    else()
-        target_compile_options(nudge PRIVATE -std=c23 -ffp-contract=off -msse4.1)
-    endif()
-elseif(MSVC)
-    target_compile_options(nudge PRIVATE /std:clatest /experimental:c11atomics /fp:precise)
-endif()
 
 # --- Game ---------------------------------------------------------------------
 add_executable(apex-rush
     src/main.cpp
     src/audio/MiniaudioAudio.cpp
-    src/core/Config.cpp
-    src/core/Paths.cpp
-    src/physics/Qu3eWorld.cpp
-    src/physics/NudgeWorld.cpp
-    src/render/RaylibBackend.cpp
-    src/render/NullBackend.cpp
     src/vehicle/TireModel.cpp
     src/vehicle/Vehicle.cpp
     src/game/MapData.cpp
@@ -86,7 +63,7 @@ add_executable(apex-rush
 )
 
 target_include_directories(apex-rush PRIVATE src third_party/miniaudio)
-target_link_libraries(apex-rush PRIVATE raylib qu3e enet nudge rush::engine)
+target_link_libraries(apex-rush PRIVATE raylib enet rush::engine)
 
 # miniaudio is a ~4 MB single-header TU; the audio mixer needs no -O3 and the
 # full optimization costs minutes of compile time.
@@ -101,14 +78,10 @@ set_tests_properties(drive-test PROPERTIES TIMEOUT 900)
 if(WIN32)
     target_link_libraries(apex-rush PRIVATE winmm)
     # nudge's solver uses large stack frames (upstream builds with 8 MB too).
-    # LINKER: prefix maps to -Wl, for the clang driver, bare flag for MSVC.
     target_link_options(apex-rush PRIVATE "LINKER:/STACK:8388608")
 endif()
 
 # --- Web (Emscripten) ---------------------------------------------------------
-# The game loop is written in blocking form; ASYNCIFY lets it yield to the
-# browser every frame (raylib sleeps inside WaitTime at the target FPS).
-# Filesystem is in-memory MEMFS, so config.ini persists per tab session only.
 if(EMSCRIPTEN)
     target_link_options(apex-rush PRIVATE
         -sASYNCIFY
@@ -119,6 +92,5 @@ if(EMSCRIPTEN)
         --shell-file ${raylib_SOURCE_DIR}/src/minshell.html
         --preload-file ${CMAKE_SOURCE_DIR}/assets/maps@/assets/maps
     )
-    # .html suffix makes emcc emit the shell page next to js/wasm.
     set_target_properties(apex-rush PROPERTIES SUFFIX ".html")
 endif()

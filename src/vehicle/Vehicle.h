@@ -2,10 +2,11 @@
 
 #include <array>
 #include <string>
+#include <vector>
 
-#include "core/Math.h"
-#include "physics/IPhysicsWorld.h"
-#include "render/IRenderer.h"
+import rush.engine.core;
+import rush.engine.physics;
+import rush.engine.render;
 #include "vehicle/TireModel.h"
 
 namespace apex {

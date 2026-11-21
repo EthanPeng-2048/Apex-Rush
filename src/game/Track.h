@@ -1,11 +1,11 @@
-#pragma once
+﻿#pragma once
 
 #include <vector>
 
-#include "core/Math.h"
+import rush.engine.core;
 #include "game/MapData.h"
-#include "physics/IPhysicsWorld.h"
-#include "render/IRenderer.h"
+import rush.engine.physics;
+import rush.engine.render;
 
 namespace apex {
 

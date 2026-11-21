@@ -1,6 +1,7 @@
-#include "vehicle/Vehicle.h"
+﻿#include "vehicle/Vehicle.h"
 
 #include <algorithm>
+#include <vector>
 #include <cmath>
 
 #include "vehicle/CarModelData.h"

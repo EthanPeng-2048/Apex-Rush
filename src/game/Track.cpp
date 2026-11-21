@@ -1,6 +1,7 @@
-#include "game/Track.h"
+﻿#include "game/Track.h"
 
 #include <algorithm>
+#include <vector>
 #include <cmath>
 
 namespace apex {
