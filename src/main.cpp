@@ -435,11 +435,14 @@ int main(int argc, char** argv) {
     const char* shotPath = nullptr;
     const char* dumpPath = nullptr;
     bool driveTest = false;
+    bool menuShot = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--drive-test") == 0) {
             driveTest = true;
         } else if (std::strcmp(argv[i], "--shot") == 0 && i + 1 < argc) {
             shotPath = argv[++i];
+        } else if (std::strcmp(argv[i], "--menu") == 0) {
+            menuShot = true;  // keep the main menu up for --shot (QA visual)
         } else if (std::strcmp(argv[i], "--dump-scene") == 0 && i + 1 < argc) {
             dumpPath = argv[++i];
         }
@@ -448,7 +451,7 @@ int main(int argc, char** argv) {
     Config config;
     config.Load("config.ini");
     // All CLI automation paths (tests, screenshots, scene dumps) skip the menu.
-    if (driveTest || dumpPath || shotPath) {
+    if ((driveTest || dumpPath || shotPath) && !menuShot) {
         config.SetString("race", "autostart", "true");
     }
 
@@ -505,7 +508,10 @@ int main(int argc, char** argv) {
         }
     }
 
-    config.Save("config.ini");
+    // A --shot run injects the autostart override for automation; saving the
+    // config then would leak autostart=true into the user's config.ini and
+    // the main menu would silently disappear on the next launch.
+    if (!shotPath) config.Save("config.ini");
     backend.Shutdown();
     return 0;
 }

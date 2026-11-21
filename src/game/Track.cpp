@@ -246,17 +246,25 @@ float Track::ProjectDistance(const Vec3& worldPos) const {
     return bestDist;
 }
 
-void Track::CorridorLookup(const Vec3& pos, float& lateralDist, float& corridorY) const {
-    lateralDist = 1e30f;
-    corridorY = 0.f;
+const Track::Sample* Track::NearestSample(const Vec3& pos, float& dist) const {
+    // True HORIZONTAL distance to the centerline. Minimizing the lateral
+    // projection (Dot(d, right)) instead makes every point in the loop
+    // interior look "laterally aligned" with some far-away sample (the
+    // projection of a radial vector onto the tangent frame is ~0), so the
+    // terrain would adopt an arbitrary station's height and bury the road.
+    const Sample* best = nullptr;
+    float bestD2 = 1e30f;
     for (const Sample& s : samples_) {
-        const Vec3 d = pos - s.position;
-        const float lateral = std::fabs(Dot(d, s.right));
-        if (lateral < lateralDist) {
-            lateralDist = lateral;
-            corridorY = s.position.y;
+        const float dx = pos.x - s.position.x;
+        const float dz = pos.z - s.position.z;
+        const float d2 = dx * dx + dz * dz;
+        if (d2 < bestD2) {
+            bestD2 = d2;
+            best = &s;
         }
     }
+    dist = std::sqrt(bestD2);
+    return best;
 }
 
 void Track::BuildPhysics(const MapData& map, IPhysicsWorld& world) {
@@ -380,7 +388,9 @@ void Track::BuildMesh(const MapData& map, IRenderer& renderer) {
         const Sample& s1 = samples_[(i + 1) % n];
         const float w0 = s0.width * 0.5f;
         const float w1 = s1.width * 0.5f;
-        const Vec3 normal = Normalize(Cross(s0.right, s1.position - s0.position));
+        // Surface normal of the ribbon: seg x right points UP (right x seg
+        // points down and the quad gets backface-culled into invisibility).
+        const Vec3 normal = Normalize(Cross(s1.position - s0.position, s0.right));
 
         // Asphalt ribbon.
         addQuad(road, s0.position - s0.right * w0, s0.position + s0.right * w0,
@@ -441,29 +451,46 @@ void Track::BuildMesh(const MapData& map, IRenderer& renderer) {
         }
     }
 
-    // Terrain base grid: bilinear height posts, blended toward the track
-    // height near the corridor so the road never floats or gets buried.
+    // Terrain base grid: bilinear height posts sampled on a 25 m lattice (the
+    // posts stay sparse data; mesh resolution is an engine choice), blended
+    // toward the track height near the corridor so the road never floats or
+    // gets buried. The corridor plane sits below the gravel band (-0.06) so
+    // the layered strips never z-fight with it, and the lattice is fine
+    // enough that the undulating road cannot poke through the terrain.
     MeshData terrain;
     if (map.gridX.size() >= 2 && map.gridZ.size() >= 2) {
         const float inner = 62.f, outer = 115.f;
+        auto corridorInfo = [&](float x, float z, float& dist, float& corridorY, float& lateral,
+                                float& bandOuter) {
+            const Sample* s = NearestSample(Vec3{x, 0.f, z}, dist);
+            corridorY = s->position.y;
+            const Vec3 d = Vec3{x, 0.f, z} - s->position;
+            lateral = Dot(d, s->right);
+            bandOuter = s->width * 0.5f +
+                        ((lateral > 0.f) ? s->grassR + s->gravelR : s->grassL + s->gravelL);
+        };
         auto blendedHeight = [&](float x, float z) {
+            float dist = 0.f, corridorY = 0.f, lateral = 0.f, bandOuter = 0.f;
+            corridorInfo(x, z, dist, corridorY, lateral, bandOuter);
             float h = map.TerrainHeight(x, z);
-            float lateral = 0.f, corridorY = 0.f;
-            CorridorLookup(Vec3{x, 0.f, z}, lateral, corridorY);
-            if (lateral < outer) {
-                float t = Clampf((lateral - inner) / (outer - inner), 0.f, 1.f);
+            if (dist < outer) {
+                float t = Clampf((dist - inner) / (outer - inner), 0.f, 1.f);
                 t = t * t * (3.f - 2.f * t);
-                h = Lerp(corridorY - 0.05f, h, t);
+                h = Lerp(corridorY - 0.12f, h, t);
             }
             return h;
         };
 
-        const size_t cols = map.gridX.size();
-        const size_t rows = map.gridZ.size();
+        const float step = 25.f;
+        const float minX = map.gridX.front(), maxX = map.gridX.back();
+        const float minZ = map.gridZ.front(), maxZ = map.gridZ.back();
+        const size_t cols = static_cast<size_t>((maxX - minX) / step) + 1;
+        const size_t rows = static_cast<size_t>((maxZ - minZ) / step) + 1;
         std::vector<Vec3> verts(cols * rows);
         for (size_t r = 0; r < rows; ++r) {
             for (size_t c = 0; c < cols; ++c) {
-                const float x = map.gridX[c], z = map.gridZ[r];
+                const float x = std::min(minX + static_cast<float>(c) * step, maxX);
+                const float z = std::min(minZ + static_cast<float>(r) * step, maxZ);
                 verts[r * cols + c] = Vec3{x, blendedHeight(x, z), z};
             }
         }
@@ -475,10 +502,17 @@ void Track::BuildMesh(const MapData& map, IRenderer& renderer) {
         }
 
         // Bake tree decor into two size buckets (Transform carries no scale).
+        // Trees that end up inside the runoff bands are dropped: the built
+        // spline curves wider than the authored polyline, so map data can
+        // legitimately place decor where the real corridor ends up.
         trees_.clear();
         for (const MapData::Decor& d : map.decor) {
+            float dist = 0.f, corridorY = 0.f, lateral = 0.f, bandOuter = 0.f;
+            corridorInfo(d.position.x, d.position.z, dist, corridorY, lateral, bandOuter);
+            if (std::fabs(lateral) < bandOuter + 2.5f) continue;
             TreeInstance t;
-            t.position = Vec3{d.position.x, blendedHeight(d.position.x, d.position.z), d.position.z};
+            t.position =
+                Vec3{d.position.x, blendedHeight(d.position.x, d.position.z), d.position.z};
             t.scale = d.scale;
             trees_.push_back(t);
         }

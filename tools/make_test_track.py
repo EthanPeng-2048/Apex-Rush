@@ -101,7 +101,7 @@ def main():
                 gr = a[6] + (b[6] - a[6]) * t
                 vr = a[7] + (b[7] - a[7]) * t
                 edge = w * 0.5 + (gr + vr if side > 0 else gl + vl)
-                off = edge + 12.0 + ((k + i) % 4) * 7.0
+                off = edge + 16.0 + ((k + i) % 4) * 7.0
                 scale = 0.9 + ((k + i) % 3) * 0.25
                 f.write(f"tree,{px + rx * side * off:.1f},{pz + rz * side * off:.1f},"
                         f"0.00,{scale:.2f}\n")

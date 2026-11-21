@@ -96,8 +96,8 @@ private:
     };
     std::vector<TreeInstance> trees_;
 
-    // Build-time helper: nearest centerline lateral distance + station height.
-    void CorridorLookup(const Vec3& pos, float& lateralDist, float& corridorY) const;
+    // Build-time helper: nearest centerline sample by horizontal distance.
+    const Sample* NearestSample(const Vec3& pos, float& dist) const;
 };
 
 }  // namespace apex

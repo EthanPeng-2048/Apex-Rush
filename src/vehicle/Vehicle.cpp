@@ -485,6 +485,7 @@ void Vehicle::UpdateWheels(float dt) {
         -kStaticCamber + camberShiftR,
     };
 
+    int grassWheels = 0;
     int gravelWheels = 0;
     for (int i = 0; i < 4; ++i) {
         const Vec3 hardpoint = TransformPoint(transform, hardpoints_[i]);
@@ -548,6 +549,7 @@ void Vehicle::UpdateWheels(float dt) {
             float surfaceGrip = 1.f;
             if (surface == SurfaceType::Grass) {
                 surfaceGrip = 0.55f;
+                ++grassWheels;
             } else if (surface == SurfaceType::Gravel) {
                 surfaceGrip = 0.30f;
                 ++gravelWheels;
@@ -576,15 +578,18 @@ void Vehicle::UpdateWheels(float dt) {
         }
     }
 
-    // Gravel drag: a car crawling through a gravel trap bleeds speed hard
-    // (the tire model already loses grip there).
-    if (gravelWheels > 0) {
+    // Runoff drag: grass and especially gravel bleed speed hard (the tire
+    // model already loses grip there). Accelerations per wheel so a car fully
+    // in the gravel sheds roughly 1g at racing speed — cutting the runoff is
+    // never a shortcut.
+    if (grassWheels > 0 || gravelWheels > 0) {
         const Vec3 velocity = world_->GetLinearVelocity(chassis_);
         const float speed = Length(velocity);
         if (speed > 0.3f) {
-            const float k = static_cast<float>(gravelWheels) * 0.25f;
-            world_->ApplyForce(chassis_,
-                               Normalize(velocity) * (-(0.7f + 0.08f * speed) * params_.mass * k),
+            float dragAccel = 0.f;
+            dragAccel += (0.8f + 0.10f * speed) * static_cast<float>(grassWheels) * 0.25f;
+            dragAccel += (1.6f + 0.16f * speed) * static_cast<float>(gravelWheels) * 0.25f;
+            world_->ApplyForce(chassis_, Normalize(velocity) * (-dragAccel * params_.mass),
                                transform.position);
         }
     }
