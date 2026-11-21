@@ -4,13 +4,30 @@ project(ApexRushOnline CXX C)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-if(MSVC)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT EMSCRIPTEN)
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        add_compile_options(-O0)
+    else()
+        # Global -O3 + ThinLTO (parallel LTO, much cheaper than full LTO).
+        # ThinLTO needs lld for the link step. Benchmarked faster than plain
+        # -O3 and than the MSVC baseline on this codebase.
+        add_compile_options(-O3 -flto=thin)
+        add_link_options(-flto=thin -fuse-ld=lld)
+    endif()
+elseif(MSVC)
     add_compile_options(/W3 /permissive-)
-    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 endif()
+add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 
 # --- Third-party: raylib (render/input/window) -------------------------------
 include(FetchContent)
+# Reuse a seeded raylib source tree (copy of the patched FetchContent checkout
+# under .deps/) across build trees and across build/ wipes — the configure-time
+# GitHub clone was the "build hangs forever". Only the sources are shared; each
+# build tree keeps its own raylib-build (native vs emscripten must not clash).
+if(EXISTS "${CMAKE_SOURCE_DIR}/.deps/raylib-src/CMakeLists.txt")
+    set(FETCHCONTENT_SOURCE_DIR_RAYLIB "${CMAKE_SOURCE_DIR}/.deps/raylib-src")
+endif()
 set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
 find_program(POWERSHELL_EXE NAMES powershell pwsh REQUIRED)
@@ -33,7 +50,11 @@ add_subdirectory(third_party/enet)
 add_library(nudge STATIC src/physics/nudge_unity.c)
 target_include_directories(nudge PUBLIC third_party/nudge)
 set_target_properties(nudge PROPERTIES C_STANDARD 23 C_STANDARD_REQUIRED ON)
-if(MSVC)
+if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+    # -msse4.1: nudge's simd.h uses _mm_blendv_ps (clang enforces target
+    # features on always_inline intrinsics, MSVC does not).
+    target_compile_options(nudge PRIVATE -std=c23 -ffp-contract=off -msse4.1)
+elseif(MSVC)
     target_compile_options(nudge PRIVATE /std:clatest /experimental:c11atomics /fp:precise)
 endif()
 
@@ -56,10 +77,21 @@ add_executable(apex-rush
 target_include_directories(apex-rush PRIVATE src third_party/miniaudio)
 target_link_libraries(apex-rush PRIVATE raylib qu3e enet nudge)
 
-if(MSVC)
+# miniaudio is a ~4 MB single-header TU; the audio mixer needs no -O3 and the
+# full optimization costs minutes of compile time.
+set_property(SOURCE src/audio/MiniaudioAudio.cpp APPEND PROPERTY COMPILE_OPTIONS
+             "$<$<CXX_COMPILER_ID:Clang>:-O1>" "$<$<CXX_COMPILER_ID:MSVC>:/O1>")
+
+# --- Tests (ctest --preset release) ------------------------------------------
+enable_testing()
+add_test(NAME drive-test COMMAND apex-rush --drive-test)
+set_tests_properties(drive-test PROPERTIES TIMEOUT 900)
+
+if(WIN32)
     target_link_libraries(apex-rush PRIVATE winmm)
     # nudge's solver uses large stack frames (upstream builds with 8 MB too).
-    target_link_options(apex-rush PRIVATE /STACK:8388608)
+    # LINKER: prefix maps to -Wl, for the clang driver, bare flag for MSVC.
+    target_link_options(apex-rush PRIVATE "LINKER:/STACK:8388608")
 endif()
 
 # --- Web (Emscripten) ---------------------------------------------------------
