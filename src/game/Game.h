@@ -47,6 +47,12 @@ public:
     void RenderHUD();
     bool WantsQuit() const { return wantsQuit_; }
 
+    // Introspection for tests and (later) the network layer.
+    const VehicleState& PlayerState() const { return racers_.front().vehicle.State(); }
+    RacePhase Phase() const { return phase_; }
+    float RaceClock() const { return raceClock_; }
+    const Track& GetTrack() const { return track_; }
+
 private:
     void BuildWorld();
     void UpdatePlayerInput();

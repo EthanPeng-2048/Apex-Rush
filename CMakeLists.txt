@@ -34,6 +34,7 @@ add_executable(apex-rush
     src/core/Config.cpp
     src/physics/Qu3eWorld.cpp
     src/render/RaylibBackend.cpp
+    src/render/NullBackend.cpp
     src/vehicle/TireModel.cpp
     src/vehicle/Vehicle.cpp
     src/game/Track.cpp

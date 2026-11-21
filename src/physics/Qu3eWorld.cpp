@@ -36,6 +36,12 @@ Transform FromQ3Transform(const q3Transform& t, const q3Quaternion& q) {
 // Captures contacts produced during the most recent scene step.
 struct Qu3eWorld::Impl final : public q3ContactListener {
 public:
+    struct PendingForce {
+        BodyHandle body = kInvalidBody;
+        Vec3 force;
+        Vec3 point;
+    };
+
     // q3Scene advances by the fixed dt given here on every Step(). The game
     // calls Step() once per 240 Hz substep, so the scene must use 1/240 too.
     q3Scene scene{1.f / 240.f, q3Vec3{0.f, -9.81f, 0.f}, 12};
@@ -43,6 +49,7 @@ public:
     BodyHandle nextHandle = 1;
     std::vector<ContactEvent> contacts;
     std::map<const q3Box*, BodyHandle> boxToBody;
+    std::vector<PendingForce> pendingForces;
 
     void BeginContact(const q3ContactConstraint* contact) override {
         if (!contact || contact->manifold.contactCount <= 0) return;
@@ -94,6 +101,10 @@ public:
 
         // `ray->toi` / `ray->normal` were just written by the scene's test.
         const float t = ray->toi;
+        // A ray that starts inside a box reports toi=0 with an uninitialized
+        // normal (q3Box::Raycast never writes n0 when all entry t0 < 0), so
+        // those hits are untrustworthy — skip them.
+        if (t <= 0.f) return true;
         if (!result.hit || t < ray->t) {
             ray->t = t;  // prune anything farther than the best hit so far
             result.hit = true;
@@ -120,7 +131,13 @@ Qu3eWorld::~Qu3eWorld() = default;
 void Qu3eWorld::SetGravity(const Vec3& gravity) { impl_->scene.SetGravity(ToQ3(gravity)); }
 
 void Qu3eWorld::Step(float dt) {
-    (void)dt;  // q3Scene advances by the dt fixed at construction (1/60).
+    for (const Impl::PendingForce& pf : impl_->pendingForces) {
+        const auto it = impl_->bodies.find(pf.body);
+        if (it == impl_->bodies.end()) continue;
+        it->second->ApplyLinearImpulseAtWorldPoint(ToQ3(pf.force * dt), ToQ3(pf.point));
+    }
+    impl_->pendingForces.clear();
+    (void)dt;  // q3Scene advances by the dt fixed at construction (1/240).
     impl_->scene.Step();
 }
 
@@ -145,7 +162,10 @@ BodyHandle Qu3eWorld::CreateBody(const BodyDesc& desc) {
     q3BoxDef boxDef;
     q3Transform local;
     q3Identity(local);
-    boxDef.Set(local, ToQ3(desc.halfExtents));
+    // q3BoxDef::Set takes FULL extents and halves them internally (q3Box.inl:
+    // m_e = extents * 0.5). Passing half-extents would shrink every collider
+    // by 2x (and mass by 8x).
+    boxDef.Set(local, ToQ3(desc.halfExtents * 2.f));
     boxDef.SetFriction(desc.friction);
     boxDef.SetRestitution(desc.restitution);
     if (desc.mass > 0.f) {
@@ -211,9 +231,12 @@ Vec3 Qu3eWorld::GetVelocityAtPoint(BodyHandle handle, const Vec3& worldPoint) co
 }
 
 void Qu3eWorld::ApplyForce(BodyHandle handle, const Vec3& force, const Vec3& worldPoint) {
-    const auto it = impl_->bodies.find(handle);
-    if (it == impl_->bodies.end()) return;
-    it->second->ApplyForceAtWorldPoint(ToQ3(force), ToQ3(worldPoint));
+    // Buffer and convert to an impulse in Step(): qu3e's ApplyForceAtWorldPoint
+    // treats its argument as a mass-scaled acceleration (m_force += force *
+    // mass) while leaving the torque term unscaled, so passing Newtons makes
+    // linear response mass-independent and explodes. Impulses have clean
+    // semantics on both axes.
+    impl_->pendingForces.push_back({handle, force, worldPoint});
 }
 
 void Qu3eWorld::ApplyImpulse(BodyHandle handle, const Vec3& impulse, const Vec3& worldPoint) {

@@ -49,11 +49,13 @@ TireModel::Output TireModel::Compute(float verticalLoad, const Vec3& contactVelo
     const float Bs = params_.B * sigma;
     const float F = peak * std::sin(params_.C * std::atan(Bs - params_.E * (Bs - std::atan(Bs))));
 
-    // Direction opposes normalized slip vector in wheel frame.
+    // Force direction in the wheel frame. kappa is wheel slip (omega*r - v):
+    // positive kappa (driven wheel) must push the car forward. Lateral slip is
+    // the contact patch velocity, so lateral force opposes it.
     Vec3 dir{0.f, 0.f, 0.f};
     if (sigma > 1e-5f) {
-        const float x = -kappa / sigma;      // longitudinal (opposes drive slip)
-        const float y = -tanAlpha / sigma;   // lateral (opposes sliding)
+        const float x = kappa / sigma;        // longitudinal: +kappa => +forward
+        const float y = -tanAlpha / sigma;    // lateral (opposes sliding)
         dir = forward * x + right * y;
     }
     out.force = dir * F;
