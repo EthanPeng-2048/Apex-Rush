@@ -151,7 +151,9 @@ void Game::UpdateAI(Racer& racer, float dt) {
     const Vec3 toTarget = target - state.transform.position;
 
     const Vec3 forward = TransformDirection(state.transform, Vec3{0.f, 0.f, 1.f});
-    const Vec3 right = TransformDirection(state.transform, Vec3{1.f, 0.f, 0.f});
+    // Geometric right is -X in the vehicle frame (+Z forward / +Y up, right
+    // handed) — see Vehicle::Update. `steer` is positive = steer right.
+    const Vec3 right = TransformDirection(state.transform, Vec3{-1.f, 0.f, 0.f});
 
     const float lateral = Dot(toTarget, right);
     const float longitudinal = Dot(toTarget, forward);
@@ -237,9 +239,15 @@ void Game::UpdateRace(float dt) {
         racer.lapDistance = d;
         racer.progress = static_cast<float>(racer.lap) + d / std::max(1.f, track_.TotalLength());
 
-        // Off-track / low-speed safety reset.
-        if (state.transform.position.y < -8.f) {
-            Transform pose{track_.PositionAt(d) + Vec3{0.f, 1.f, 0.f}, track_.StartRotation()};
+        // Off-track / flipped safety reset (simcade recovery). A car lying on
+        // its roof or side has no wheel contact and would otherwise be stuck.
+        const Vec3 carUp = TransformDirection(state.transform, Vec3{0.f, 1.f, 0.f});
+        const bool fellOff = state.transform.position.y < -8.f;
+        const bool stranded = carUp.y < 0.25f && state.speed < 3.f;
+        if (fellOff || stranded) {
+            const Vec3 fwd = track_.ForwardAt(d);
+            Transform pose{track_.PositionAt(d) + Vec3{0.f, 1.f, 0.f},
+                           Quat::FromAxisAngle(Vec3{0.f, 1.f, 0.f}, std::atan2(fwd.x, fwd.z))};
             racer.vehicle.Reset(pose);
             statusText_ = racer.name + " reset";
             statusTimer_ = 2.f;

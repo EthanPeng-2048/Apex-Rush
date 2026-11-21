@@ -182,7 +182,10 @@ void Vehicle::Update(const VehicleInput& input, float dt) {
     UpdateAssists(in);
 
     // Smooth steering (rate limit) for keyboard feel.
-    const float steerTarget = in.steer * 21.f * kDegToRad;
+    // Frame note: the vehicle frame is +Z forward / +Y up (right-handed), so
+    // the geometric right side is -X and a right turn is a NEGATIVE yaw around
+    // +Y. `in.steer` is defined as positive = steer right, hence the sign.
+    const float steerTarget = -in.steer * 21.f * kDegToRad;
     const float steerRate = 4.2f * dt;
     if (steerAngle_ < steerTarget) steerAngle_ = std::min(steerAngle_ + steerRate, steerTarget);
     else steerAngle_ = std::max(steerAngle_ - steerRate, steerTarget);
@@ -474,11 +477,13 @@ void Vehicle::UpdateAssists(VehicleInput& input) {
     if (params_.escLevel > 0.f) {
         const Vec3 angVel = world_->GetAngularVelocity(chassis_);
         const float yawRate = Dot(angVel, Vec3{0.f, 1.f, 0.f});
-        const float expectedYaw = forwardSpeed * input.steer * 0.28f;
+        // Right turn (steer > 0) yaws negative around +Y — see the note in
+        // Update(). Counter-steer: move steer toward the yaw error.
+        const float expectedYaw = -forwardSpeed * input.steer * 0.28f;
         const float yawError = yawRate - expectedYaw;
         if (std::fabs(yawError) > 0.55f) {
             const float correction = Clampf(yawError * 0.22f * params_.escLevel, -0.32f, 0.32f);
-            input.steer = Clampf(input.steer - correction, -1.f, 1.f);
+            input.steer = Clampf(input.steer + correction, -1.f, 1.f);
         }
     }
 }

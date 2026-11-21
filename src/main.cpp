@@ -106,21 +106,28 @@ int RunDriveTest(Config& config) {
     std::printf("       speed %.1f km/h, gear %d, rpm %.0f\n", game.PlayerState().speedKmh,
                 game.PlayerState().gear, game.PlayerState().rpm);
 
-    // 2) Steering at speed: throttle + full steering, heading must change.
+    // 2) Steering at speed. Keep it gentle — at 60 km/h full lock asks for
+    // ~3.4g and plows the car into the barriers, which garbles the heading.
     const Vec3 headingBefore =
         TransformDirection(game.PlayerState().transform, Vec3{0.f, 0.f, 1.f});
     InputState turn;
-    turn.throttle = 0.5f;
-    turn.steer = 1.f;
-    run(1.2f, turn);
+    turn.throttle = 0.35f;
+    turn.steer = 0.4f;
+    run(0.8f, turn);
+    // Deterministic mapping check: steer = +1 must point the front wheels to
+    // the right of the nose. In the vehicle frame (+Z forward, +Y up, right
+    // handed) a right turn is a negative yaw, so the steer angle is negative.
+    check(game.PlayerState().steerAngleDeg < -2.f, "steer +1 points wheels right",
+          game.PlayerState().steerAngleDeg, 0.f);
     const Vec3 headingAfter =
         TransformDirection(game.PlayerState().transform, Vec3{0.f, 0.f, 1.f});
     const float turnDeg = std::acos(Clampf(Dot(headingBefore, headingAfter), -1.f, 1.f)) * kRadToDeg;
     check(turnDeg > 15.f, "steering changes heading", turnDeg, 15.f);
-    // steer = +1 (D / right arrow) must yaw the car to the right: the heading
-    // rotates from +Z toward +X, i.e. cross(before, after) has positive Y.
-    const float yawSign = Cross(headingBefore, headingAfter).y;
-    check(yawSign > 0.f, "steer +1 yaws right", yawSign, 0.f);
+    // steer = +1 (D / right arrow) must swing the nose toward the car's
+    // geometric right side = forward x up (=-X when the car faces +Z).
+    const Vec3 rightDir = Cross(headingBefore, Vec3{0.f, 1.f, 0.f});
+    const float rightSwing = Dot(headingAfter, rightDir);
+    check(rightSwing > 0.05f, "steer +1 turns right", rightSwing, 0.f);
 
     // 3) Braking: full brake for 2 s from whatever speed we reached.
     InputState brake;
@@ -132,11 +139,21 @@ int RunDriveTest(Config& config) {
           beforeBrake * 0.65f);
 
     // 4) Reverse gear: like the real thing it only engages near a standstill.
-    run(1.f, brake);
+    // Fresh grid first — the steering/braking run above may have parked the
+    // car against a barrier, and reverse must be tested from a clean stop.
+    InputState restart;
+    restart.restart = true;
+    run(0.05f, restart);
+    run(4.f, InputState{});
     InputState reverse;
     reverse.throttle = 1.f;
     reverse.reverse = true;
     run(1.5f, reverse);
+    {
+        const VehicleState& s = game.PlayerState();
+        std::printf("       reverse: fwd=%.2f gear=%d throttle=%.2f\n", s.forwardSpeed, s.gear,
+                    s.throttle);
+    }
     check(game.PlayerState().forwardSpeed < -1.f, "reverse moves car backwards",
           game.PlayerState().forwardSpeed, -1.f);
 

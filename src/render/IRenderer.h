@@ -88,7 +88,11 @@ public:
 struct InputState {
     float throttle = 0.f;      // 0..1
     float brake = 0.f;         // 0..1
-    float steer = 0.f;         // -1..1, positive = right
+    // -1..1, positive = steer right (D / right arrow must give +1). The
+    // vehicle frame is +Z forward / +Y up (right handed), whose geometric
+    // right side is -X, so "right" is a negative yaw — conversions live in
+    // Vehicle::Update, input backends only map keys to this semantic.
+    float steer = 0.f;
     bool handbrake = false;
     bool reverse = false;
     bool drsToggle = false;
