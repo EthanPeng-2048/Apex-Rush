@@ -69,7 +69,13 @@ private:
     float totalLength_ = 0.f;
     float spacing_ = 4.f;
     MeshHandle roadMesh_ = kInvalidMesh;
-    MeshHandle kerbMesh_ = kInvalidMesh;
+    MeshHandle edgeLineMesh_ = kInvalidMesh;
+    MeshHandle kerbRedMesh_ = kInvalidMesh;
+    MeshHandle kerbWhiteMesh_ = kInvalidMesh;
+    MeshHandle wallMesh_ = kInvalidMesh;
+    MeshHandle grassMesh_ = kInvalidMesh;
+    MeshHandle startLineWhiteMesh_ = kInvalidMesh;
+    MeshHandle startLineBlackMesh_ = kInvalidMesh;
 };
 
 // Three built-in circuits (small/medium/techy) generated procedurally.

@@ -204,6 +204,9 @@ private:
     // Mode state
     bool wingTogglePrev_ = false;
     float drsZoneTimer_ = 0.f;
+
+    // Visual-only wheel rotation (radians), accumulated from road speed.
+    float wheelSpinAngle_ = 0.f;
 };
 
 }  // namespace apex

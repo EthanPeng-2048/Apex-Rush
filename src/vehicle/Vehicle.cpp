@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include "vehicle/CarModelData.h"
+
 namespace apex {
 
 namespace {
@@ -11,6 +13,57 @@ namespace {
 constexpr int kFrontLeft = 0, kFrontRight = 1, kRearLeft = 2, kRearRight = 3;
 
 bool IsFront(int wheel) { return wheel < 2; }
+
+// Model space: origin sits on the ground at the wheelbase centre, +Z forward,
+// exported by tools/export_car_model.py from the CC0 RaceCar.glb. The body's
+// ground plane must meet the wheel contact, i.e. ride height below the chassis
+// origin = static suspension length + wheel radius (~0.112 + R).
+constexpr float kStaticSuspension = 0.112f;
+
+// The source asset's left/right naming mirrors our +X=right convention, so
+// anchors are referenced by position: (xSign, zSign) -> physics wheel index.
+struct WheelDraw {
+    int wheelIndex;
+    float anchorX, anchorZ;
+};
+
+const WheelDraw kWheelDraws[4] = {
+    {kFrontLeft, -0.705f, 1.544f},   // x<0, z>0
+    {kFrontRight, 0.705f, 1.544f},   // x>0, z>0
+    {kRearLeft, -0.705f, -1.544f},   // x<0, z<0
+    {kRearRight, 0.705f, -1.544f},   // x>0, z<0
+};
+
+// Lazily-built GPU meshes shared by every car (body + one wheel drawn 4x).
+struct ModelCache {
+    MeshHandle body = kInvalidMesh;
+    MeshHandle wheel = kInvalidMesh;
+};
+
+ModelCache& GetModelCache() {
+    static ModelCache cache;
+    return cache;
+}
+
+MeshData BlobToMesh(const car_model::MeshBlob& blob) {
+    MeshData data;
+    data.positions.resize(static_cast<size_t>(blob.vertexCount));
+    data.normals.resize(static_cast<size_t>(blob.vertexCount));
+    for (int i = 0; i < blob.vertexCount; ++i) {
+        data.positions[static_cast<size_t>(i)] = {blob.positions[i * 3 + 0], blob.positions[i * 3 + 1],
+                                                  blob.positions[i * 3 + 2]};
+        data.normals[static_cast<size_t>(i)] = {blob.normals[i * 3 + 0], blob.normals[i * 3 + 1],
+                                                blob.normals[i * 3 + 2]};
+    }
+    data.indices.assign(blob.indices, blob.indices + blob.indexCount);
+    return data;
+}
+
+void EnsureModel(IRenderer& renderer) {
+    ModelCache& cache = GetModelCache();
+    if (cache.body == kInvalidMesh) cache.body = renderer.CreateMesh(BlobToMesh(car_model::kBody));
+    if (cache.wheel == kInvalidMesh) cache.wheel = renderer.CreateMesh(BlobToMesh(car_model::kWheel));
+}
 
 }  // namespace
 
@@ -217,6 +270,8 @@ void Vehicle::Update(const VehicleInput& input, float dt) {
     float damageSum = 0.f;
     for (int i = 0; i < static_cast<int>(CarPart::Count); ++i) damageSum += state_.partHealth[i];
     state_.damageTotal = 1.f - damageSum / static_cast<float>(CarPart::Count);
+
+    wheelSpinAngle_ += (forwardSpeed / params_.wheelRadius) * dt;
 }
 
 void Vehicle::UpdatePowertrain(const VehicleInput& input, float dt) {
@@ -474,65 +529,34 @@ void Vehicle::UpdateDamageFromContact(const ContactEvent& event) {
 void Vehicle::Render(IRenderer& renderer, const Color& tint) const {
     if (!world_ || chassis_ == kInvalidBody) return;
     const Transform transform = world_->GetTransform(chassis_);
-    const Vec3 forward = TransformDirection(transform, Vec3{0.f, 0.f, 1.f});
-    const Vec3 up = TransformDirection(transform, Vec3{0.f, 1.f, 0.f});
-    const Vec3 right = TransformDirection(transform, Vec3{1.f, 0.f, 0.f});
+    EnsureModel(renderer);
+    const ModelCache& cache = GetModelCache();
 
-    // Chassis block (low-poly, scaled box).
-    Transform chassisT = transform;
-    renderer.DrawBox({params_.chassisHalfX, params_.chassisHalfY, params_.chassisHalfZ}, chassisT,
-                     tint);
+    // Body: rigidly attached to the chassis, its ground plane at the wheel
+    // contact (static ride height below the chassis origin).
+    Transform bodyT = transform;
+    bodyT.position += TransformDirection(transform, Vec3{0.f, -(kStaticSuspension + params_.wheelRadius), 0.f});
+    renderer.DrawMesh(cache.body, bodyT, tint);
 
-    // Front wing
-    {
-        const float h = state_.partHealth[static_cast<int>(CarPart::FrontWing)];
-        Transform t = transform;
-        t.position += forward * 2.15f;
-        t.position -= up * 0.12f;
-        renderer.DrawBox({1.05f, 0.05f, 0.34f}, t, Color{0.85f, 0.12f, 0.12f, h * 0.35f + 0.65f});
+    // Wheels follow the suspension in Y, steer around up (front) and spin
+    // around their axle. Anchor X/Z come from the model so the wheels stay in
+    // the arches; Y comes from the live raycast suspension length.
+    for (const WheelDraw& draw : kWheelDraws) {
+        const WheelState& wheel = state_.wheels[draw.wheelIndex];
+        const float suspLen = wheel.grounded ? wheel.suspensionLength : kStaticSuspension;
+
+        Quat rot = transform.rotation;
+        if (IsFront(draw.wheelIndex)) {
+            rot = rot * Quat::FromAxisAngle(Vec3{0.f, 1.f, 0.f}, steerAngle_);
+        }
+        rot = rot * Quat::FromAxisAngle(Vec3{1.f, 0.f, 0.f}, wheelSpinAngle_);
+
+        Transform t;
+        t.position = TransformPoint(transform, Vec3{draw.anchorX, -suspLen, draw.anchorZ});
+        t.rotation = rot;
+        const float wearTint = 1.f - wheel.wear * 0.45f;
+        renderer.DrawMesh(cache.wheel, t, Color{0.12f, 0.12f, 0.13f, wearTint});
     }
-    // Rear wing
-    {
-        const float h = state_.partHealth[static_cast<int>(CarPart::RearWing)];
-        Transform t = transform;
-        t.position -= forward * 1.95f;
-        t.position += up * 0.52f;
-        // X-mode tilts visually lower/flatter.
-        const float tilt = state_.wingMode == WingMode::XMode ? 0.22f : 0.55f;
-        t.position += up * tilt * 0.18f;
-        renderer.DrawBox({0.52f, 0.06f, 0.30f}, t, Color{0.85f, 0.12f, 0.12f, h * 0.35f + 0.65f});
-    }
-    // Sidepods
-    {
-        const float h = state_.partHealth[static_cast<int>(CarPart::Sidepods)];
-        Transform t = transform;
-        t.position -= up * 0.02f;
-        renderer.DrawBox({params_.chassisHalfX + 0.10f, 0.16f, 1.05f}, t,
-                         Color{0.72f, 0.72f, 0.75f, h * 0.3f + 0.7f});
-    }
-
-    // Wheels (visual only — physics uses raycast suspension).
-    const float maxLen = params_.suspensionRestLength + params_.suspensionMaxTravel;
-    for (int i = 0; i < 4; ++i) {
-        const Vec3 hardpoint = TransformPoint(transform, hardpoints_[i]);
-        const float length = state_.wheels[i].grounded ? state_.wheels[i].suspensionLength : maxLen;
-        const Vec3 wheelCenter = hardpoint - up * (length + params_.wheelRadius * 0.15f);
-
-        Transform t = transform;
-        t.position = wheelCenter;
-        const float wearTint = 1.f - state_.wheels[i].wear * 0.45f;
-        renderer.DrawBox({0.16f, params_.wheelRadius * 0.85f, params_.wheelRadius * 0.85f}, t,
-                         Color{0.12f, 0.12f, 0.13f, wearTint});
-
-        // Suspension strut
-        renderer.DrawLine3D(hardpoint, wheelCenter, Color{0.45f, 0.45f, 0.5f, 1.f});
-    }
-
-    // Nose marker so orientation reads at a glance.
-    renderer.DrawLine3D(transform.position + up * 0.35f,
-                        transform.position + up * 0.35f + forward * 1.4f,
-                        Color{1.f, 0.85f, 0.15f, 1.f});
-    (void)right;
 }
 
 }  // namespace apex

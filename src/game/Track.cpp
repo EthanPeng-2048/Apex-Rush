@@ -180,62 +180,113 @@ void Track::BuildPhysics(IPhysicsWorld& world) {
 }
 
 void Track::BuildMesh(IRenderer& renderer) {
-    // Road ribbon: quad strip along the centerline.
-    MeshData road;
     const size_t n = samples_.size();
     if (n < 2) return;
 
-    road.positions.reserve(n * 2);
-    road.normals.reserve(n * 2);
-    road.indices.reserve(n * 6);
+    MeshData road, edgeLines, kerbRed, kerbWhite, walls, grass;
+
+    // Quad helper: (a,b) and (c,d) are opposite edges; winding is fixed so the
+    // face normal points along `normal`.
+    auto addQuad = [](MeshData& mesh, const Vec3& a, const Vec3& b, const Vec3& c, const Vec3& d,
+                      const Vec3& normal) {
+        const uint32_t base = static_cast<uint32_t>(mesh.positions.size());
+        mesh.positions.push_back(a);
+        mesh.positions.push_back(b);
+        mesh.positions.push_back(c);
+        mesh.positions.push_back(d);
+        for (int k = 0; k < 4; ++k) mesh.normals.push_back(normal);
+        const bool flip = Dot(Cross(b - a, c - a), normal) < 0.f;
+        if (!flip) {
+            mesh.indices.push_back(base + 0);
+            mesh.indices.push_back(base + 1);
+            mesh.indices.push_back(base + 2);
+            mesh.indices.push_back(base + 2);
+            mesh.indices.push_back(base + 1);
+            mesh.indices.push_back(base + 3);
+        } else {
+            mesh.indices.push_back(base + 0);
+            mesh.indices.push_back(base + 2);
+            mesh.indices.push_back(base + 1);
+            mesh.indices.push_back(base + 3);
+            mesh.indices.push_back(base + 2);
+            mesh.indices.push_back(base + 1);
+        }
+    };
+
+    const Vec3 up{0.f, 1.f, 0.f};
+    const float kerbDepth = 0.8f;
+    const float lineDepth = 0.22f;
+    const float lift = 0.015f;  // keep coplanar strips from z-fighting
 
     for (size_t i = 0; i < n; ++i) {
-        const Sample& s = samples_[i];
-        const float halfWidth = s.width * 0.5f;
-        const Vec3 left = s.position - s.right * halfWidth;
-        const Vec3 right = s.position + s.right * halfWidth;
-        road.positions.push_back(left);
-        road.positions.push_back(right);
-        road.normals.push_back({0.f, 1.f, 0.f});
-        road.normals.push_back({0.f, 1.f, 0.f});
-    }
-    for (size_t i = 0; i < n; ++i) {
-        const size_t a = i * 2;
-        const size_t b = a + 1;
-        const size_t c = ((i + 1) % n) * 2;
-        const size_t d = c + 1;
-        road.indices.push_back(static_cast<uint32_t>(a));
-        road.indices.push_back(static_cast<uint32_t>(c));
-        road.indices.push_back(static_cast<uint32_t>(b));
-        road.indices.push_back(static_cast<uint32_t>(b));
-        road.indices.push_back(static_cast<uint32_t>(c));
-        road.indices.push_back(static_cast<uint32_t>(d));
-    }
-    roadMesh_ = renderer.CreateMesh(road);
+        const Sample& s0 = samples_[i];
+        const Sample& s1 = samples_[(i + 1) % n];
+        const float w0 = s0.width * 0.5f;
+        const float w1 = s1.width * 0.5f;
 
-    // Kerb stripes every few samples on both sides (visual only).
-    MeshData kerb;
-    for (size_t i = 0; i + 1 < n; i += 2) {
-        const Sample& s = samples_[i];
-        const float halfWidth = s.width * 0.5f;
+        // Asphalt ribbon.
+        addQuad(road, s0.position - s0.right * w0, s0.position + s0.right * w0,
+                s1.position - s1.right * w1, s1.position + s1.right * w1, up);
+
         for (int side = -1; side <= 1; side += 2) {
-            const Vec3 inner = s.position + s.right * (halfWidth - 0.35f) * static_cast<float>(side);
-            const Vec3 outer = s.position + s.right * (halfWidth + 0.35f) * static_cast<float>(side);
-            const uint32_t base = static_cast<uint32_t>(kerb.positions.size());
-            kerb.positions.push_back(inner);
-            kerb.positions.push_back(outer);
-            kerb.positions.push_back(inner + s.forward * 3.5f);
-            kerb.positions.push_back(outer + s.forward * 3.5f);
-            for (int k = 0; k < 4; ++k) kerb.normals.push_back({0.f, 1.f, 0.f});
-            kerb.indices.push_back(base);
-            kerb.indices.push_back(base + 2);
-            kerb.indices.push_back(base + 1);
-            kerb.indices.push_back(base + 1);
-            kerb.indices.push_back(base + 2);
-            kerb.indices.push_back(base + 3);
+            const float sgn = static_cast<float>(side);
+
+            // White edge line just inboard of the kerb.
+            const Vec3 lineIn0 = s0.position + s0.right * sgn * (w0 - kerbDepth - lineDepth);
+            const Vec3 lineOut0 = s0.position + s0.right * sgn * (w0 - kerbDepth);
+            const Vec3 lineIn1 = s1.position + s1.right * sgn * (w1 - kerbDepth - lineDepth);
+            const Vec3 lineOut1 = s1.position + s1.right * sgn * (w1 - kerbDepth);
+            addQuad(edgeLines, lineIn0 + up * lift, lineOut0 + up * lift, lineIn1 + up * lift,
+                    lineOut1 + up * lift, up);
+
+            // Kerb strip at the asphalt edge, alternating red/white per segment.
+            const Vec3 kerbIn0 = s0.position + s0.right * sgn * (w0 - kerbDepth);
+            const Vec3 kerbOut0 = s0.position + s0.right * sgn * w0;
+            const Vec3 kerbIn1 = s1.position + s1.right * sgn * (w1 - kerbDepth);
+            const Vec3 kerbOut1 = s1.position + s1.right * sgn * w1;
+            MeshData& kerb = (i % 2 == 0) ? kerbRed : kerbWhite;
+            addQuad(kerb, kerbIn0 + up * lift, kerbOut0 + up * lift, kerbIn1 + up * lift,
+                    kerbOut1 + up * lift, up);
+
+            // Barrier wall on the outer face of the kerb (matches the physics
+            // wall boxes that sit just outside the road edge).
+            const float wallH = 1.2f;
+            const Vec3 base0 = s0.position + s0.right * sgn * w0;
+            const Vec3 base1 = s1.position + s1.right * sgn * w1;
+            addQuad(walls, base0, base1, base0 + up * wallH, base1 + up * wallH, -s0.right * sgn);
         }
     }
-    if (!kerb.positions.empty()) kerbMesh_ = renderer.CreateMesh(kerb);
+
+    // Grass apron under everything.
+    const float field = 420.f;
+    addQuad(grass, Vec3{-field, -0.02f, -field}, Vec3{field, -0.02f, -field},
+            Vec3{-field, -0.02f, field}, Vec3{field, -0.02f, field}, up);
+
+    // Start/finish checker band across the road, oriented with the centerline.
+    {
+        MeshData lineWhite, lineBlack;
+        const Sample& s = samples_.front();
+        const float halfWidth = s.width * 0.5f;
+        for (int i = -10; i < 10; ++i) {
+            const float off0 = static_cast<float>(i) * 0.55f;
+            const float off1 = off0 + 0.55f;
+            if (off0 > halfWidth || off1 < -halfWidth) continue;
+            const Vec3 p0 = s.position + s.right * off0;
+            const Vec3 p1 = s.position + s.right * off1;
+            MeshData& cell = (i % 2 == 0) ? lineWhite : lineBlack;
+            addQuad(cell, p0 - s.forward * 0.3f + up * lift, p1 - s.forward * 0.3f + up * lift,
+                    p0 + s.forward * 0.3f + up * lift, p1 + s.forward * 0.3f + up * lift, up);
+        }
+        startLineWhiteMesh_ = renderer.CreateMesh(lineWhite);
+        startLineBlackMesh_ = renderer.CreateMesh(lineBlack);
+    }
+
+    roadMesh_ = renderer.CreateMesh(road);
+    edgeLineMesh_ = renderer.CreateMesh(edgeLines);
+    kerbRedMesh_ = renderer.CreateMesh(kerbRed);
+    kerbWhiteMesh_ = renderer.CreateMesh(kerbWhite);
+    wallMesh_ = renderer.CreateMesh(walls);
+    grassMesh_ = renderer.CreateMesh(grass);
 }
 
 Vec3 Track::StartPosition(int gridSlot) const {
@@ -256,25 +307,28 @@ Quat Track::StartRotation() const {
 }
 
 void Track::Render(IRenderer& renderer) const {
+    const Transform origin{};
+    if (grassMesh_ != kInvalidMesh) {
+        renderer.DrawMesh(grassMesh_, origin, Color{0.20f, 0.44f, 0.22f, 1.f});
+    }
     if (roadMesh_ != kInvalidMesh) {
-        renderer.DrawMesh(roadMesh_, Transform{}, Color{0.32f, 0.33f, 0.36f, 1.f});
+        renderer.DrawMesh(roadMesh_, origin, Color{0.23f, 0.24f, 0.27f, 1.f});
     }
-    if (kerbMesh_ != kInvalidMesh) {
-        renderer.DrawMesh(kerbMesh_, Transform{}, Color{0.82f, 0.28f, 0.22f, 1.f});
+    if (edgeLineMesh_ != kInvalidMesh) {
+        renderer.DrawMesh(edgeLineMesh_, origin, Color{0.88f, 0.88f, 0.9f, 1.f});
     }
-
-    // Start/finish line marker.
-    if (!samples_.empty()) {
-        const Sample& s = samples_.front();
-        const float halfWidth = s.width * 0.5f;
-        for (int i = -4; i < 4; ++i) {
-            const float off = static_cast<float>(i) * 0.9f;
-            const Vec3 a = s.position + s.right * off - s.forward * 0.25f;
-            const Vec3 b = s.position + s.right * off + s.forward * 0.25f;
-            renderer.DrawLine3D(a + Vec3{0.f, 0.02f, 0.f}, b + Vec3{0.f, 0.02f, 0.f},
-                                (i % 2 == 0) ? Color::White() : Color::Black());
-        }
-        (void)halfWidth;
+    if (kerbRedMesh_ != kInvalidMesh) {
+        renderer.DrawMesh(kerbRedMesh_, origin, Color{0.82f, 0.22f, 0.18f, 1.f});
+    }
+    if (kerbWhiteMesh_ != kInvalidMesh) {
+        renderer.DrawMesh(kerbWhiteMesh_, origin, Color{0.92f, 0.92f, 0.92f, 1.f});
+    }
+    if (wallMesh_ != kInvalidMesh) {
+        renderer.DrawMesh(wallMesh_, origin, Color{0.75f, 0.76f, 0.78f, 1.f});
+    }
+    if (startLineWhiteMesh_ != kInvalidMesh) {
+        renderer.DrawMesh(startLineWhiteMesh_, origin, Color::White());
+        renderer.DrawMesh(startLineBlackMesh_, origin, Color{0.1f, 0.1f, 0.1f, 1.f});
     }
 }
 

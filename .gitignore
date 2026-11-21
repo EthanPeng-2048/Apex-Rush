@@ -10,3 +10,4 @@ dist/
 *.ilk
 *.log
 config.ini
+.playwright-mcp/

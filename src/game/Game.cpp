@@ -88,7 +88,6 @@ void Game::Update() {
 }
 
 void Game::Render3D() {
-    renderer_.DrawGrid(40, 10.f);
     track_.Render(renderer_);
 
     for (Racer& racer : racers_) {

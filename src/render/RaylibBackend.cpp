@@ -76,7 +76,8 @@ bool RaylibBackend::ShouldClose() const {
 
 void RaylibBackend::BeginFrame() {
     ::BeginDrawing();
-    ::ClearBackground({24, 26, 32, 255});
+    // Sky blue so the grass/track read like an outdoor circuit.
+    ::ClearBackground({132, 186, 230, 255});
 }
 
 void RaylibBackend::BeginScene() {
