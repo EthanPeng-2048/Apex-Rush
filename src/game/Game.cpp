@@ -137,6 +137,12 @@ void Game::LoadSettings() {
         audio_->SetMasterVolume(std::clamp(config_.GetInt("audio", "volume", 80), 0, 100) / 100.f);
         audio_->SetBackend(config_.GetString("audio", "backend", "auto").c_str());
     }
+
+    // Season feature gates: classic (DRS) vs 2026 (active aero + override).
+    // Defaults = classic 2025 preset (DRS on, the 2026 systems off).
+    seasonDrs_ = config_.GetBool("season", "drs", true);
+    seasonAero_ = config_.GetBool("season", "active_aero", false);
+    seasonOverride_ = config_.GetBool("season", "overtake", false);
 }
 
 void Game::SpawnRacers() {
@@ -164,6 +170,10 @@ void Game::SpawnRacers() {
             params.steerLevel = AssistLevel::Full;
         }
         params.damageEnabled = config_.GetBool("race", "damage", true);
+        // Season rules apply to every car (player and AI alike).
+        params.drsEnabled = seasonDrs_;
+        params.activeAeroEnabled = seasonAero_;
+        params.overtakeEnabled = seasonOverride_;
 
         Transform pose;
         pose.position = track_.StartPosition(i);
@@ -280,14 +290,15 @@ void Game::UpdatePlayerInput() {
 
     if (phase_ == RacePhase::Racing && !player.finished) {
         // DRS: F only arms/disarms inside a map-marked zone (authored on
-        // straights). Leaving the zone closes DRS and resets the latch, so
-        // re-entering a zone later starts closed — the driver must re-arm.
+        // straights), and only when the season enables DRS. Leaving the
+        // zone closes DRS and resets the latch, so re-entering a zone later
+        // starts closed — the driver must re-arm.
         const float playerD =
             track_.ProjectDistance(player.vehicle.State().transform.position);
         const bool inDrsZone = track_.InDrsZone(playerD);
         if (!inDrsZone) {
             drsWanted_ = false;
-        } else if (raw.drsToggle) {
+        } else if (raw.drsToggle && seasonDrs_) {
             drsWanted_ = !drsWanted_;
         }
         player.input.throttle = raw.throttle;
@@ -297,8 +308,10 @@ void Game::UpdatePlayerInput() {
         player.input.reverse = raw.reverse;
         player.input.drsZone = inDrsZone;
         player.input.drsRequest = drsWanted_;
-        player.input.wingToggle = raw.wingModeToggle;
-        player.input.overtake = raw.overtake;
+        // 2026 systems are gated by the season — the keys do nothing in
+        // classic rules (and the HUD hides their hints).
+        player.input.wingToggle = raw.wingModeToggle && seasonAero_;
+        player.input.overtake = raw.overtake && seasonOverride_;
     } else if (phase_ == RacePhase::Countdown) {
         player.input = VehicleInput{};
     } else {
@@ -427,11 +440,12 @@ void Game::UpdateAI(Racer& racer, float dt) {
     racer.input.throttle = throttle;
     racer.input.brake = brake;
 
-    // Use DRS/overtake features like the player — but DRS only inside a
-    // map-marked zone (the vehicle gates activation on drsZone).
+    // Use DRS/overtake features like the player — but only what the season
+    // enables (the vehicle gates activation on the same flags).
     racer.input.drsZone = track_.InDrsZone(d);
-    racer.input.drsRequest = true;
-    racer.input.overtake = curvMax < 0.002f && state.speed > 50.f;
+    racer.input.drsRequest = seasonDrs_;
+    racer.input.overtake =
+        seasonOverride_ && curvMax < 0.002f && state.speed > 50.f;
     racer.input.wingToggle = false;
 }
 
@@ -677,13 +691,20 @@ void Game::RenderHUD() {
     renderer_.DrawRect2D(62.f, baseY + 120.f, 136.f * state.ersCharge, 8.f,
                          state.ersDeploying ? Color::Yellow() : Color::Blue());
 
-    if (state.drsActive) {
-        renderer_.DrawText2D("DRS", w - 120.f, 30.f, 30, Color::Green());
-    } else if (state.drsAvailable) {
-        renderer_.DrawText2D("DRS RDY", w - 170.f, 30.f, 22, Color::Yellow());
+    // DRS / wing indicators — only for the features this season enables
+    // (classic shows DRS, 2026 shows the X/Z modes; never both).
+    if (seasonDrs_) {
+        if (state.drsActive) {
+            renderer_.DrawText2D("DRS", w - 120.f, 30.f, 30, Color::Green());
+        } else if (state.drsAvailable) {
+            renderer_.DrawText2D("DRS RDY", w - 170.f, 30.f, 22, Color::Yellow());
+        }
     }
-    renderer_.DrawText2D(state.wingMode == WingMode::XMode ? "X-MODE" : "Z-MODE", w - 150.f, 64.f,
-                         20, state.wingMode == WingMode::XMode ? Color::Blue() : Color::Orange());
+    if (seasonAero_) {
+        renderer_.DrawText2D(state.wingMode == WingMode::XMode ? "X-MODE" : "Z-MODE",
+                             w - 150.f, 64.f, 20,
+                             state.wingMode == WingMode::XMode ? Color::Blue() : Color::Orange());
+    }
 
     // Phase overlays.
     if (phase_ == RacePhase::Countdown) {
@@ -710,8 +731,13 @@ void Game::RenderHUD() {
         renderer_.DrawText2D(statusText_, w * 0.5f - 80.f, h - 200.f, 22, Color::Orange());
     }
 
-    renderer_.DrawText2D("W/S THROTTLE-BRAKE   A/D STEER   F DRS   V WING   SHIFT OVERTAKE   C CAMERA   ESC MENU",
-                         12.f, h - 22.f, 15, Color::DarkGray());
+    // Help line lists only the keys this season actually wires up.
+    std::string help = "W/S THROTTLE-BRAKE   A/D STEER";
+    if (seasonDrs_) help += "   F DRS";
+    if (seasonAero_) help += "   V WING";
+    if (seasonOverride_) help += "   SHIFT OVERTAKE";
+    help += "   C CAMERA   ESC MENU";
+    renderer_.DrawText2D(help, 12.f, h - 22.f, 15, Color::DarkGray());
 }
 
 void Game::UpdateMenu() {
@@ -768,18 +794,48 @@ void Game::UpdateSettings() {
     if (dir == 0 && !in.menuSelect) return;
 
     switch (settingsCursor_) {
-        case 0:
+        case 0: {
+            // SEASON preset: classic (DRS) <-> 2026 (aero + override).
+            // Writing a preset rewrites the three feature toggles with it.
+            const std::string preset = config_.GetString("season", "preset", "2025");
+            int idx = (preset == "2026") ? 1 : 0;  // custom -> classic
+            idx = CyclePreset(idx, 2, dir);
+            const bool is2026 = (idx == 1);
+            config_.SetString("season", "preset", is2026 ? "2026" : "2025");
+            config_.SetString("season", "drs", is2026 ? "0" : "1");
+            config_.SetString("season", "active_aero", is2026 ? "1" : "0");
+            config_.SetString("season", "overtake", is2026 ? "1" : "0");
+            seasonDrs_ = !is2026;
+            seasonAero_ = is2026;
+            seasonOverride_ = is2026;
+            break;
+        }
         case 1:
         case 2:
         case 3: {
+            // Per-feature toggles. Flipping one marks the preset CUSTOM —
+            // the three systems may then mix, but only deliberately.
+            static const char* kSeasonKeys[3] = {"drs", "active_aero", "overtake"};
+            bool* gates[3] = {&seasonDrs_, &seasonAero_, &seasonOverride_};
+            const int i = settingsCursor_ - 1;
+            bool value = (dir != 0) ? (dir > 0) : !*gates[i];
+            *gates[i] = value;
+            config_.SetString("season", kSeasonKeys[i], value ? "1" : "0");
+            config_.SetString("season", "preset", "custom");
+            break;
+        }
+        case 4:
+        case 5:
+        case 6:
+        case 7: {
             static const char* kAssistKeys[4] = {"abs", "tc", "esc", "steer"};
-            const char* key = kAssistKeys[settingsCursor_];
+            const char* key = kAssistKeys[settingsCursor_ - 4];
             int level = static_cast<int>(ParseAssistLevel(config_, key, DefaultAssistLevel(key)));
             level = CyclePreset(level, 3, dir);
             SaveAssistLevel(config_, key, static_cast<AssistLevel>(level));
             break;
         }
-        case 4: {
+        case 8: {
             video_.borderlessFullscreen =
                 (dir != 0) ? (dir > 0) : !video_.borderlessFullscreen;
             config_.SetString("video", "mode",
@@ -787,7 +843,7 @@ void Game::UpdateSettings() {
             renderer_.ApplyVideo(video_);
             break;
         }
-        case 5: {
+        case 9: {
             int idx = 0;
             for (int i = 0; i < kResPresetCount; ++i) {
                 if (kResPresets[i].width == video_.width && kResPresets[i].height == video_.height) {
@@ -802,13 +858,13 @@ void Game::UpdateSettings() {
             renderer_.ApplyVideo(video_);
             break;
         }
-        case 6: {
+        case 10: {
             video_.shadows = (dir != 0) ? (dir > 0) : !video_.shadows;
             config_.SetString("video", "quality", video_.shadows ? "high" : "low");
             renderer_.ApplyVideo(video_);
             break;
         }
-        case 7: {
+        case 11: {
             int idx = 0;
             for (int i = 0; i < kFpsPresetCount; ++i) {
                 if (kFpsPresets[i] == video_.fpsLimit) idx = i;
@@ -819,7 +875,7 @@ void Game::UpdateSettings() {
             renderer_.ApplyVideo(video_);
             break;
         }
-        case 8: {
+        case 12: {
             const int hz = static_cast<int>(1.f / fixedDt_ + 0.5f);
             int idx = 1;
             for (int i = 0; i < kPhysicsPresetCount; ++i) {
@@ -830,7 +886,7 @@ void Game::UpdateSettings() {
             config_.SetString("physics", "hz", std::to_string(kPhysicsPresets[idx]));
             break;
         }
-        case 9: {
+        case 13: {
             // Collision backend swap (qu3e | nudge) — rebuilt on next race.
             const bool nudge = config_.GetString("physics", "engine", "qu3e") == "nudge";
             config_.SetString("physics", "engine",
@@ -838,7 +894,7 @@ void Game::UpdateSettings() {
                                          : (nudge ? "qu3e" : "nudge"));
             break;
         }
-        case 10: {
+        case 14: {
             const int volume =
                 std::clamp(config_.GetInt("audio", "volume", 80) + (dir != 0 ? (dir > 0 ? 20 : -20) : 20),
                            0, 100);
@@ -969,7 +1025,17 @@ void Game::RenderSettings() {
     const int physicsHz = static_cast<int>(1.f / fixedDt_ + 0.5f);
     char resBuffer[32];
     std::snprintf(resBuffer, sizeof(resBuffer), "%dx%d", video_.width, video_.height);
+    // Season preset display: named presets or CUSTOM once a feature gate
+    // was flipped individually.
+    const std::string preset = config_.GetString("season", "preset", "2025");
+    const std::string seasonName = preset == "2026"   ? "2026"
+                                   : preset == "2025" ? "2025"
+                                                      : "CUSTOM";
     const Row rows[kSettingsRowCount] = {
+        {"SEASON", seasonName},
+        {"DRS", seasonDrs_ ? "ON" : "OFF"},
+        {"ACTIVE AERO", seasonAero_ ? "ON" : "OFF"},
+        {"OVERTAKE", seasonOverride_ ? "ON" : "OFF"},
         {"ABS", AssistLevelName(ParseAssistLevel(config_, "abs", DefaultAssistLevel("abs")))},
         {"TRACTION CTRL", AssistLevelName(ParseAssistLevel(config_, "tc", DefaultAssistLevel("tc")))},
         {"STABILITY CTRL", AssistLevelName(ParseAssistLevel(config_, "esc", DefaultAssistLevel("esc")))},

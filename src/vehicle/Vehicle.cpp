@@ -267,24 +267,27 @@ void Vehicle::Update(const VehicleInput& input, float dt) {
     throttleSmooth_ += (in.throttle - throttleSmooth_) * std::min(1.f, 10.f * dt);
     brakeSmooth_ += (in.brake - brakeSmooth_) * std::min(1.f, 14.f * dt);
 
-    // Wing mode toggle (2026 active aero).
-    if (in.wingToggle && !wingTogglePrev_) {
+    // Wing mode toggle (2026 active aero) — only when the season enables it.
+    if (params_.activeAeroEnabled && in.wingToggle && !wingTogglePrev_) {
         state_.wingMode = (state_.wingMode == WingMode::ZMode) ? WingMode::XMode : WingMode::ZMode;
     }
     wingTogglePrev_ = in.wingToggle;
 
     // DRS: available only inside a map-marked activation zone (zones.csv,
-    // authored on straights) — no speed or steering gate. Once the driver
-    // opens it, it stays open for the whole zone: low speed and turning
-    // never close it. Leaving the zone closes it (drsZone goes false); the
-    // game resets the toggle latch on exit so re-entry starts closed.
-    state_.drsAvailable = in.drsZone;
-    state_.drsActive = in.drsRequest && in.drsZone;
+    // authored on straights) and only when the season enables DRS — no
+    // speed or steering gate. Once the driver opens it, it stays open for
+    // the whole zone: low speed and turning never close it. Leaving the
+    // zone closes it (drsZone goes false); the game resets the toggle
+    // latch on exit so re-entry starts closed.
+    state_.drsAvailable = params_.drsEnabled && in.drsZone;
+    state_.drsActive = in.drsRequest && state_.drsAvailable;
 
-    // ERS: deploy on overtake button when charge remains; regenerate under braking.
+    // ERS: deploy on overtake button when charge remains; regenerate under
+    // braking. The manual deploy is the 2026 override mode — off in classic.
     state_.ersDeploying = false;
     float ersPower = 0.f;
-    if (in.overtake && state_.ersCharge > 0.02f && throttleSmooth_ > 0.5f) {
+    if (params_.overtakeEnabled && in.overtake && state_.ersCharge > 0.02f &&
+        throttleSmooth_ > 0.5f) {
         ersPower = params_.ersDeployPower * params_.overtakeMultiplier;
         state_.ersDeploying = true;
         state_.ersCharge = std::max(0.f, state_.ersCharge - ersPower * dt / params_.ersCapacity);

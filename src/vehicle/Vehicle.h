@@ -85,6 +85,14 @@ struct VehicleParams {
     // No-damage mode: collisions still bounce, but parts never lose health.
     bool damageEnabled = true;
 
+    // Season rules ([season] in config): classic (DRS) and 2026 (active
+    // aero + override) never mix. Game sets these from the season preset /
+    // per-feature toggles at spawn; the vehicle gates the features itself
+    // so a stale input can't leak a disabled system.
+    bool drsEnabled = true;          // classic: DRS on straights
+    bool activeAeroEnabled = false;  // 2026: X/Z wing modes (V)
+    bool overtakeEnabled = false;    // 2026: manual override deploy (SHIFT)
+
     // ERS / overtake
     float ersCapacity = 4.0e6f;       // J
     float ersDeployPower = 350000.f;  // W

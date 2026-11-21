@@ -45,8 +45,9 @@ class Game {
 public:
     // Race-setup rows: circuit, laps, cars, damage, start, back.
     static constexpr int kRaceSetupRowCount = 6;
-    // Global settings rows: assists + video/physics + audio + BACK.
-    static constexpr int kSettingsRowCount = 13;
+    // Global settings rows: season + feature gates, assists, video/physics,
+    // audio + BACK.
+    static constexpr int kSettingsRowCount = 17;
 
     Game(IRenderer& renderer, IInput& input, Config& config, IAudio* audio = nullptr);
 
@@ -123,6 +124,14 @@ private:
     // leaving the zone closes DRS and resets the latch, so re-entering a
     // zone later starts closed (the driver must re-arm).
     bool drsWanted_ = false;
+
+    // Season feature gates ([season] in config): classic (DRS) and 2026
+    // (active aero + override) never mix. The settings screen exposes a
+    // season preset plus per-feature toggles; toggling a feature flips the
+    // preset display to CUSTOM.
+    bool seasonDrs_ = true;
+    bool seasonAero_ = false;
+    bool seasonOverride_ = false;
 
     // Menu / settings state.
     InputState rawInput_;

@@ -264,6 +264,11 @@ int RunDrsZoneTest(const char* engine) {
     config.SetString("assists", "esc", "full");
     config.SetString("assists", "tc", "sport");
     config.SetString("assists", "abs", "sport");
+    // Pin the classic season so a user's [season] config can't disable DRS
+    // and fail these zone assertions (local config, never saved).
+    config.SetString("season", "drs", "1");
+    config.SetString("season", "active_aero", "0");
+    config.SetString("season", "overtake", "0");
 
     Game game(backend, backend, config);
     if (!game.Init()) {
@@ -567,6 +572,104 @@ int RunWallCrashTest(IPhysicsWorld& world) {
     return ok ? 0 : 1;
 }
 
+// Season feature gates: classic (DRS) and 2026 (active aero + override)
+// must not leak into each other — a disabled system ignores its input even
+// if the game layer forwards it. Vehicle-level check of the VehicleParams
+// flags the game sets from the [season] config at spawn.
+int RunSeasonGateTest(IPhysicsWorld& world) {
+    world.SetGravity({0.f, -9.81f, 0.f});
+
+    BodyDesc ground;
+    ground.transform.position = {0.f, -1.f, 0.f};
+    ground.halfExtents = {2000.f, 1.f, 2000.f};
+    ground.friction = 0.8f;
+    world.CreateBody(ground);
+
+    int failures = 0;
+    auto check = [&failures](bool ok, const char* what, float got, float want) {
+        std::printf("[%s] %s (got %.2f, target %.2f)\n", ok ? "PASS" : "FAIL", what, got, want);
+        if (!ok) ++failures;
+    };
+
+    const float dt = 1.f / 240.f;
+    auto spawn = [&](const VehicleParams& params) {
+        Vehicle car;
+        Transform pose;
+        pose.position = {0.f, 0.55f, 0.f};
+        car.Spawn(world, pose, params);
+        for (int i = 0; i < 60; ++i) {  // settle on the suspension
+            car.Update(VehicleInput{}, dt);
+            world.Step(dt);
+        }
+        return car;
+    };
+    auto step = [&](Vehicle& car, const VehicleInput& in, float seconds) {
+        const int n = static_cast<int>(seconds / dt + 0.5f);
+        for (int i = 0; i < n; ++i) {
+            car.Update(in, dt);
+            world.Step(dt);
+        }
+    };
+
+    // Classic season: DRS works, the 2026 systems stay dead.
+    {
+        VehicleParams params;  // defaults: drs on, aero/override off
+        Vehicle car = spawn(params);
+
+        VehicleInput drs;
+        drs.drsZone = true;
+        drs.drsRequest = true;
+        step(car, drs, 0.05f);
+        check(car.State().drsActive, "season: classic DRS works in zone",
+              car.State().drsActive ? 1.f : 0.f, 1.f);
+
+        VehicleInput wing;
+        wing.wingToggle = true;
+        step(car, wing, 0.05f);
+        check(car.State().wingMode == WingMode::ZMode, "season: classic ignores wing toggle",
+              static_cast<float>(car.State().wingMode), static_cast<float>(WingMode::ZMode));
+
+        VehicleInput ovt;
+        ovt.overtake = true;
+        ovt.throttle = 1.f;
+        step(car, ovt, 0.3f);
+        check(!car.State().ersDeploying, "season: classic ignores override",
+              car.State().ersDeploying ? 1.f : 0.f, 0.f);
+    }
+
+    // 2026 season: active aero + override work, DRS stays dead even inside
+    // a DRS zone with a stale request.
+    {
+        VehicleParams params;
+        params.drsEnabled = false;
+        params.activeAeroEnabled = true;
+        params.overtakeEnabled = true;
+        Vehicle car = spawn(params);
+
+        VehicleInput drs;
+        drs.drsZone = true;
+        drs.drsRequest = true;
+        step(car, drs, 0.05f);
+        check(!car.State().drsActive, "season: 2026 ignores DRS",
+              car.State().drsActive ? 1.f : 0.f, 0.f);
+
+        VehicleInput wing;
+        wing.wingToggle = true;
+        step(car, wing, 0.05f);
+        check(car.State().wingMode == WingMode::XMode, "season: 2026 wing toggle works",
+              static_cast<float>(car.State().wingMode), static_cast<float>(WingMode::XMode));
+
+        VehicleInput ovt;
+        ovt.overtake = true;
+        ovt.throttle = 1.f;
+        step(car, ovt, 0.3f);
+        check(car.State().ersDeploying, "season: 2026 override deploys",
+              car.State().ersDeploying ? 1.f : 0.f, 1.f);
+    }
+
+    return failures;
+}
+
 // `apex-rush --drive-test`: headless physics/controls verification. Drives the
 // player car with scripted input and asserts acceleration, braking, steering
 // and reverse. Exits 0 on success, 1 on failure. No window is created, so it
@@ -732,6 +835,12 @@ int RunDriveTestForEngine(Config& config, const char* engine) {
     {
         std::unique_ptr<IPhysicsWorld> crashWorld = MakeWorld(engine);
         failures += RunWallCrashTest(*crashWorld);
+    }
+
+    // 5c) Season gates: classic DRS and 2026 aero/override never leak.
+    {
+        std::unique_ptr<IPhysicsWorld> seasonWorld = MakeWorld(engine);
+        failures += RunSeasonGateTest(*seasonWorld);
     }
 
     // 6) Menu / settings flow (headless, backend-agnostic).
