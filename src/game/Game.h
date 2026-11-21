@@ -13,6 +13,8 @@ namespace apex {
 
 // Race phases drive UI and input gating.
 enum class RacePhase {
+    Menu,
+    Settings,
     Countdown,
     Racing,
     Finished,
@@ -55,7 +57,14 @@ public:
 
 private:
     void BuildWorld();
+    void LoadSettings();
+    void SpawnRacers();
+    void StartRace();
     void UpdatePlayerInput();
+    void UpdateMenu();
+    void UpdateSettings();
+    void RenderMenu();
+    void RenderSettings();
     void UpdateAI(Racer& racer, float dt);
     void StepPhysics(float dt);
     void UpdateRace(float dt);
@@ -88,6 +97,11 @@ private:
     std::string statusText_;
     float statusTimer_ = 0.f;
     bool wantsQuit_ = false;
+
+    // Menu / settings state.
+    InputState rawInput_;
+    int menuCursor_ = 0;
+    int settingsCursor_ = 0;
 };
 
 }  // namespace apex

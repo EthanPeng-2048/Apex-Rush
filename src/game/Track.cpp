@@ -96,8 +96,23 @@ void Track::Resample(const std::vector<ControlPoint>& controlPoints, float spaci
     }
 }
 
+void Track::Dispose(IRenderer& renderer) {
+    const MeshHandle meshes[] = {grassMesh_,  roadMesh_,        edgeLineMesh_, kerbRedMesh_,
+                                 kerbWhiteMesh_, wallMesh_,     startLineWhiteMesh_,
+                                 startLineBlackMesh_};
+    for (MeshHandle mesh : meshes) {
+        if (mesh != kInvalidMesh) renderer.DestroyMesh(mesh);
+    }
+    grassMesh_ = roadMesh_ = edgeLineMesh_ = kerbRedMesh_ = kerbWhiteMesh_ =
+        wallMesh_ = startLineWhiteMesh_ = startLineBlackMesh_ = kInvalidMesh;
+    wallBodies_.clear();
+    drsZones_.clear();
+    overtakeZones_.clear();
+}
+
 void Track::Build(const std::vector<ControlPoint>& controlPoints, IPhysicsWorld& world,
                   IRenderer& renderer) {
+    Dispose(renderer);
     Resample(controlPoints, 4.f);
     BuildPhysics(world);
     BuildMesh(renderer);

@@ -29,15 +29,21 @@ Game::Game(IRenderer& renderer, IInput& input, Config& config)
     : renderer_(renderer), input_(input), config_(config) {}
 
 bool Game::Init() {
-    world_ = std::make_unique<Qu3eWorld>();
-    world_->SetGravity({0.f, -9.81f, 0.f});
+    StartRace();
+    // Tests and automation skip straight to the grid; normal launches open
+    // the main menu over the parked scene.
+    phase_ = config_.GetBool("race", "autostart", false) ? RacePhase::Countdown
+                                                         : RacePhase::Menu;
+    return true;
+}
 
+void Game::LoadSettings() {
     circuitIndex_ = std::clamp(config_.GetInt("race", "circuit", 0), 0, 2);
     totalLaps_ = std::clamp(config_.GetInt("race", "laps", 3), 1, 20);
+}
+
+void Game::SpawnRacers() {
     const int carCount = std::clamp(config_.GetInt("race", "cars", 4), 1, 8);
-
-    BuildWorld();
-
     racers_.resize(static_cast<size_t>(carCount));
     for (int i = 0; i < carCount; ++i) {
         Racer& racer = racers_[static_cast<size_t>(i)];
@@ -54,11 +60,21 @@ bool Game::Init() {
         pose.rotation = track_.StartRotation();
         racer.vehicle.Spawn(*world_, pose, params, &racer);
     }
+}
 
+// (Re)build world, track and grid from the current config — used at boot and
+// whenever the player starts a race from the menu.
+void Game::StartRace() {
+    LoadSettings();
+    racers_.clear();
+    world_ = std::make_unique<Qu3eWorld>();
+    world_->SetGravity({0.f, -9.81f, 0.f});
+    BuildWorld();
+    SpawnRacers();
     phase_ = RacePhase::Countdown;
     phaseTimer_ = 3.5f;
     raceClock_ = 0.f;
-    return true;
+    accumulator_ = 0.f;
 }
 
 void Game::BuildWorld() {
@@ -70,20 +86,27 @@ void Game::Update() {
     const float frameDt = std::min(renderer_.FrameTime(), 0.1f);
 
     UpdatePlayerInput();
-    for (Racer& racer : racers_) {
-        if (!racer.isPlayer && !racer.finished) UpdateAI(racer, frameDt);
+
+    if (phase_ == RacePhase::Menu) {
+        UpdateMenu();
+    } else if (phase_ == RacePhase::Settings) {
+        UpdateSettings();
+    } else {
+        for (Racer& racer : racers_) {
+            if (!racer.isPlayer && !racer.finished) UpdateAI(racer, frameDt);
+        }
+
+        // Fixed-step physics: 240 Hz.
+        accumulator_ += frameDt;
+        while (accumulator_ >= kFixedDt) {
+            StepPhysics(kFixedDt);
+            accumulator_ -= kFixedDt;
+        }
+
+        UpdateRace(frameDt);
     }
 
-    // Fixed-step physics: 240 Hz.
-    accumulator_ += frameDt;
-    while (accumulator_ >= kFixedDt) {
-        StepPhysics(kFixedDt);
-        accumulator_ -= kFixedDt;
-    }
-
-    UpdateRace(frameDt);
     UpdateCamera(frameDt);
-
     if (statusTimer_ > 0.f) statusTimer_ -= frameDt;
 }
 
@@ -100,9 +123,24 @@ void Game::UpdatePlayerInput() {
     if (racers_.empty()) return;
     Racer& player = racers_.front();
 
-    const InputState raw = input_.Poll();
-    if (raw.pause) wantsQuit_ = true;
+    rawInput_ = input_.Poll();
+    const InputState& raw = rawInput_;
+
+    // Menus own their input (UpdateMenu / UpdateSettings); cars stay parked.
+    if (phase_ == RacePhase::Menu || phase_ == RacePhase::Settings) {
+        player.input = VehicleInput{};
+        return;
+    }
+
     if (raw.cameraCycle) cameraMode_ = (cameraMode_ + 1) % 4;
+
+    // ESC/P drops back to the menu from any race phase.
+    if (raw.pause) {
+        phase_ = RacePhase::Menu;
+        menuCursor_ = 0;
+        player.input = VehicleInput{};
+        return;
+    }
 
     if (phase_ == RacePhase::Racing && !player.finished) {
         player.input.throttle = raw.throttle;
@@ -276,6 +314,24 @@ void Game::UpdateCamera(float dt) {
     const Vec3 forward = TransformDirection(state.transform, Vec3{0.f, 0.f, 1.f});
     const Vec3 up{0.f, 1.f, 0.f};
 
+    // Menus get a slow orbit around the parked car.
+    if (phase_ == RacePhase::Menu || phase_ == RacePhase::Settings) {
+        const float angle = static_cast<float>(renderer_.TimeSeconds()) * 0.18f;
+        const Vec3 desiredPos = state.transform.position +
+                                Vec3{std::cos(angle) * 13.f, 5.f, std::sin(angle) * 13.f};
+        const Vec3 desiredTarget = state.transform.position + Vec3{0.f, 0.8f, 0.f};
+        const float blend = Clampf(dt * 3.f, 0.f, 1.f);
+        cameraPos_ += (desiredPos - cameraPos_) * blend;
+        cameraTarget_ += (desiredTarget - cameraTarget_) * blend;
+        CameraDesc cam;
+        cam.position = cameraPos_;
+        cam.target = cameraTarget_;
+        cam.up = up;
+        cam.fovYDeg = 58.f;
+        renderer_.SetCamera(cam);
+        return;
+    }
+
     Vec3 desiredPos;
     Vec3 desiredTarget;
     switch (cameraMode_) {
@@ -315,6 +371,14 @@ void Game::UpdateCamera(float dt) {
 }
 
 void Game::RenderHUD() {
+    if (phase_ == RacePhase::Menu) {
+        RenderMenu();
+        return;
+    }
+    if (phase_ == RacePhase::Settings) {
+        RenderSettings();
+        return;
+    }
     if (racers_.empty()) return;
     const Racer& player = racers_.front();
     const VehicleState& state = player.vehicle.State();
@@ -398,7 +462,7 @@ void Game::RenderHUD() {
                       FormatTime(player.raceTime > 0.f ? player.raceTime : raceClock_).c_str(),
                       FormatTime(player.bestLapTime).c_str());
         renderer_.DrawText2D(buffer, w * 0.5f - 190.f, h * 0.5f - 8.f, 22, Color::Yellow());
-        renderer_.DrawText2D("ENTER = RESTART    ESC = QUIT", w * 0.5f - 190.f, h * 0.5f + 40.f, 20,
+        renderer_.DrawText2D("ENTER = RESTART    ESC = MENU", w * 0.5f - 190.f, h * 0.5f + 40.f, 20,
                              Color::Gray());
     }
 
@@ -406,8 +470,154 @@ void Game::RenderHUD() {
         renderer_.DrawText2D(statusText_, w * 0.5f - 80.f, h - 200.f, 22, Color::Orange());
     }
 
-    renderer_.DrawText2D("W/S THROTTLE-BRAKE   A/D STEER   F DRS   V WING   SHIFT OVERTAKE   C CAMERA   P QUIT",
+    renderer_.DrawText2D("W/S THROTTLE-BRAKE   A/D STEER   F DRS   V WING   SHIFT OVERTAKE   C CAMERA   ESC MENU",
                          12.f, h - 22.f, 15, Color::DarkGray());
+}
+
+void Game::UpdateMenu() {
+    const InputState& in = rawInput_;
+    if (in.menuUp) menuCursor_ = (menuCursor_ + 2) % 3;
+    if (in.menuDown) menuCursor_ = (menuCursor_ + 1) % 3;
+    if (in.menuSelect) {
+        switch (menuCursor_) {
+            case 0:
+                StartRace();
+                break;
+            case 1:
+                phase_ = RacePhase::Settings;
+                settingsCursor_ = 0;
+                break;
+            default:
+                wantsQuit_ = true;
+                break;
+        }
+    }
+    if (in.menuBack) wantsQuit_ = true;
+}
+
+void Game::UpdateSettings() {
+    constexpr int kRows = 7;  // circuit, laps, cars, abs, tc, esc, back
+    const InputState& in = rawInput_;
+    if (in.menuUp) settingsCursor_ = (settingsCursor_ + kRows - 1) % kRows;
+    if (in.menuDown) settingsCursor_ = (settingsCursor_ + 1) % kRows;
+
+    auto backToMenu = [this]() {
+        config_.Save("config.ini");
+        phase_ = RacePhase::Menu;
+        menuCursor_ = 0;
+    };
+
+    if (settingsCursor_ == kRows - 1) {
+        if (in.menuSelect || in.menuBack) backToMenu();
+        return;
+    }
+    if (in.menuBack) {
+        backToMenu();
+        return;
+    }
+
+    const int dir = (in.menuRight ? 1 : 0) - (in.menuLeft ? 1 : 0);
+    if (dir == 0 && !in.menuSelect) return;
+
+    switch (settingsCursor_) {
+        case 0: {
+            circuitIndex_ = std::clamp(circuitIndex_ + (dir != 0 ? dir : 1), 0, 2);
+            config_.SetString("race", "circuit", std::to_string(circuitIndex_));
+            break;
+        }
+        case 1: {
+            totalLaps_ = std::clamp(totalLaps_ + (dir != 0 ? dir : 1), 1, 20);
+            config_.SetString("race", "laps", std::to_string(totalLaps_));
+            break;
+        }
+        case 2: {
+            const int cars = std::clamp(config_.GetInt("race", "cars", 4) + (dir != 0 ? dir : 1),
+                                        1, 8);
+            config_.SetString("race", "cars", std::to_string(cars));
+            break;
+        }
+        default: {
+            static const char* kAssistKeys[3] = {"abs", "tc", "esc"};
+            const char* key = kAssistKeys[settingsCursor_ - 3];
+            bool value = config_.GetBool("assists", key, true);
+            value = (dir != 0) ? (dir > 0) : !value;
+            config_.SetString("assists", key, value ? "true" : "false");
+            break;
+        }
+    }
+}
+
+void Game::RenderMenu() {
+    const float w = static_cast<float>(renderer_.ScreenWidth());
+    const float h = static_cast<float>(renderer_.ScreenHeight());
+
+    renderer_.DrawRect2D(0.f, 0.f, w, h, Color{0.f, 0.f, 0.f, 0.35f});
+    renderer_.DrawText2D("APEX RUSH", w * 0.5f - 165.f, h * 0.24f, 68, Color::White());
+    renderer_.DrawText2D("OPEN F1 SIM", w * 0.5f - 92.f, h * 0.24f + 78.f, 20, Color::Gray());
+
+    const char* items[3] = {"START RACE", "SETTINGS", "QUIT"};
+    float y = h * 0.52f;
+    for (int i = 0; i < 3; ++i) {
+        const bool selected = (i == menuCursor_);
+        const Vec2f size = renderer_.MeasureText2D(items[i], 28);
+        const float x = w * 0.5f - size.x * 0.5f;
+        if (selected) {
+            renderer_.DrawRect2D(x - 28.f, y - 8.f, size.x + 56.f, 42.f,
+                                 Color{1.f, 0.55f, 0.15f, 0.22f});
+        }
+        renderer_.DrawText2D(items[i], x, y, 28, selected ? Color::Orange() : Color::White());
+        y += 54.f;
+    }
+
+    const std::string hint = "W/S SELECT    ENTER CONFIRM    ESC QUIT";
+    const Vec2f hintSize = renderer_.MeasureText2D(hint, 18);
+    renderer_.DrawText2D(hint, w * 0.5f - hintSize.x * 0.5f, h - 52.f, 18, Color::Gray());
+}
+
+void Game::RenderSettings() {
+    const float w = static_cast<float>(renderer_.ScreenWidth());
+    const float h = static_cast<float>(renderer_.ScreenHeight());
+
+    renderer_.DrawRect2D(0.f, 0.f, w, h, Color{0.f, 0.f, 0.f, 0.45f});
+
+    const std::string title = "SETTINGS";
+    const Vec2f titleSize = renderer_.MeasureText2D(title, 42);
+    renderer_.DrawText2D(title, w * 0.5f - titleSize.x * 0.5f, h * 0.14f, 42, Color::White());
+
+    struct Row {
+        const char* label;
+        std::string value;
+    };
+    const int cars = config_.GetInt("race", "cars", 4);
+    const Row rows[7] = {
+        {"CIRCUIT", std::to_string(circuitIndex_ + 1) + "/3"},
+        {"LAPS", std::to_string(totalLaps_)},
+        {"CARS", std::to_string(cars)},
+        {"ABS", config_.GetBool("assists", "abs", true) ? "ON" : "OFF"},
+        {"TRACTION CTRL", config_.GetBool("assists", "tc", true) ? "ON" : "OFF"},
+        {"STABILITY CTRL", config_.GetBool("assists", "esc", true) ? "ON" : "OFF"},
+        {"BACK", ""},
+    };
+
+    float y = h * 0.28f;
+    for (int i = 0; i < 7; ++i) {
+        const bool selected = (i == settingsCursor_);
+        renderer_.DrawRect2D(w * 0.5f - 300.f, y - 6.f, 600.f, 40.f,
+                             selected ? Color{1.f, 0.55f, 0.15f, 0.22f}
+                                      : Color{0.f, 0.f, 0.f, 0.25f});
+        renderer_.DrawText2D(rows[i].label, w * 0.5f - 280.f, y, 22,
+                             selected ? Color::Orange() : Color::White());
+        if (!rows[i].value.empty()) {
+            const Vec2f valueSize = renderer_.MeasureText2D(rows[i].value, 22);
+            renderer_.DrawText2D(rows[i].value, w * 0.5f + 280.f - valueSize.x, y, 22,
+                                 selected ? Color::Yellow() : Color::Gray());
+        }
+        y += 46.f;
+    }
+
+    const std::string hint = "A/D CHANGE    W/S SELECT    ENTER/ESC BACK";
+    const Vec2f hintSize = renderer_.MeasureText2D(hint, 18);
+    renderer_.DrawText2D(hint, w * 0.5f - hintSize.x * 0.5f, h - 52.f, 18, Color::Gray());
 }
 
 }  // namespace apex

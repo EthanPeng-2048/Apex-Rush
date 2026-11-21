@@ -119,6 +119,69 @@ int RunFlatStabilityTest() {
     return failures;
 }
 
+// Menu/settings flow on the headless backend: boots into the menu (no
+// autostart), opens settings, comes back, starts a race — plus a render
+// smoke pass over the menu screens. Uses the real config.ini but never
+// changes a value, so the settings save round-trips the user's config.
+int RunMenuTest() {
+    NullBackend backend;
+    if (!backend.Init(1280, 720, "menu-test")) {
+        std::printf("[FAIL] menu-test backend init\n");
+        return 1;
+    }
+
+    Config config;
+    config.Load("config.ini");
+    Game game(backend, backend, config);
+    if (!game.Init()) {
+        std::printf("[FAIL] menu-test game init\n");
+        return 1;
+    }
+
+    int failures = 0;
+    auto checkPhase = [&failures](bool ok, const char* what, RacePhase got, RacePhase want) {
+        std::printf("[%s] %s (got %d, want %d)\n", ok ? "PASS" : "FAIL", what,
+                    static_cast<int>(got), static_cast<int>(want));
+        if (!ok) ++failures;
+    };
+    auto frame = [&](InputState in) {
+        backend.scripted = in;
+        backend.BeginFrame();
+        game.Update();
+        game.RenderHUD();
+        backend.EndFrame();
+    };
+
+    checkPhase(game.Phase() == RacePhase::Menu, "menu: boots into menu", game.Phase(),
+               RacePhase::Menu);
+
+    InputState press;
+    press.menuDown = true;  // cursor -> SETTINGS
+    frame(press);
+    press = InputState{};
+    press.menuSelect = true;
+    frame(press);
+    checkPhase(game.Phase() == RacePhase::Settings, "menu: settings opens", game.Phase(),
+               RacePhase::Settings);
+
+    press = InputState{};
+    press.menuDown = true;
+    for (int i = 0; i < 6 && game.Phase() == RacePhase::Settings; ++i) frame(press);
+    press = InputState{};
+    press.menuSelect = true;  // BACK row
+    frame(press);
+    checkPhase(game.Phase() == RacePhase::Menu, "menu: settings returns", game.Phase(),
+               RacePhase::Menu);
+
+    press = InputState{};
+    press.menuSelect = true;  // START RACE
+    frame(press);
+    checkPhase(game.Phase() == RacePhase::Countdown, "menu: start race -> countdown", game.Phase(),
+               RacePhase::Countdown);
+
+    return failures;
+}
+
 // `apex-rush --drive-test`: headless physics/controls verification. Drives the
 // player car with scripted input and asserts acceleration, braking, steering
 // and reverse. Exits 0 on success, 1 on failure. No window is created, so it
@@ -275,6 +338,9 @@ int RunDriveTest(Config& config) {
     //    speed without hitting the barriers.)
     failures += RunFlatStabilityTest();
 
+    // 6) Menu / settings flow (headless).
+    failures += RunMenuTest();
+
     std::printf("drive-test: %s (%d failures)\n", failures == 0 ? "OK" : "FAILED", failures);
     backend.Shutdown();
     return failures == 0 ? 0 : 1;
@@ -303,6 +369,10 @@ int main(int argc, char** argv) {
 
     Config config;
     config.Load("config.ini");
+    // All CLI automation paths (tests, screenshots, scene dumps) skip the menu.
+    if (driveTest || dumpPath || shotPath) {
+        config.SetString("race", "autostart", "true");
+    }
 
     if (driveTest) {
         return RunDriveTest(config);

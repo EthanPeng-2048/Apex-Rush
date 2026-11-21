@@ -103,6 +103,15 @@ struct InputState {
     bool pause = false;
     bool restart = false;
     bool lookBack = false;
+
+    // Menu navigation (edge-triggered). Shared with W/S/A/D and arrows so the
+    // menu works without a mouse; only consumed in Menu/Settings phases.
+    bool menuUp = false;
+    bool menuDown = false;
+    bool menuLeft = false;
+    bool menuRight = false;
+    bool menuSelect = false;
+    bool menuBack = false;
 };
 
 class IInput {

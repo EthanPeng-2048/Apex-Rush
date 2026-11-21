@@ -230,6 +230,12 @@ InputState RaylibBackend::Poll() {
     state.pause = IsKeyPressed(KEY_ESCAPE) || IsKeyPressed(KEY_P);
     state.restart = IsKeyPressed(KEY_ENTER);
     state.lookBack = IsKeyDown(KEY_B);
+    state.menuUp = IsKeyPressed(KEY_UP) || IsKeyPressed(KEY_W);
+    state.menuDown = IsKeyPressed(KEY_DOWN) || IsKeyPressed(KEY_S);
+    state.menuLeft = IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_A);
+    state.menuRight = IsKeyPressed(KEY_RIGHT) || IsKeyPressed(KEY_D);
+    state.menuSelect = IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE);
+    state.menuBack = IsKeyPressed(KEY_ESCAPE);
     return state;
 }
 

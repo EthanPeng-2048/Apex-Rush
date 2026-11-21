@@ -20,8 +20,13 @@ public:
     };
 
     // Build the circuit from control points (closed loop, Catmull-Rom).
+    // Safe to call again on an existing track (settings change): previous
+    // meshes are destroyed and body lists cleared first.
     void Build(const std::vector<ControlPoint>& controlPoints, IPhysicsWorld& world,
                IRenderer& renderer);
+
+    // Release render meshes (called by Build before rebuilding).
+    void Dispose(IRenderer& renderer);
 
     // Spline helpers (arc-length parameterized).
     Vec3 PositionAt(float distance) const;
