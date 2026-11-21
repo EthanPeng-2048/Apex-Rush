@@ -5,12 +5,119 @@
 
 #include "core/Config.h"
 #include "game/Game.h"
+#include "physics/Qu3eWorld.h"
 #include "render/NullBackend.h"
 #include "render/RaylibBackend.h"
+#include "vehicle/Vehicle.h"
 
 namespace {
 
 using namespace apex;
+
+// High-speed steering stability on a bare ground plane. The circuit is a
+// ~120 m radius loop, so any straight run drifts into the wall within ~3 s
+// and wall contacts garble handling numbers; an infinite plane isolates the
+// vehicle dynamics. Regression for the "slight steer at speed = spin" bug:
+// a keyboard step to part lock used to ratchet to full lock (steering filter
+// jumped straight to its too-large speed limit, and the ESC reference yaw was
+// ~10x too large at speed so it kept adding steering) and snap the car.
+int RunFlatStabilityTest() {
+    Qu3eWorld world;
+    world.SetGravity({0.f, -9.81f, 0.f});
+
+    BodyDesc ground;
+    ground.transform.position = {0.f, -1.f, 0.f};
+    ground.halfExtents = {2000.f, 1.f, 2000.f};
+    ground.friction = 0.8f;
+    world.CreateBody(ground);
+
+    VehicleParams params;
+    Transform pose;
+    pose.position = {0.f, 0.55f, 0.f};
+    Vehicle car;
+    car.Spawn(world, pose, params);
+
+    int failures = 0;
+    auto check = [&failures](bool ok, const char* what, float got, float want) {
+        std::printf("[%s] %s (got %.2f, target %.2f)\n", ok ? "PASS" : "FAIL", what, got, want);
+        if (!ok) ++failures;
+    };
+
+    const float dt = 1.f / 240.f;  // matches Game::kFixedDt
+    auto step = [&](const VehicleInput& in, float seconds) {
+        const int n = static_cast<int>(seconds / dt + 0.5f);
+        for (int i = 0; i < n; ++i) {
+            car.Update(in, dt);
+            world.Step(dt);
+        }
+    };
+    auto heading = [&]() {
+        return TransformDirection(car.State().transform, Vec3{0.f, 0.f, 1.f});
+    };
+    auto sideSlip = [&]() {
+        const VehicleState& s = car.State();
+        return std::fabs(Dot(s.velocity, Cross(heading(), Vec3{0.f, 1.f, 0.f})));
+    };
+
+    step(VehicleInput{}, 1.0f);  // settle on the suspension
+
+    // Phase A: mid speed. Even at ~75 km/h the old ESC reference already
+    // ratcheted a 0.25 tap to full lock.
+    {
+        VehicleInput accel;
+        accel.throttle = 1.f;
+        step(accel, 2.2f);
+        const float v0 = car.State().speed;
+        const Vec3 heading0 = heading();
+
+        VehicleInput tap;
+        tap.throttle = 0.3f;
+        tap.steer = 0.25f;
+        step(tap, 1.0f);
+
+        const VehicleState& s = car.State();
+        check(v0 > 15.f, "flat: reach mid speed", v0, 15.f);
+        const float bound = 0.25f * 21.f / (1.f + 0.032f * s.speed + 0.0018f * s.speed * s.speed) +
+                            0.35f;
+        check(std::fabs(s.steerAngleDeg) < bound, "flat: steer within speed limit",
+              s.steerAngleDeg, bound);
+        const float turnDeg =
+            std::acos(Clampf(Dot(heading0, heading()), -1.f, 1.f)) * kRadToDeg;
+        check(turnDeg < 25.f, "flat: no snap spin at mid speed", turnDeg, 25.f);
+        check(sideSlip() < 3.f, "flat: low side slip at mid speed", sideSlip(), 3.f);
+        std::printf("       mid-speed tap: v=%.1f km/h\n", s.speedKmh);
+    }
+
+    // Phase B: keep the throttle pinned to true racing speed (~200 km/h),
+    // then repeat the tap. This is the regime where a slight steer used to
+    // spin the car instantly.
+    {
+        VehicleInput accel;
+        accel.throttle = 1.f;
+        step(accel, 10.f);
+        const float v0 = car.State().speed;
+        const Vec3 heading0 = heading();
+
+        VehicleInput tap;
+        tap.throttle = 0.2f;
+        tap.steer = 0.25f;
+        step(tap, 1.2f);
+
+        const VehicleState& s = car.State();
+        check(v0 > 40.f, "flat: reach racing speed", v0, 40.f);
+        const float bound = 0.25f * 21.f / (1.f + 0.032f * s.speed + 0.0018f * s.speed * s.speed) +
+                            0.35f;
+        check(std::fabs(s.steerAngleDeg) < bound, "flat: steer within speed limit",
+              s.steerAngleDeg, bound);
+        const float turnDeg =
+            std::acos(Clampf(Dot(heading0, heading()), -1.f, 1.f)) * kRadToDeg;
+        check(turnDeg < 20.f, "flat: no snap spin at racing speed", turnDeg, 20.f);
+        check(sideSlip() < 3.5f, "flat: low side slip at racing speed", sideSlip(), 3.5f);
+        std::printf("       high-speed tap: v=%.1f km/h\n", s.speedKmh);
+    }
+
+    return failures;
+}
 
 // `apex-rush --drive-test`: headless physics/controls verification. Drives the
 // player car with scripted input and asserts acceleration, braking, steering
@@ -115,16 +222,20 @@ int RunDriveTest(Config& config) {
     InputState turn;
     turn.throttle = 0.35f;
     turn.steer = 0.4f;
-    run(0.8f, turn);
+    run(1.0f, turn);
     // Deterministic mapping check: steer = +1 must point the front wheels to
     // the right of the nose. In the vehicle frame (+Z forward, +Y up, right
     // handed) a right turn is a negative yaw, so the steer angle is negative.
-    check(game.PlayerState().steerAngleDeg < -2.f, "steer +1 points wheels right",
+    // Sign only: the circuit curves away, so wall contact near the end of the
+    // run can legitimately counter-steer the wheel back toward centre.
+    check(game.PlayerState().steerAngleDeg < -0.5f, "steer +1 points wheels right",
           game.PlayerState().steerAngleDeg, 0.f);
     const Vec3 headingAfter =
         TransformDirection(game.PlayerState().transform, Vec3{0.f, 0.f, 1.f});
     const float turnDeg = std::acos(Clampf(Dot(headingBefore, headingAfter), -1.f, 1.f)) * kRadToDeg;
-    check(turnDeg > 15.f, "steering changes heading", turnDeg, 15.f);
+    // Speed-sensitive steering trims the max angle, so the same 0.4 input
+    // bends the car less than before; 13 deg in 1 s is still a clear turn.
+    check(turnDeg > 13.f, "steering changes heading", turnDeg, 13.f);
     // steer = +1 (D / right arrow) must swing the nose toward the car's
     // geometric right side = forward x up (=-X when the car faces +Z).
     const Vec3 rightDir = Cross(headingBefore, Vec3{0.f, 1.f, 0.f});
@@ -158,6 +269,11 @@ int RunDriveTest(Config& config) {
     }
     check(game.PlayerState().forwardSpeed < -1.f, "reverse moves car backwards",
           game.PlayerState().forwardSpeed, -1.f);
+
+    // 5) High-speed steering stability lives on a bare ground plane — see
+    //    RunFlatStabilityTest. (The circuit loop is too tight to reach racing
+    //    speed without hitting the barriers.)
+    failures += RunFlatStabilityTest();
 
     std::printf("drive-test: %s (%d failures)\n", failures == 0 ? "OK" : "FAILED", failures);
     backend.Shutdown();

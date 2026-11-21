@@ -182,17 +182,25 @@ void Vehicle::Update(const VehicleInput& input, float dt) {
     VehicleInput in = input;
     UpdateAssists(in);
 
-    // Smooth steering (rate limit) for keyboard feel.
+    // Speed-sensitive steering filter. Keyboard input steps to full lock
+    // instantly, so the raw value must never reach the road wheels directly:
+    //  - the max angle shrinks with speed toward the grip envelope (~2 deg at
+    //    250 km/h; the old curve still allowed ~3x what the tires can hold at
+    //    that speed, so any steer input snapped the car),
+    //  - wind-up takes longer the faster you go, so a tap at speed is a
+    //    gentle direction change; unwinding toward centre stays quick so
+    //    releasing the key feels crisp.
     // Frame note: the vehicle frame is +Z forward / +Y up (right-handed), so
     // the geometric right side is -X and a right turn is a NEGATIVE yaw around
     // +Y. `in.steer` is defined as positive = steer right, hence the sign.
-    // The wheel angle shrinks with speed (21 deg at standstill, ~7 deg at
-    // 250 km/h) so the car stays controllable at racing speed.
     const float speedNow = state_.speed;
     const float steerRange =
-        21.f * kDegToRad / (1.f + 0.032f * speedNow + 0.00025f * speedNow * speedNow);
+        21.f * kDegToRad / (1.f + 0.032f * speedNow + 0.0018f * speedNow * speedNow);
     const float steerTarget = -in.steer * steerRange;
-    const float steerRate = 4.2f * dt;
+    const float tau = std::fabs(steerTarget) < std::fabs(steerAngle_)
+                          ? 0.06f
+                          : std::min(0.085f + 0.0028f * speedNow, 0.30f);
+    const float steerRate = steerRange / tau * dt;
     if (steerAngle_ < steerTarget) steerAngle_ = std::min(steerAngle_ + steerRate, steerTarget);
     else steerAngle_ = std::max(steerAngle_ - steerRate, steerTarget);
 
@@ -488,16 +496,19 @@ void Vehicle::UpdateAssists(VehicleInput& input) {
         }
     }
 
-    // ESC: counter-steer bias when yaw rate is excessive for the speed.
-    if (params_.escLevel > 0.f) {
+    // ESC: counter-steer only when the car rotates faster than the steering
+    // asks for (bicycle-model reference yaw = v * tan(steer) / wheelbase).
+    // Never add steering on understeer: the old reference scaled with
+    // v * input and was ~10x too large at speed, so its "yaw deficit" kept
+    // ratcheting the wheel toward full lock on a straight and spun the car.
+    if (params_.escLevel > 0.f && !input.handbrake) {
         const Vec3 angVel = world_->GetAngularVelocity(chassis_);
         const float yawRate = Dot(angVel, Vec3{0.f, 1.f, 0.f});
-        // Right turn (steer > 0) yaws negative around +Y — see the note in
-        // Update(). Counter-steer: move steer toward the yaw error.
-        const float expectedYaw = -forwardSpeed * input.steer * 0.28f;
-        const float yawError = yawRate - expectedYaw;
-        if (std::fabs(yawError) > 0.55f) {
-            const float correction = Clampf(yawError * 0.22f * params_.escLevel, -0.32f, 0.32f);
+        const float yawRef = forwardSpeed * std::tan(steerAngle_) / params_.wheelbase;
+        const float excess = std::fabs(yawRate) - std::fabs(yawRef);
+        if (excess > 0.35f) {
+            const float correction =
+                Clampf((yawRate - yawRef) * 0.22f * params_.escLevel, -0.32f, 0.32f);
             input.steer = Clampf(input.steer + correction, -1.f, 1.f);
         }
     }
