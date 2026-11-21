@@ -218,6 +218,29 @@ int RunMenuTest() {
     checkPhase(game.Phase() == RacePhase::Countdown, "setup: start -> countdown", game.Phase(),
                RacePhase::Countdown);
 
+    // ESC from a race phase must return to the menu without quitting — the
+    // same keypress must not also act as "back" in the menu (regression:
+    // "ESC exits the app instead of going back to the menu").
+    InputState esc;
+    esc.pause = true;
+    esc.menuBack = true;
+    frame(esc);
+    checkPhase(game.Phase() == RacePhase::Menu, "esc: race back to menu", game.Phase(),
+               RacePhase::Menu);
+    if (game.WantsQuit()) {
+        std::printf("[FAIL] esc: race-to-menu must not quit\n");
+        ++failures;
+    }
+
+    // ESC is inert in the menu; only the QUIT item may exit.
+    frame(esc);
+    checkPhase(game.Phase() == RacePhase::Menu, "esc: menu stays put", game.Phase(),
+               RacePhase::Menu);
+    if (game.WantsQuit()) {
+        std::printf("[FAIL] esc: menu must not quit on back\n");
+        ++failures;
+    }
+
     return failures;
 }
 

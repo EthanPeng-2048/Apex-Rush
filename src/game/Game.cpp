@@ -1,4 +1,4 @@
-﻿#include "game/Game.h"
+#include "game/Game.h"
 
 #include <algorithm>
 #include <cctype>
@@ -722,7 +722,9 @@ void Game::UpdateMenu() {
                 break;
         }
     }
-    if (in.menuBack) wantsQuit_ = true;
+    // ESC is inert here on purpose: quitting must go through the QUIT item
+    // only. Acting on menuBack also ate the same keypress that just brought
+    // the player back from a race ("ESC exits the app instead of the menu").
 }
 
 void Game::UpdateSettings() {
@@ -932,7 +934,7 @@ void Game::RenderMenu() {
         y += 54.f;
     }
 
-    const std::string hint = "W/S SELECT    ENTER CONFIRM    ESC QUIT";
+    const std::string hint = "W/S SELECT    ENTER CONFIRM";
     const Vec2f hintSize = renderer_.MeasureText2D(hint, 18);
     renderer_.DrawText2D(hint, w * 0.5f - hintSize.x * 0.5f, h - 52.f, 18, Color::Gray());
 }
