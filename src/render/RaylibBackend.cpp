@@ -23,6 +23,11 @@ Vector3 ToRaylib(const Vec3& v) { return {v.x, v.y, v.z}; }
 extern "C" __declspec(dllimport) int __stdcall GetSystemMetrics(int nIndex);
 constexpr int kSmCxScreen = 0;
 constexpr int kSmCyScreen = 1;
+// IME (Chinese/Japanese input methods) swallows game keys between keydown and
+// keyup ("卡键"). Disable it for the game thread so keystrokes go straight
+// through — the game takes the input system back.
+extern "C" __declspec(dllimport) int __stdcall ImmDisableIME(unsigned long dwThreadId);
+#pragma comment(lib, "imm32.lib")
 #endif
 
 }  // namespace
@@ -49,6 +54,9 @@ bool RaylibBackend::Init(int width, int height, const std::string& title) {
 #endif
     InitWindow(width, height, title.c_str());
     if (!IsWindowReady()) return false;
+#ifdef _WIN32
+    ImmDisableIME(0xFFFFFFFFul);  // current thread
+#endif
 #if defined(__EMSCRIPTEN__)
     // Web builds run the blocking loop through ASYNCIFY and must yield to the
     // browser once per frame — raylib does that inside WaitTime at the target
