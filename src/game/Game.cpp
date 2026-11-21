@@ -173,6 +173,14 @@ void Game::UpdatePlayerInput() {
         phaseTimer_ = 3.5f;
         raceClock_ = 0.f;
     }
+
+    // AI 代驾 (autopilot): the player car drives itself — demo mode and the
+    // AI regression harness ([race] autopilot=true).
+    if (config_.GetBool("race", "autopilot", false) && phase_ == RacePhase::Racing &&
+        !player.finished) {
+        player.input = VehicleInput{};
+        UpdateAI(player, 0.f);
+    }
 }
 
 void Game::UpdateAI(Racer& racer, float dt) {
@@ -184,46 +192,96 @@ void Game::UpdateAI(Racer& racer, float dt) {
     const VehicleState& state = racer.vehicle.State();
     const float d = track_.ProjectDistance(state.transform.position);
 
-    // Look ahead further at speed.
-    const float lookahead = 12.f + state.speed * 0.55f;
-    const Vec3 target = track_.PositionAt(d + lookahead);
-    const Vec3 toTarget = target - state.transform.position;
-
     const Vec3 forward = TransformDirection(state.transform, Vec3{0.f, 0.f, 1.f});
     // Geometric right is -X in the vehicle frame (+Z forward / +Y up, right
     // handed) — see Vehicle::Update. `steer` is positive = steer right.
     const Vec3 right = TransformDirection(state.transform, Vec3{-1.f, 0.f, 0.f});
 
-    const float lateral = Dot(toTarget, right);
-    const float longitudinal = Dot(toTarget, forward);
+    // --- Steering: heading error toward a speed-scaled lookahead point,
+    // damped by lateral velocity (anti-sideslip). This is what keeps the car
+    // off the walls — lateral-offset steering alone cuts corners too hard.
+    const float lookahead = 14.f + state.speed * 0.72f;
+    const Vec3 target = track_.PositionAt(d + lookahead);
+    const Vec3 toTarget = target - state.transform.position;
+    float yawErr = std::atan2(toTarget.x, toTarget.z) - std::atan2(forward.x, forward.z);
+    while (yawErr > kPi) yawErr -= 2.f * kPi;
+    while (yawErr < -kPi) yawErr += 2.f * kPi;
+    const float lateralVel = Dot(state.velocity, right);
+    // Modest gain + strong anti-sideslip damping: high gain + weak damping
+    // makes the steering loop oscillate at speed and spin the car.
+    float steer = Clampf(-yawErr * 1.5f - lateralVel * 0.06f, -1.f, 1.f);
 
-    // Steering: proportional to lateral offset, damped by speed.
-    float steer = Clampf(lateral * 0.16f, -1.f, 1.f);
-    if (longitudinal < 0.f) steer = -steer;
-    racer.input.steer = steer;
-
-    // Target speed from curvature ahead (sample two points).
-    const Vec3 ahead1 = track_.PositionAt(d + 30.f);
-    const Vec3 ahead2 = track_.PositionAt(d + 70.f);
-    const Vec3 v1 = Normalize(ahead1 - state.transform.position);
-    const Vec3 v2 = Normalize(ahead2 - ahead1);
-    const float corner = 1.f - Clampf(Dot(v1, v2), -1.f, 1.f);  // 0 straight, ~1 hairpin
-
-    const float targetSpeed = Clampf(86.f - corner * 160.f, 22.f, 86.f);
-    if (state.speed < targetSpeed) {
-        racer.input.throttle = 1.f;
-        racer.input.brake = 0.f;
-    } else if (state.speed > targetSpeed + 3.f) {
-        racer.input.throttle = 0.f;
-        racer.input.brake = Clampf((state.speed - targetSpeed) * 0.12f, 0.2f, 1.f);
-    } else {
-        racer.input.throttle = 0.55f;
-        racer.input.brake = 0.f;
+    // --- Speed target from the sharpest corner inside the braking horizon.
+    // Two caps: grip (v = sqrt(aLat / curvature)) and the steering envelope —
+    // the speed-sensitive wheel-angle limit makes tight corners physically
+    // unturnable above a speed (R=23 m needs ~9 deg but 25 m/s only allows
+    // 7 deg), so also solve 21deg / (1 + 0.032v + 0.0018v^2) >= 1.15 * L * curv.
+    const float horizon = std::max(60.f, state.speed * state.speed / 24.f);
+    float curvMax = 0.f;
+    for (float dd = 0.f; dd <= horizon; dd += 10.f) {
+        curvMax = std::max(curvMax, track_.CurvatureAt(d + dd) * 1.2f);
     }
+    curvMax = std::max(curvMax, 0.0012f);
+    float vTarget = std::sqrt(13.5f / curvMax);
+    {
+        // Keep within the playable steering envelope (Vehicle::Update):
+        // delta_max(v) = 48.58/v^2 + 0.0135 rad; require 1.15x margin.
+        const float rhs = 1.15f * 3.6f * curvMax;
+        if (rhs > 0.0135f) {
+            vTarget = std::min(vTarget, std::sqrt(48.58f / (rhs - 0.0135f)));
+        }
+    }
+    vTarget = Clampf(vTarget * 0.95f, 12.f, 62.f);
+
+    const float total = track_.TotalLength();
+    for (const Racer& other : racers_) {
+        if (&other == &racer) continue;
+        const float od = track_.ProjectDistance(other.vehicle.State().transform.position);
+        float gap = od - d;
+        if (gap < -total * 0.5f) gap += total;
+        else if (gap > total * 0.5f) gap -= total;
+        if (gap > 0.f && gap < 18.f) {
+            // Floor at 8 m/s so close following never freezes into an
+            // accordion; light contact is harmless in no-damage mode.
+            vTarget = std::max(8.f, std::min(vTarget, other.vehicle.State().speed + 2.5f +
+                                                          gap * 0.5f));
+        }
+    }
+
+    float throttle = 1.f;
+    float brake = 0.f;
+    if (state.speed < 8.f) {
+        throttle = 1.f;
+    } else if (state.speed > vTarget + 1.5f) {
+        throttle = 0.f;
+        brake = Clampf((state.speed - vTarget) * 0.14f, 0.15f, 1.f);
+    } else if (state.speed > vTarget - 2.f) {
+        throttle = 0.55f;
+    }
+
+    // Slide recovery: ease off and counter a bit when the rear steps out.
+    const float slide =
+        std::fabs(state.wheels[2].slipAngleDeg) + std::fabs(state.wheels[3].slipAngleDeg);
+    if (slide > 28.f) {
+        throttle *= 0.55f;
+        steer = Clampf(steer * 1.25f, -1.f, 1.f);
+    }
+
+    // Spin recovery: when facing away from the track, coast and unwind the
+    // steering toward the target — flooring it while sideways only pins the
+    // car against a wall.
+    if (Dot(forward, track_.ForwardAt(d)) < 0.2f) {
+        throttle = 0.f;
+        brake = state.speed > 8.f ? 0.35f : 0.f;
+    }
+
+    racer.input.steer = steer;
+    racer.input.throttle = throttle;
+    racer.input.brake = brake;
 
     // Use DRS/overtake features like the player.
     racer.input.drsRequest = true;
-    racer.input.overtake = corner < 0.02f && state.speed > 55.f;
+    racer.input.overtake = curvMax < 0.002f && state.speed > 50.f;
     racer.input.wingToggle = false;
 }
 
@@ -279,13 +337,22 @@ void Game::UpdateRace(float dt) {
         racer.progress = static_cast<float>(racer.lap) + d / std::max(1.f, track_.TotalLength());
 
         // Off-track / flipped safety reset (simcade recovery). A car lying on
-        // its roof or side has no wheel contact and would otherwise be stuck.
+        // its roof or side has no wheel contact and would otherwise be stuck;
+        // a car pinned against a wall with wheels spinning gets the same
+        // treatment after a few seconds.
         const Vec3 carUp = TransformDirection(state.transform, Vec3{0.f, 1.f, 0.f});
         const bool fellOff = state.transform.position.y < -8.f;
         const bool stranded = carUp.y < 0.25f && state.speed < 3.f;
-        if (fellOff || stranded) {
-            const Vec3 fwd = track_.ForwardAt(d);
-            Transform pose{track_.PositionAt(d) + Vec3{0.f, 1.f, 0.f},
+        const bool pinned = state.speed < 2.5f && racer.input.throttle > 0.5f;
+        racer.stuckTimer = pinned ? racer.stuckTimer + dt : 0.f;
+        if (fellOff || stranded || racer.stuckTimer > 4.f) {
+            const bool wasPinned = racer.stuckTimer > 4.f;
+            racer.stuckTimer = 0.f;
+            // A wall pin usually leaves a pile of cars — respawn a little
+            // ahead on the centerline so the pack clears itself.
+            const float dd = d + (wasPinned ? 12.f : 0.f);
+            const Vec3 fwd = track_.ForwardAt(dd);
+            Transform pose{track_.PositionAt(dd) + Vec3{0.f, 1.f, 0.f},
                            Quat::FromAxisAngle(Vec3{0.f, 1.f, 0.f}, std::atan2(fwd.x, fwd.z))};
             racer.vehicle.Reset(pose);
             statusText_ = racer.name + " reset";

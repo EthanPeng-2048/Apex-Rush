@@ -94,6 +94,30 @@ void Track::Resample(const std::vector<ControlPoint>& controlPoints, float spaci
         samples_.front().right =
             Normalize(Cross(Vec3{0.f, 1.f, 0.f}, samples_.front().forward));
     }
+
+    // Per-sample horizontal curvature (1/radius) from consecutive headings,
+    // smoothed over a few samples. Pitch changes must not count as curvature.
+    const size_t sampleCount = samples_.size();
+    if (sampleCount > 2) {
+        std::vector<float> raw(sampleCount, 0.f);
+        for (size_t i = 0; i < sampleCount; ++i) {
+            Vec3 f0 = samples_[(i + sampleCount - 1) % sampleCount].forward;
+            Vec3 f1 = samples_[i].forward;
+            f0.y = 0.f;
+            f1.y = 0.f;
+            if (LengthSq(f0) > 1e-8f && LengthSq(f1) > 1e-8f) {
+                raw[i] = std::acos(Clampf(Dot(Normalize(f0), Normalize(f1)), -1.f, 1.f)) /
+                         std::max(spacing_, 1e-3f);
+            }
+        }
+        for (size_t i = 0; i < sampleCount; ++i) {
+            float acc = 0.f;
+            for (int k = -2; k <= 2; ++k) {
+                acc += raw[(i + static_cast<size_t>(k) + sampleCount) % sampleCount];
+            }
+            samples_[i].curvature = acc / 5.f;
+        }
+    }
 }
 
 void Track::Dispose(IRenderer& renderer) {
@@ -148,6 +172,13 @@ float Track::WidthAt(float distance) const {
     const float d = std::fmod(distance, totalLength_);
     const size_t i = static_cast<size_t>(d / spacing_) % samples_.size();
     return samples_[i].width;
+}
+
+float Track::CurvatureAt(float distance) const {
+    if (samples_.empty()) return 0.f;
+    const float d = std::fmod(distance, totalLength_);
+    const size_t i = static_cast<size_t>(d / spacing_) % samples_.size();
+    return samples_[i].curvature;
 }
 
 float Track::ProjectDistance(const Vec3& worldPos) const {

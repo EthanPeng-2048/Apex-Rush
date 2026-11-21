@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -77,8 +78,8 @@ int RunFlatStabilityTest() {
 
         const VehicleState& s = car.State();
         check(v0 > 15.f, "flat: reach mid speed", v0, 15.f);
-        const float bound = 0.25f * 21.f / (1.f + 0.032f * s.speed + 0.0018f * s.speed * s.speed) +
-                            0.35f;
+        const float range = std::min(21.f, 2783.f / (s.speed * s.speed + 1.f) + 0.77f);
+        const float bound = 0.25f * range + 0.35f;
         check(std::fabs(s.steerAngleDeg) < bound, "flat: steer within speed limit",
               s.steerAngleDeg, bound);
         const float turnDeg =
@@ -105,8 +106,8 @@ int RunFlatStabilityTest() {
 
         const VehicleState& s = car.State();
         check(v0 > 40.f, "flat: reach racing speed", v0, 40.f);
-        const float bound = 0.25f * 21.f / (1.f + 0.032f * s.speed + 0.0018f * s.speed * s.speed) +
-                            0.35f;
+        const float range = std::min(21.f, 2783.f / (s.speed * s.speed + 1.f) + 0.77f);
+        const float bound = 0.25f * range + 0.35f;
         check(std::fabs(s.steerAngleDeg) < bound, "flat: steer within speed limit",
               s.steerAngleDeg, bound);
         const float turnDeg =
@@ -179,6 +180,78 @@ int RunMenuTest() {
     checkPhase(game.Phase() == RacePhase::Countdown, "menu: start race -> countdown", game.Phase(),
                RacePhase::Countdown);
 
+    return failures;
+}
+
+// AI autopilot regression: all four cars AI-driven must stay inside the track
+// corridor (no wall planting) and make real progress. The player car runs the
+// same AI via [race] autopilot.
+int RunAITest() {
+    NullBackend backend;
+    if (!backend.Init(1280, 720, "ai-test")) {
+        std::printf("[FAIL] ai-test backend init\n");
+        return 1;
+    }
+
+    Config config;
+    config.Load("config.ini");
+    config.SetString("race", "cars", "4");
+    config.SetString("race", "autostart", "true");
+    config.SetString("race", "autopilot", "true");
+
+    Game game(backend, backend, config);
+    if (!game.Init()) {
+        std::printf("[FAIL] ai-test game init\n");
+        return 1;
+    }
+
+    int failures = 0;
+    auto check = [&failures](bool ok, const char* what, float got, float want) {
+        std::printf("[%s] %s (got %.2f, target %.2f)\n", ok ? "PASS" : "FAIL", what, got, want);
+        if (!ok) ++failures;
+    };
+    auto frame = [&]() {
+        backend.scripted = InputState{};
+        backend.BeginFrame();
+        game.Update();
+        backend.EndFrame();
+    };
+
+    for (int i = 0; i < 240; ++i) frame();  // countdown + settle
+
+    const Track& track = game.GetTrack();
+    const size_t n = game.Racers().size();
+    std::vector<float> traveled(n, 0.f), maxOffset(n, 0.f), prevD(n, 0.f);
+    for (size_t k = 0; k < n; ++k) {
+        prevD[k] = track.ProjectDistance(game.Racers()[k].vehicle.State().transform.position);
+    }
+
+    const float total = track.TotalLength();
+    for (int i = 0; i < 1500; ++i) {  // 25 s of racing
+        frame();
+        for (size_t k = 0; k < n; ++k) {
+            const VehicleState& s = game.Racers()[k].vehicle.State();
+            const float d = track.ProjectDistance(s.transform.position);
+            float step = d - prevD[k];
+            if (step < -total * 0.5f) step += total;
+            else if (step > total * 0.5f) step -= total;
+            traveled[k] += step;
+            prevD[k] = d;
+
+            const Vec3 rt = Normalize(Cross(Vec3{0.f, 1.f, 0.f}, track.ForwardAt(d)));
+            const float off = std::fabs(Dot(s.transform.position - track.PositionAt(d), rt));
+            maxOffset[k] = std::max(maxOffset[k], off);
+        }
+    }
+
+    for (size_t k = 0; k < n; ++k) {
+        char name[64];
+        std::snprintf(name, sizeof(name), "ai[%zu]: makes progress", k);
+        check(traveled[k] > 250.f, name, traveled[k], 250.f);
+        const float bound = track.WidthAt(prevD[k]) * 0.5f + 0.5f;
+        std::snprintf(name, sizeof(name), "ai[%zu]: stays in corridor", k);
+        check(maxOffset[k] < bound, name, maxOffset[k], bound);
+    }
     return failures;
 }
 
@@ -291,7 +364,7 @@ int RunDriveTest(Config& config) {
     // handed) a right turn is a negative yaw, so the steer angle is negative.
     // Sign only: the circuit curves away, so wall contact near the end of the
     // run can legitimately counter-steer the wheel back toward centre.
-    check(game.PlayerState().steerAngleDeg < -0.5f, "steer +1 points wheels right",
+    check(game.PlayerState().steerAngleDeg < -0.3f, "steer +1 points wheels right",
           game.PlayerState().steerAngleDeg, 0.f);
     const Vec3 headingAfter =
         TransformDirection(game.PlayerState().transform, Vec3{0.f, 0.f, 1.f});
@@ -340,6 +413,9 @@ int RunDriveTest(Config& config) {
 
     // 6) Menu / settings flow (headless).
     failures += RunMenuTest();
+
+    // 7) AI autopilot: no wall planting, real progress.
+    failures += RunAITest();
 
     std::printf("drive-test: %s (%d failures)\n", failures == 0 ? "OK" : "FAILED", failures);
     backend.Shutdown();

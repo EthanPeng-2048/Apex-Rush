@@ -33,6 +33,7 @@ struct Racer {
     float raceTime = 0.f;
     int position = 1;
     float progress = 0.f;  // lap + distance fraction, for ranking
+    float stuckTimer = 0.f;
     bool finished = false;
 };
 
@@ -51,6 +52,7 @@ public:
 
     // Introspection for tests and (later) the network layer.
     const VehicleState& PlayerState() const { return racers_.front().vehicle.State(); }
+    const std::vector<Racer>& Racers() const { return racers_; }
     RacePhase Phase() const { return phase_; }
     float RaceClock() const { return raceClock_; }
     const Track& GetTrack() const { return track_; }

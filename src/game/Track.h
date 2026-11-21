@@ -33,6 +33,8 @@ public:
     Vec3 ForwardAt(float distance) const;
     float TotalLength() const { return totalLength_; }
     float WidthAt(float distance) const;
+    // Local curvature (1/radius, horizontal) — AI corner-speed planning.
+    float CurvatureAt(float distance) const;
 
     // Progress helpers: project a world position onto the centerline.
     float ProjectDistance(const Vec3& worldPos) const;
@@ -61,6 +63,7 @@ private:
         Vec3 right;
         float width;
         float distance;
+        float curvature = 0.f;  // 1/radius, horizontal
     };
 
     void Resample(const std::vector<ControlPoint>& controlPoints, float spacing);
