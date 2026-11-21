@@ -183,7 +183,6 @@ void Track::Dispose(IRenderer& renderer) {
     groundBodies_.clear();
     trees_.clear();
     drsZones_.clear();
-    overtakeZones_.clear();
 }
 
 void Track::Build(const MapData& map, IPhysicsWorld& world, IRenderer& renderer) {
@@ -192,10 +191,10 @@ void Track::Build(const MapData& map, IPhysicsWorld& world, IRenderer& renderer)
     BuildPhysics(map, world);
     BuildMesh(map, renderer);
 
-    // Default zones: one DRS zone on the main straight, one overtake zone.
-    if (totalLength_ > 200.f) {
-        drsZones_.push_back({totalLength_ * 0.02f, totalLength_ * 0.16f});
-        overtakeZones_.push_back({totalLength_ * 0.30f, totalLength_ * 0.42f});
+    // DRS activation zones come from map data (zones.csv lap fractions).
+    // A map without zones.csv has no DRS — never guess a zone.
+    for (const MapData::DrsZone& zone : map.drsZones) {
+        drsZones_.push_back({zone.start * totalLength_, zone.end * totalLength_});
     }
 }
 
@@ -244,6 +243,13 @@ float Track::ProjectDistance(const Vec3& worldPos) const {
         }
     }
     return bestDist;
+}
+
+bool Track::InDrsZone(float distance) const {
+    for (const Zone& zone : drsZones_) {
+        if (zone.Contains(distance)) return true;
+    }
+    return false;
 }
 
 const Track::Sample* Track::NearestSample(const Vec3& pos, float& dist) const {

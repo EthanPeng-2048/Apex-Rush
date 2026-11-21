@@ -279,12 +279,23 @@ void Game::UpdatePlayerInput() {
     }
 
     if (phase_ == RacePhase::Racing && !player.finished) {
-        if (raw.drsToggle) drsWanted_ = !drsWanted_;
+        // DRS: F only arms/disarms inside a map-marked zone (authored on
+        // straights). Leaving the zone closes DRS and resets the latch, so
+        // re-entering a zone later starts closed — the driver must re-arm.
+        const float playerD =
+            track_.ProjectDistance(player.vehicle.State().transform.position);
+        const bool inDrsZone = track_.InDrsZone(playerD);
+        if (!inDrsZone) {
+            drsWanted_ = false;
+        } else if (raw.drsToggle) {
+            drsWanted_ = !drsWanted_;
+        }
         player.input.throttle = raw.throttle;
         player.input.brake = raw.brake;
         player.input.steer = raw.steer;
         player.input.handbrake = raw.handbrake;
         player.input.reverse = raw.reverse;
+        player.input.drsZone = inDrsZone;
         player.input.drsRequest = drsWanted_;
         player.input.wingToggle = raw.wingModeToggle;
         player.input.overtake = raw.overtake;
@@ -416,7 +427,9 @@ void Game::UpdateAI(Racer& racer, float dt) {
     racer.input.throttle = throttle;
     racer.input.brake = brake;
 
-    // Use DRS/overtake features like the player.
+    // Use DRS/overtake features like the player — but DRS only inside a
+    // map-marked zone (the vehicle gates activation on drsZone).
+    racer.input.drsZone = track_.InDrsZone(d);
     racer.input.drsRequest = true;
     racer.input.overtake = curvMax < 0.002f && state.speed > 50.f;
     racer.input.wingToggle = false;

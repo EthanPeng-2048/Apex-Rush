@@ -36,7 +36,8 @@ public:
     // Progress helpers: project a world position onto the centerline.
     float ProjectDistance(const Vec3& worldPos) const;
 
-    // Zones: [0] start/finish at distance 0. DRS zones are [start, end].
+    // Zones: [0] start/finish at distance 0. DRS zones are [start, end],
+    // converted from map-data lap fractions by Build.
     struct Zone {
         float startDistance = 0.f;
         float endDistance = 0.f;
@@ -45,7 +46,8 @@ public:
         }
     };
     const std::vector<Zone>& DrsZones() const { return drsZones_; }
-    const std::vector<Zone>& OvertakeZones() const { return overtakeZones_; }
+    // True when the arc-length distance lies inside any map-marked DRS zone.
+    bool InDrsZone(float distance) const;
 
     Vec3 StartPosition(int gridSlot) const;
     Quat StartRotation() const;
@@ -71,7 +73,6 @@ private:
 
     std::vector<Sample> samples_;
     std::vector<Zone> drsZones_;
-    std::vector<Zone> overtakeZones_;
     std::vector<BodyHandle> wallBodies_;
     std::vector<BodyHandle> groundBodies_;
     float totalLength_ = 0.f;

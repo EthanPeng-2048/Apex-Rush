@@ -64,6 +64,9 @@ public:
     RacePhase Phase() const { return phase_; }
     float RaceClock() const { return raceClock_; }
     const Track& GetTrack() const { return track_; }
+    // True while the player's DRS toggle is latched on (test hook: the
+    // latch resets when leaving a DRS zone, which drives re-entry behavior).
+    bool PlayerDrsWanted() const { return drsWanted_; }
 
 private:
     void BuildWorld();
@@ -116,8 +119,9 @@ private:
     float statusTimer_ = 0.f;
     bool wantsQuit_ = false;
 
-    // Latched DRS request: F is edge-triggered, DRS must stay open across
-    // frames until toggled off (it still auto-closes when unavailable).
+    // Latched DRS request: F only arms/disarms inside a map-marked DRS zone;
+    // leaving the zone closes DRS and resets the latch, so re-entering a
+    // zone later starts closed (the driver must re-arm).
     bool drsWanted_ = false;
 
     // Menu / settings state.

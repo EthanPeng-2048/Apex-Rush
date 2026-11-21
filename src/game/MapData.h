@@ -16,6 +16,9 @@ namespace apex {
 //  - terrain.csv  height posts x, z, y on a regular grid (bilinear lookup).
 //  - decor.csv    type, x, z, y, scale (trees; y is a hint, the engine snaps
 //                 decor to the terrain height).
+//  - zones.csv    optional DRS activation zones as lap-length fractions:
+//                 drs,<start_frac>,<end_frac>  (0..1 of the smoothed
+//                 centerline length; authored on straights).
 struct MapData {
     struct WayPoint {
         Vec3 position;
@@ -30,9 +33,17 @@ struct MapData {
         float scale = 1.f;
     };
 
+    // DRS activation zone as a lap-length fraction (0..1). Converted to
+    // arc length by Track::Build.
+    struct DrsZone {
+        float start = 0.f;
+        float end = 0.f;
+    };
+
     std::string name;
     std::vector<WayPoint> centerline;
     std::vector<Decor> decor;
+    std::vector<DrsZone> drsZones;
 
     // Regular height-post grid (sorted unique axes + row-major heights).
     std::vector<float> gridX, gridZ;
@@ -45,8 +56,9 @@ struct MapData {
     float MinTerrainY() const;
 };
 
-// Load mapsRoot/<name>/{track,terrain,decor}.csv. Missing optional files are
-// tolerated (decor/terrain); track.csv is required for ok=true.
+// Load mapsRoot/<name>/{track,terrain,decor,zones}.csv. Missing optional
+// files are tolerated (decor/terrain/zones); track.csv is required for
+// ok=true. Maps without zones.csv simply have no DRS zones.
 MapData LoadMapData(const std::string& mapsRoot, const std::string& name);
 
 // Map folder names under mapsRoot (for the settings menu). Empty on failure.

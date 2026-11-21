@@ -1,6 +1,7 @@
 #include "game/MapData.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -145,6 +146,27 @@ MapData LoadMapData(const std::string& mapsRoot, const std::string& name) {
             d.position = {std::stof(f[1]), std::stof(f[3]), std::stof(f[2])};
             d.scale = std::stof(f[4]);
             map.decor.push_back(d);
+        }
+    }
+
+    // zones.csv — optional DRS activation zones (lap-length fractions).
+    {
+        std::ifstream in(dir / "zones.csv");
+        std::string line;
+        while (std::getline(in, line)) {
+            if (IsCommentOrEmpty(line)) continue;
+            const std::vector<std::string> f = SplitCsv(line);
+            if (f.size() < 3) continue;
+            std::string type = f[0];
+            for (char& c : type) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (type != "drs") continue;
+            MapData::DrsZone zone;
+            zone.start = std::stof(f[1]);
+            zone.end = std::stof(f[2]);
+            // Clamp to the lap and drop inverted/degenerate ranges.
+            zone.start = Clampf(zone.start, 0.f, 1.f);
+            zone.end = Clampf(zone.end, 0.f, 1.f);
+            if (zone.end > zone.start) map.drsZones.push_back(zone);
         }
     }
 

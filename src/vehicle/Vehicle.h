@@ -142,7 +142,8 @@ struct VehicleInput {
     float steer = 0.f;
     bool handbrake = false;
     bool reverse = false;
-    bool drsRequest = false;
+    bool drsRequest = false;  // driver wants DRS open (latched by the game)
+    bool drsZone = false;     // car is inside a map-marked DRS activation zone
     bool wingToggle = false;
     bool overtake = false;
 };
@@ -226,7 +227,6 @@ private:
 
     // Mode state
     bool wingTogglePrev_ = false;
-    float drsZoneTimer_ = 0.f;
 
     // Visual-only wheel rotation (radians), accumulated from road speed.
     float wheelSpinAngle_ = 0.f;

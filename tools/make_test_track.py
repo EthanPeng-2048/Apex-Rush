@@ -48,11 +48,13 @@ def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     n = len(WAYPOINTS)
 
-    # Lap length estimate for tree placement (polygon perimeter).
-    perim = 0.0
+    # Lap length estimate for tree placement (polygon perimeter) and DRS
+    # zone fractions: cumulative distance at each waypoint.
+    cum = [0.0]
     for i in range(n):
         a, b = WAYPOINTS[i], WAYPOINTS[(i + 1) % n]
-        perim += math.hypot(b[0] - a[0], b[1] - a[1])
+        cum.append(cum[-1] + math.hypot(b[0] - a[0], b[1] - a[1]))
+    perim = cum[-1]
 
     with open(os.path.join(OUT_DIR, "track.csv"), "w", encoding="utf-8") as f:
         f.write("# x, z, y, width, grass_left, gravel_left, grass_right, gravel_right\n")
@@ -105,6 +107,27 @@ def main():
                 scale = 0.9 + ((k + i) % 3) * 0.25
                 f.write(f"tree,{px + rx * side * off:.1f},{pz + rz * side * off:.1f},"
                         f"0.00,{scale:.2f}\n")
+
+    # DRS activation zones (lap-length fractions of the centerline). Zones
+    # belong on straights: the main straight (start line -> before T1
+    # braking) and the back straight (after the fast-right exit -> before
+    # fast-right 2 braking). The engine smooths with Catmull-Rom, so the
+    # fractions are approximate (~2% of the lap).
+    def zone_frac(i0, i1, start_margin, end_margin):
+        s = (cum[i0] + start_margin) / perim
+        e = (cum[i1] - end_margin) / perim
+        return s, e
+
+    zones = [
+        zone_frac(0, 1, 25.0, 140.0),   # main straight
+        zone_frac(7, 8, 110.0, 70.0),   # back straight
+    ]
+    with open(os.path.join(OUT_DIR, "zones.csv"), "w", encoding="utf-8") as f:
+        f.write("# type, start_frac, end_frac  (fractions of centerline length)\n")
+        f.write("# DRS activation zones, authored on straights.\n")
+        f.write("# The engine smooths with Catmull-Rom, so boundaries are approximate.\n")
+        for s, e in zones:
+            f.write(f"drs,{s:.4f},{e:.4f}\n")
 
     print(f"wrote {OUT_DIR}: {n} waypoints, lap ~{perim:.0f} m")
 

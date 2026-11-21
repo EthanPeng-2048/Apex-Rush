@@ -273,14 +273,13 @@ void Vehicle::Update(const VehicleInput& input, float dt) {
     }
     wingTogglePrev_ = in.wingToggle;
 
-    // DRS: only when requested, moving forward fast, and basically straight.
-    // The threshold is relative to the speed-sensitive steering envelope —
-    // a fixed angle never trips at speed (the envelope is only a few degrees
-    // up there) and the car would keep straight-line aero through fast
-    // corners.
-    state_.drsAvailable =
-        speed > 55.f && std::fabs(steerAngle_) < 0.35f * SteerEnvelopeDeg(speed) * kDegToRad;
-    state_.drsActive = in.drsRequest && state_.drsAvailable;
+    // DRS: available only inside a map-marked activation zone (zones.csv,
+    // authored on straights) — no speed or steering gate. Once the driver
+    // opens it, it stays open for the whole zone: low speed and turning
+    // never close it. Leaving the zone closes it (drsZone goes false); the
+    // game resets the toggle latch on exit so re-entry starts closed.
+    state_.drsAvailable = in.drsZone;
+    state_.drsActive = in.drsRequest && in.drsZone;
 
     // ERS: deploy on overtake button when charge remains; regenerate under braking.
     state_.ersDeploying = false;

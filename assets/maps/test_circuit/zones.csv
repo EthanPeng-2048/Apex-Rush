@@ -1,0 +1,5 @@
+# type, start_frac, end_frac  (fractions of centerline length)
+# DRS activation zones, authored on straights.
+# The engine smooths with Catmull-Rom, so boundaries are approximate.
+drs,0.0065,0.1308
+drs,0.6037,0.6436

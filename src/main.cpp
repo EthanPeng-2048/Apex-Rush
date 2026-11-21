@@ -244,6 +244,129 @@ int RunMenuTest() {
     return failures;
 }
 
+// DRS zone semantics: F only arms inside a map-marked zone (zones.csv),
+// DRS stays open through speed and steering changes while in the zone, and
+// leaving the zone closes it and resets the latch so re-entry starts
+// closed. Regression for "DRS opens anywhere" and "re-entry auto-opens".
+int RunDrsZoneTest(const char* engine) {
+    NullBackend backend;
+    if (!backend.Init(1280, 720, "drs-zone-test")) {
+        std::printf("[FAIL] drs-zone-test backend init\n");
+        return 1;
+    }
+
+    Config config;
+    config.Load(DataPath("config.ini"));
+    config.SetString("race", "cars", "1");  // player only — no AI traffic
+    config.SetString("race", "autostart", "true");
+    config.SetString("physics", "engine", engine);
+    config.SetString("assists", "steer", "full");
+    config.SetString("assists", "esc", "full");
+    config.SetString("assists", "tc", "sport");
+    config.SetString("assists", "abs", "sport");
+
+    Game game(backend, backend, config);
+    if (!game.Init()) {
+        std::printf("[FAIL] drs-zone-test game init\n");
+        return 1;
+    }
+
+    int failures = 0;
+    auto check = [&failures](bool ok, const char* what, float got, float want) {
+        std::printf("[%s] %s (got %.2f, target %.2f)\n", ok ? "PASS" : "FAIL", what, got, want);
+        if (!ok) ++failures;
+    };
+
+    // Drive with a lookahead steer — the grid sits on the final corner, so
+    // a straight run would leave the track before reaching the DRS zone.
+    // Same formula as the AI (proven by RunAITest).
+    auto frame = [&](const InputState& base) {
+        InputState in = base;
+        const VehicleState& s = game.PlayerState();
+        const Track& track = game.GetTrack();
+        const float d = track.ProjectDistance(s.transform.position);
+        const Vec3 fwd = TransformDirection(s.transform, Vec3{0.f, 0.f, 1.f});
+        const Vec3 right = TransformDirection(s.transform, Vec3{-1.f, 0.f, 0.f});
+        const float lookahead = std::min(10.f + s.speed * 0.32f, 30.f);
+        const Vec3 target = track.PositionAt(d + lookahead);
+        const Vec3 toTarget = target - s.transform.position;
+        float yawErr = std::atan2(toTarget.x, toTarget.z) - std::atan2(fwd.x, fwd.z);
+        while (yawErr > kPi) yawErr -= 2.f * kPi;
+        while (yawErr < -kPi) yawErr += 2.f * kPi;
+        const float lateralVel = Dot(s.velocity, right);
+        in.steer = Clampf(-yawErr * 1.5f - lateralVel * 0.06f, -1.f, 1.f);
+        backend.scripted = in;
+        backend.BeginFrame();
+        game.Update();
+        game.RenderHUD();
+        backend.EndFrame();
+    };
+
+    // Wait out the countdown.
+    InputState idle;
+    for (int i = 0; i < 240; ++i) frame(idle);
+
+    // 1) Off the grid (outside the zone): F must not arm DRS.
+    InputState press;
+    press.drsToggle = true;
+    frame(press);
+    {
+        const VehicleState& s = game.PlayerState();
+        check(!s.drsAvailable && !s.drsActive, "drs: closed outside zone", s.drsActive, 0.f);
+        check(!game.PlayerDrsWanted(), "drs: F ignored outside zone",
+              game.PlayerDrsWanted() ? 1.f : 0.f, 0.f);
+    }
+
+    // 2) Drive into the zone (main straight, just after the start line).
+    InputState gas;
+    gas.throttle = 1.f;
+    int guard = 0;
+    while (!game.PlayerState().drsAvailable && guard++ < 1200) frame(gas);
+    check(game.PlayerState().drsAvailable, "drs: zone entered on main straight",
+          game.PlayerState().drsAvailable ? 1.f : 0.f, 1.f);
+    {
+        const VehicleState& s = game.PlayerState();
+        check(!s.drsActive && !game.PlayerDrsWanted(), "drs: closed on entry (no auto-open)",
+              s.drsActive ? 1.f : 0.f, 0.f);
+    }
+
+    // 3) F inside the zone opens DRS — no speed or steering gate.
+    press = InputState{};
+    press.drsToggle = true;
+    frame(press);
+    check(game.PlayerState().drsActive, "drs: F opens in zone",
+          game.PlayerState().drsActive ? 1.f : 0.f, 1.f);
+
+    // Still in the zone: DRS must stay open (the old implementation closed
+    // it below 55 m/s or off-straight).
+    for (int i = 0; i < 60; ++i) frame(gas);
+    check(game.PlayerState().drsActive, "drs: stays open in zone",
+          game.PlayerState().drsActive ? 1.f : 0.f, 1.f);
+
+    // 4) Drive out of the zone: DRS closes and the latch resets, so the
+    //    next entry starts closed (regression: re-entry auto-opened).
+    guard = 0;
+    while (game.PlayerState().drsAvailable && guard++ < 1200) frame(gas);
+    check(!game.PlayerState().drsAvailable, "drs: zone exited",
+          game.PlayerState().drsAvailable ? 1.f : 0.f, 0.f);
+    {
+        const VehicleState& s = game.PlayerState();
+        check(!s.drsActive, "drs: closes on zone exit", s.drsActive ? 1.f : 0.f, 0.f);
+        check(!game.PlayerDrsWanted(), "drs: latch resets on zone exit",
+              game.PlayerDrsWanted() ? 1.f : 0.f, 0.f);
+    }
+
+    // 5) F outside the zone still does nothing.
+    press = InputState{};
+    press.drsToggle = true;
+    frame(press);
+    check(!game.PlayerDrsWanted(), "drs: cannot re-arm outside zone",
+          game.PlayerDrsWanted() ? 1.f : 0.f, 0.f);
+
+    backend.Shutdown();
+    return failures;
+}
+
 // AI autopilot regression: all four cars AI-driven must stay inside the track
 // corridor (no wall planting) and make real progress. The player car runs the
 // same AI via [race] autopilot.
@@ -613,6 +736,9 @@ int RunDriveTestForEngine(Config& config, const char* engine) {
 
     // 6) Menu / settings flow (headless, backend-agnostic).
     failures += RunMenuTest();
+
+    // 6b) DRS zone semantics: map-marked zones, latch reset on exit.
+    failures += RunDrsZoneTest(engine);
 
     // 7) AI autopilot: no wall planting, real progress.
     failures += RunAITest(engine);
