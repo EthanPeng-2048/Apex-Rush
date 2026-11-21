@@ -187,9 +187,11 @@ void Vehicle::Update(const VehicleInput& input, float dt) {
     //  - the max angle shrinks with speed toward the grip envelope (~2 deg at
     //    250 km/h; the old curve still allowed ~3x what the tires can hold at
     //    that speed, so any steer input snapped the car),
-    //  - wind-up takes longer the faster you go, so a tap at speed is a
-    //    gentle direction change; unwinding toward centre stays quick so
-    //    releasing the key feels crisp.
+    //  - both directions ramp gradually (BeamNG-style keyboard filtering):
+    //    a key press eases the input in and out instead of stepping it, so a
+    //    sudden input change never hits the chassis as a discontinuity.
+    //    Wind-up grows slower with speed (a tap at 200 km/h is a gentle
+    //    correction); unwind is quicker but still eased so release is smooth.
     // Frame note: the vehicle frame is +Z forward / +Y up (right-handed), so
     // the geometric right side is -X and a right turn is a NEGATIVE yaw around
     // +Y. `in.steer` is defined as positive = steer right, hence the sign.
@@ -198,14 +200,16 @@ void Vehicle::Update(const VehicleInput& input, float dt) {
         21.f * kDegToRad / (1.f + 0.032f * speedNow + 0.0018f * speedNow * speedNow);
     const float steerTarget = -in.steer * steerRange;
     const float tau = std::fabs(steerTarget) < std::fabs(steerAngle_)
-                          ? 0.06f
-                          : std::min(0.085f + 0.0028f * speedNow, 0.30f);
+                          ? 0.11f
+                          : std::min(0.10f + 0.0032f * speedNow, 0.34f);
     const float steerRate = steerRange / tau * dt;
     if (steerAngle_ < steerTarget) steerAngle_ = std::min(steerAngle_ + steerRate, steerTarget);
     else steerAngle_ = std::max(steerAngle_ - steerRate, steerTarget);
 
-    throttleSmooth_ += (in.throttle - throttleSmooth_) * std::min(1.f, 12.f * dt);
-    brakeSmooth_ += (in.brake - brakeSmooth_) * std::min(1.f, 18.f * dt);
+    // Throttle/brake ramp the same way — keyboard keys ease toward full
+    // input instead of stepping there (BeamNG-style).
+    throttleSmooth_ += (in.throttle - throttleSmooth_) * std::min(1.f, 10.f * dt);
+    brakeSmooth_ += (in.brake - brakeSmooth_) * std::min(1.f, 14.f * dt);
 
     // Wing mode toggle (2026 active aero).
     if (in.wingToggle && !wingTogglePrev_) {
