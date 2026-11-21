@@ -150,6 +150,16 @@ float Track::ProjectDistance(const Vec3& worldPos) const {
 }
 
 void Track::BuildPhysics(IPhysicsWorld& world) {
+    // Grass ground plane just under the road surface: cars that leave the
+    // track keep wheel contact (the vehicle applies reduced grip below y=0)
+    // instead of beaching on their chassis.
+    BodyDesc ground;
+    ground.transform.position = {0.f, -2.05f, 0.f};
+    ground.halfExtents = {600.f, 2.f, 600.f};
+    ground.mass = 0.f;
+    ground.friction = 0.7f;
+    world.CreateBody(ground);
+
     // Road slab per sample: thin wide boxes so raycast suspension always
     // finds the surface. Walls as taller boxes on both edges.
     for (const Sample& s : samples_) {

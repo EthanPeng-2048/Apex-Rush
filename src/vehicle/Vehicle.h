@@ -63,8 +63,8 @@ struct VehicleParams {
     // Aero  (force = 0.5 * rho * coeff * v^2)
     float airDensity = 1.225f;
     float dragArea = 1.02f;           // Cd*A
-    float downforceArea = 2.05f;      // Cl*A
-    float frontDownforceShare = 0.45f;
+    float downforceArea = 3.3f;       // Cl*A ≈ 1.3x car weight at 250 km/h
+    float frontDownforceShare = 0.44f;
     float centerOfPressureOffset = 0.1f;  // +Z moves aero balance rearward
 
     // Assists (0 = off, 1 = full)

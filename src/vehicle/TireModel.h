@@ -11,12 +11,12 @@ class TireModel {
 public:
     struct Params {
         // Magic Formula shape for F(sigma): D sin(C atan(B s - E(B s - atan(B s))))
-        float B = 10.f;        // stiffness factor
+        float B = 11.f;        // stiffness factor
         float C = 1.9f;        // shape factor
-        float D0 = 1.6f;       // peak force coefficient at reference load
+        float D0 = 1.55f;      // friction coefficient at reference load
         float E = 0.97f;       // curvature factor
-        float Fz0 = 3500.f;    // reference vertical load [N]
-        float loadExp = 0.9f;  // n in D(Fz) = D0 (Fz/Fz0)^n * Fz  (n<1 => mu drops with load)
+        float Fz0 = 1840.f;    // reference vertical load = static corner load (750 kg / 4) [N]
+        float loadExp = 0.85f; // n in F(D) = D0 * Fz0 * (Fz/Fz0)^n; n<1 => mu falls with load
         float wearRate = 2.5e-6f;
         float wearGripLoss = 0.35f;   // grip multiplier drop at W=1
         float minGrip = 0.55f;        // floor multiplier

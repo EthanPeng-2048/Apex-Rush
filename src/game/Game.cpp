@@ -170,7 +170,7 @@ void Game::UpdateAI(Racer& racer, float dt) {
     const Vec3 v2 = Normalize(ahead2 - ahead1);
     const float corner = 1.f - Clampf(Dot(v1, v2), -1.f, 1.f);  // 0 straight, ~1 hairpin
 
-    const float targetSpeed = Clampf(78.f - corner * 210.f, 16.f, 82.f);
+    const float targetSpeed = Clampf(86.f - corner * 160.f, 22.f, 86.f);
     if (state.speed < targetSpeed) {
         racer.input.throttle = 1.f;
         racer.input.brake = 0.f;

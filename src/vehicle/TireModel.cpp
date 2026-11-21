@@ -40,10 +40,12 @@ TireModel::Output TireModel::Compute(float verticalLoad, const Vec3& contactVelo
     out.slipAngleDeg = slipAngle * kRadToDeg;
     out.slipMagnitude = sigma;
 
-    // Load-sensitive peak: D(Fz) = D0 * (Fz/Fz0)^n * Fz  =>  mu falls with load.
+    // Load-sensitive peak: F = D0 * Fz0 * (Fz/Fz0)^n with n < 1, so the
+    // friction coefficient mu = D0 * (Fz0/Fz)^(1-n) falls as load grows
+    // (load sensitivity, like a real tire). D0 is mu at Fz0.
     const float loadRatio = verticalLoad / params_.Fz0;
-    const float peak = params_.D0 * std::pow(std::max(loadRatio, 1e-3f), params_.loadExp) *
-                       verticalLoad * GripMultiplier();
+    const float peak = params_.D0 * params_.Fz0 *
+                       std::pow(std::max(loadRatio, 1e-3f), params_.loadExp) * GripMultiplier();
 
     // Magic Formula along the combined slip.
     const float Bs = params_.B * sigma;

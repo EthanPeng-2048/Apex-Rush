@@ -185,13 +185,18 @@ void Vehicle::Update(const VehicleInput& input, float dt) {
     // Frame note: the vehicle frame is +Z forward / +Y up (right-handed), so
     // the geometric right side is -X and a right turn is a NEGATIVE yaw around
     // +Y. `in.steer` is defined as positive = steer right, hence the sign.
-    const float steerTarget = -in.steer * 21.f * kDegToRad;
+    // The wheel angle shrinks with speed (21 deg at standstill, ~7 deg at
+    // 250 km/h) so the car stays controllable at racing speed.
+    const float speedNow = state_.speed;
+    const float steerRange =
+        21.f * kDegToRad / (1.f + 0.032f * speedNow + 0.00025f * speedNow * speedNow);
+    const float steerTarget = -in.steer * steerRange;
     const float steerRate = 4.2f * dt;
     if (steerAngle_ < steerTarget) steerAngle_ = std::min(steerAngle_ + steerRate, steerTarget);
     else steerAngle_ = std::max(steerAngle_ - steerRate, steerTarget);
 
-    throttleSmooth_ += (in.throttle - throttleSmooth_) * std::min(1.f, 8.f * dt);
-    brakeSmooth_ += (in.brake - brakeSmooth_) * std::min(1.f, 10.f * dt);
+    throttleSmooth_ += (in.throttle - throttleSmooth_) * std::min(1.f, 12.f * dt);
+    brakeSmooth_ += (in.brake - brakeSmooth_) * std::min(1.f, 18.f * dt);
 
     // Wing mode toggle (2026 active aero).
     if (in.wingToggle && !wingTogglePrev_) {
@@ -405,6 +410,11 @@ void Vehicle::UpdateWheels(float dt) {
             float damperForce = params_.damperC * compressionRate;
             // Only damp when compressing to avoid jacking.
             if (compressionRate < 0.f) damperForce *= 0.35f;
+            // Cap the damper: a raycast miss/hit flicker (wheel grazing a slab
+            // edge under body roll) makes the compression rate enormous for a
+            // substep and the impulse used to launch the car into the air.
+            const float damperCap = params_.springK * 0.30f;
+            damperForce = Clampf(damperForce, -damperCap * 0.4f, damperCap);
             float normalForce = std::max(0.f, springForce + damperForce);
 
             wheel.grounded = true;
@@ -418,9 +428,12 @@ void Vehicle::UpdateWheels(float dt) {
             // Suspension force along the strut (chassis up).
             world_->ApplyForce(chassis_, up * normalForce, hit.point);
 
-            // Tire forces in the wheel plane.
+            // Tire forces in the wheel plane. Off-track contacts (below the
+            // road surface, i.e. the grass plane) get reduced grip so cutting
+            // through the grass is never faster than staying on the asphalt.
+            const float surfaceGrip = hit.point.y < -0.02f ? 0.55f : 1.f;
             const TireModel::Output tire = tires_[i].Compute(
-                normalForce, wheel.contactVelocity, wheelForward, wheelRight,
+                normalForce * surfaceGrip, wheel.contactVelocity, wheelForward, wheelRight,
                 drivePerWheel_[i], brakePerWheel_[i], dt);
             world_->ApplyForce(chassis_, tire.force, hit.point);
             wheel.force = tire.force;
@@ -436,7 +449,8 @@ void Vehicle::UpdateWheels(float dt) {
         } else {
             wheel.grounded = false;
             wheel.suspensionLength = maxLen;
-            wheel.compression = 0.f;
+            // Keep the last compression: zeroing it here made the re-contact
+            // compression rate huge and spiked the damper (car launch).
             wheel.load = 0.f;
             wheel.force = Vec3{};
         }

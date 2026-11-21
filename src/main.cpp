@@ -93,15 +93,17 @@ int RunDriveTest(Config& config) {
 
     const Vec3 startPos = game.PlayerState().transform.position;
 
-    // 1) Acceleration: full throttle for 4 s.
+    // 1) Acceleration: full throttle. Keep it to 2.5 s — the circuit curves
+    // away and a longer straight run drives the car into the barrier, which
+    // caps the speed and ruins the measurement.
     InputState throttle;
     throttle.throttle = 1.f;
-    run(4.f, throttle);
+    run(2.5f, throttle);
     const float accelSpeed = game.PlayerState().speed;
     const float forwardGain =
         Dot(game.PlayerState().transform.position - startPos,
             TransformDirection(game.PlayerState().transform, Vec3{0.f, 0.f, 1.f}));
-    check(accelSpeed > 8.f, "throttle accelerates car", accelSpeed, 8.f);
+    check(accelSpeed > 12.f, "throttle accelerates car", accelSpeed, 12.f);
     check(forwardGain > 10.f, "car moves forward along heading", forwardGain, 10.f);
     std::printf("       speed %.1f km/h, gear %d, rpm %.0f\n", game.PlayerState().speedKmh,
                 game.PlayerState().gear, game.PlayerState().rpm);
