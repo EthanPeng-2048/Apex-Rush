@@ -1,0 +1,3 @@
+[submodule "rush-engine"]
+	path = rush-engine
+	url = https://github.com/EthanPeng-2048/rush-engine.git

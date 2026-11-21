@@ -7,6 +7,8 @@
 #include <memory>
 #include <string>
 
+#include <rush/rush.h>
+
 #include "audio/MiniaudioAudio.h"
 #include "core/Config.h"
 #include "core/Paths.h"
@@ -678,6 +680,16 @@ int RunSeasonGateTest(IPhysicsWorld& world) {
 // backend (qu3e and nudge must both pass it).
 int RunDriveTestForEngine(Config& config, const char* engine) {
     config.SetString("physics", "engine", engine);
+    // Pin the simulation environment: user config (assists / hz / season)
+    // must not change scripted-input assertions between machines or runs.
+    config.SetString("physics", "hz", "240");
+    config.SetString("assists", "steer", "full");
+    config.SetString("assists", "esc", "full");
+    config.SetString("assists", "tc", "sport");
+    config.SetString("assists", "abs", "sport");
+    config.SetString("season", "drs", "1");
+    config.SetString("season", "active_aero", "0");
+    config.SetString("season", "overtake", "0");
     NullBackend backend;
     if (!backend.Init(1280, 720, "drive-test")) {
         std::printf("[FAIL] NullBackend init\n");
@@ -979,6 +991,8 @@ int main(int argc, char** argv) {
 
     Config config;
     config.Load(DataPath("config.ini"));
+    // Prove the rush-engine link is live (static libs drop unreferenced TUs).
+    std::printf("rush-engine %s\n", rush::VersionString());
     // All CLI automation paths (tests, screenshots, scene dumps) skip the menu.
     if ((driveTest || dumpPath || shotPath || bench) && !menuShot && !settingsShot) {
         config.SetString("race", "autostart", "true");

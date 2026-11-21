@@ -1,8 +1,10 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.28)
 project(ApexRushOnline CXX C)
 
-set(CMAKE_CXX_STANDARD 17)
+# C++23: rush-engine / exstl need std::expected (and later named modules).
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_SCAN_FOR_MODULES ON)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT EMSCRIPTEN)
     if(CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -45,6 +47,9 @@ FetchContent_MakeAvailable(raylib)
 add_subdirectory(third_party/qu3e)
 add_subdirectory(third_party/enet)
 
+# --- Rush Engine (git submodule: render + physics + async runtime) ------------
+add_subdirectory(rush-engine)
+
 # nudge: C23 unity build of the engine core (see src/physics/nudge_unity.c).
 # Compiled with the same flags upstream nudge uses for MSVC.
 add_library(nudge STATIC src/physics/nudge_unity.c)
@@ -81,7 +86,7 @@ add_executable(apex-rush
 )
 
 target_include_directories(apex-rush PRIVATE src third_party/miniaudio)
-target_link_libraries(apex-rush PRIVATE raylib qu3e enet nudge)
+target_link_libraries(apex-rush PRIVATE raylib qu3e enet nudge rush::engine)
 
 # miniaudio is a ~4 MB single-header TU; the audio mixer needs no -O3 and the
 # full optimization costs minutes of compile time.
