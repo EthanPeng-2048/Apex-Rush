@@ -9,7 +9,6 @@ import rush.engine.core;
 #include "game/Track.h"
 import rush.engine.physics;
 import rush.engine.render;
-#include "vehicle/Vehicle.h"
 
 namespace apex {
 

@@ -55,8 +55,6 @@ add_subdirectory(rush-engine)
 add_executable(apex-rush
     src/main.cpp
     src/audio/MiniaudioAudio.cpp
-    src/vehicle/TireModel.cpp
-    src/vehicle/Vehicle.cpp
     src/game/MapData.cpp
     src/game/Track.cpp
     src/game/Game.cpp

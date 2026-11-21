@@ -15,7 +15,6 @@ import rush.engine.core;
 #include "game/Game.h"
 import rush.engine.physics;
 import rush.engine.render;
-#include "vehicle/Vehicle.h"
 
 namespace {
 
