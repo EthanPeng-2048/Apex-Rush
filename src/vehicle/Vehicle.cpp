@@ -532,7 +532,7 @@ void Vehicle::ProcessContacts(const std::vector<ContactEvent>& contacts, float) 
 }
 
 void Vehicle::UpdateDamageFromContact(const ContactEvent& event) {
-    if (!world_) return;
+    if (!world_ || !params_.damageEnabled) return;
     const Transform transform = world_->GetTransform(chassis_);
 
     // Map the world contact point into chassis-local space and pick the part

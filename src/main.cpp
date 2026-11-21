@@ -166,7 +166,7 @@ int RunMenuTest() {
 
     press = InputState{};
     press.menuDown = true;
-    for (int i = 0; i < 6 && game.Phase() == RacePhase::Settings; ++i) frame(press);
+    for (int i = 0; i < 7 && game.Phase() == RacePhase::Settings; ++i) frame(press);
     press = InputState{};
     press.menuSelect = true;  // BACK row
     frame(press);

@@ -54,6 +54,7 @@ void Game::SpawnRacers() {
         if (config_.GetBool("assists", "abs", true)) params.absLevel = 1.f; else params.absLevel = 0.f;
         if (config_.GetBool("assists", "tc", true)) params.tcLevel = 1.f; else params.tcLevel = 0.f;
         if (config_.GetBool("assists", "esc", true)) params.escLevel = 1.f; else params.escLevel = 0.f;
+        params.damageEnabled = config_.GetBool("race", "damage", true);
 
         Transform pose;
         pose.position = track_.StartPosition(i);
@@ -496,7 +497,7 @@ void Game::UpdateMenu() {
 }
 
 void Game::UpdateSettings() {
-    constexpr int kRows = 7;  // circuit, laps, cars, abs, tc, esc, back
+    constexpr int kRows = 8;  // circuit, laps, cars, damage, abs, tc, esc, back
     const InputState& in = rawInput_;
     if (in.menuUp) settingsCursor_ = (settingsCursor_ + kRows - 1) % kRows;
     if (in.menuDown) settingsCursor_ = (settingsCursor_ + 1) % kRows;
@@ -536,9 +537,15 @@ void Game::UpdateSettings() {
             config_.SetString("race", "cars", std::to_string(cars));
             break;
         }
+        case 3: {
+            bool value = config_.GetBool("race", "damage", true);
+            value = (dir != 0) ? (dir > 0) : !value;
+            config_.SetString("race", "damage", value ? "true" : "false");
+            break;
+        }
         default: {
             static const char* kAssistKeys[3] = {"abs", "tc", "esc"};
-            const char* key = kAssistKeys[settingsCursor_ - 3];
+            const char* key = kAssistKeys[settingsCursor_ - 4];
             bool value = config_.GetBool("assists", key, true);
             value = (dir != 0) ? (dir > 0) : !value;
             config_.SetString("assists", key, value ? "true" : "false");
@@ -589,18 +596,19 @@ void Game::RenderSettings() {
         std::string value;
     };
     const int cars = config_.GetInt("race", "cars", 4);
-    const Row rows[7] = {
+    const Row rows[8] = {
         {"CIRCUIT", std::to_string(circuitIndex_ + 1) + "/3"},
         {"LAPS", std::to_string(totalLaps_)},
         {"CARS", std::to_string(cars)},
+        {"DAMAGE", config_.GetBool("race", "damage", true) ? "ON" : "OFF"},
         {"ABS", config_.GetBool("assists", "abs", true) ? "ON" : "OFF"},
         {"TRACTION CTRL", config_.GetBool("assists", "tc", true) ? "ON" : "OFF"},
         {"STABILITY CTRL", config_.GetBool("assists", "esc", true) ? "ON" : "OFF"},
         {"BACK", ""},
     };
 
-    float y = h * 0.28f;
-    for (int i = 0; i < 7; ++i) {
+    float y = h * 0.26f;
+    for (int i = 0; i < 8; ++i) {
         const bool selected = (i == settingsCursor_);
         renderer_.DrawRect2D(w * 0.5f - 300.f, y - 6.f, 600.f, 40.f,
                              selected ? Color{1.f, 0.55f, 0.15f, 0.22f}

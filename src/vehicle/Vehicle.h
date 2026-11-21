@@ -73,6 +73,9 @@ struct VehicleParams {
     float escLevel = 1.f;
     float steerAssist = 1.f;
 
+    // No-damage mode: collisions still bounce, but parts never lose health.
+    bool damageEnabled = true;
+
     // ERS / overtake
     float ersCapacity = 4.0e6f;       // J
     float ersDeployPower = 350000.f;  // W
