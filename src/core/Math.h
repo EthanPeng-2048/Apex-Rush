@@ -89,6 +89,31 @@ inline Vec3 TransformDirection(const Transform& t, const Vec3& d) {
     return Rotate(t.rotation, d);
 }
 
+// Stores the 4x4 matrix M with M * (p, 1) == TransformPoint(t, p) as 16
+// floats in row-major order (out[row*4 + col]). This matches raylib's Matrix
+// aggregate member order (m0, m4, m8, m12, m1, ...), so the values can be
+// copied straight into it. Getting the transpose wrong inverts the rotation
+// and hides the translation in the w row, which stretches vertices wildly.
+inline void TransformToMatrix(const Transform& t, float out[16]) {
+    const float x = t.rotation.x, y = t.rotation.y, z = t.rotation.z, w = t.rotation.w;
+    out[0] = 1.f - 2.f * (y * y + z * z);
+    out[1] = 2.f * (x * y - z * w);
+    out[2] = 2.f * (x * z + y * w);
+    out[3] = t.position.x;
+    out[4] = 2.f * (x * y + z * w);
+    out[5] = 1.f - 2.f * (x * x + z * z);
+    out[6] = 2.f * (y * z - x * w);
+    out[7] = t.position.y;
+    out[8] = 2.f * (x * z - y * w);
+    out[9] = 2.f * (y * z + x * w);
+    out[10] = 1.f - 2.f * (x * x + y * y);
+    out[11] = t.position.z;
+    out[12] = 0.f;
+    out[13] = 0.f;
+    out[14] = 0.f;
+    out[15] = 1.f;
+}
+
 constexpr float kPi = 3.14159265358979f;
 constexpr float kDegToRad = kPi / 180.f;
 constexpr float kRadToDeg = 180.f / kPi;

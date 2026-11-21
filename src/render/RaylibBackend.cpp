@@ -153,15 +153,15 @@ void RaylibBackend::DrawMesh(MeshHandle handle, const Transform& transform, cons
     if (it == impl_->models.end()) return;
     ::Model& model = it->second;
 
-    // Rebuild the model matrix from our transform each draw. Columns are the
-    // rotated basis vectors (raylib Matrix is column-major, m0..m15 row text).
-    const Quat& q = transform.rotation;
-    const float x = q.x, y = q.y, z = q.z, w = q.w;
-    model.transform = {
-        1.f - 2.f * (y * y + z * z), 2.f * (x * y + z * w), 2.f * (x * z - y * w), 0.f,
-        2.f * (x * y - z * w), 1.f - 2.f * (x * x + z * z), 2.f * (y * z + x * w), 0.f,
-        2.f * (x * z + y * w), 2.f * (y * z - x * w), 1.f - 2.f * (x * x + y * y), 0.f,
-        transform.position.x, transform.position.y, transform.position.z, 1.f};
+    // Rebuild the model matrix from our transform each draw. raylib's Matrix
+    // aggregate order is the matrix written row by row (translation in the
+    // 4th slot of the first three rows) — TransformToMatrix matches it.
+    float m[16];
+    TransformToMatrix(transform, m);
+    model.transform = {m[0], m[1], m[2],  m[3],
+                       m[4], m[5], m[6],  m[7],
+                       m[8], m[9], m[10], m[11],
+                       m[12], m[13], m[14], m[15]};
     DrawModel(model, {0.f, 0.f, 0.f}, 1.f, ToRaylib(tint));
     // Restore identity so the next frame's transform starts clean.
     model.transform = {1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f,

@@ -49,6 +49,27 @@ int RunDriveTest(Config& config) {
         }
     };
 
+    // 0) Transform matrix transcription. A transposed matrix inverts the
+    // rotation and buries the translation in the w row (stretched "spider
+    // web" geometry in-game), so the 16 floats must match TransformPoint.
+    {
+        Transform tr;
+        tr.position = Vec3{1.f, 2.f, 3.f};
+        tr.rotation = Quat::FromAxisAngle(Vec3{0.f, 1.f, 0.f}, 90.f * kDegToRad);
+        float m[16];
+        TransformToMatrix(tr, m);
+        const Vec3 basis[3] = {{1.f, 0.f, 0.f}, {0.f, 1.f, 0.f}, {0.f, 0.f, 1.f}};
+        float worst = 0.f;
+        for (const Vec3& b : basis) {
+            const Vec3 viaMatrix{m[0] * b.x + m[1] * b.y + m[2] * b.z + m[3],
+                                 m[4] * b.x + m[5] * b.y + m[6] * b.z + m[7],
+                                 m[8] * b.x + m[9] * b.y + m[10] * b.z + m[11]};
+            const float err = Length(viaMatrix - TransformPoint(tr, b));
+            if (err > worst) worst = err;
+        }
+        check(worst < 1e-4f, "transform matrix == TransformPoint", worst, 0.f);
+    }
+
     // Wait out the 3.5 s countdown; the car settles onto its suspension.
     run(4.f, InputState{});
     if (game.Phase() != RacePhase::Racing) {
@@ -96,6 +117,10 @@ int RunDriveTest(Config& config) {
         TransformDirection(game.PlayerState().transform, Vec3{0.f, 0.f, 1.f});
     const float turnDeg = std::acos(Clampf(Dot(headingBefore, headingAfter), -1.f, 1.f)) * kRadToDeg;
     check(turnDeg > 15.f, "steering changes heading", turnDeg, 15.f);
+    // steer = +1 (D / right arrow) must yaw the car to the right: the heading
+    // rotates from +Z toward +X, i.e. cross(before, after) has positive Y.
+    const float yawSign = Cross(headingBefore, headingAfter).y;
+    check(yawSign > 0.f, "steer +1 yaws right", yawSign, 0.f);
 
     // 3) Braking: full brake for 2 s from whatever speed we reached.
     InputState brake;
