@@ -109,6 +109,7 @@ void Vehicle::Spawn(IPhysicsWorld& world, const Transform& pose, const VehiclePa
 
     engineRpm_ = params.idleRpm;
     gear_ = 1;
+    escStrength_ = 0.f;
     state_.ersCharge = params.ersBaseCharge;
     state_.wingMode = WingMode::ZMode;
     state_.transform = pose;
@@ -130,7 +131,8 @@ void Vehicle::Reset(const Transform& pose) {
     for (int i = 0; i < 4; ++i) {
         state_.wheels[i].wear = 0.f;
         state_.wheels[i].temperature = 70.f;
-        tires_[i].SetWear(0.f);
+        state_.wheels[i].slipRatio = 0.f;
+        tires_[i].Reset();
     }
     for (int i = 0; i < static_cast<int>(CarPart::Count); ++i) {
         state_.partHealth[i] = 1.f;
@@ -138,6 +140,7 @@ void Vehicle::Reset(const Transform& pose) {
     engineRpm_ = params_.idleRpm;
     gear_ = 1;
     steerAngle_ = 0.f;
+    escStrength_ = 0.f;
     state_.ersCharge = params_.ersBaseCharge;
     state_.wingMode = WingMode::ZMode;
 }
@@ -152,9 +155,16 @@ Vehicle::AeroCoefficients Vehicle::ComputeAero() const {
     const float floorGain = 0.55f + 0.45f * floorH;
     const float sideGain = 0.82f + 0.18f * sideH;
 
-    aero.frontDownforceArea = params_.downforceArea * params_.frontDownforceShare *
+    // Pitch shifts aero balance: a nose-down car (braking) moves the center
+    // of pressure forward. Nose-up pitch is positive (body forward.y > 0).
+    const float pitch =
+        std::asin(Clampf(TransformDirection(state_.transform, Vec3{0.f, 0.f, 1.f}).y, -1.f, 1.f));
+    const float frontShare = Clampf(params_.frontDownforceShare - params_.aeroPitchBalance * pitch,
+                                    0.30f, 0.58f);
+
+    aero.frontDownforceArea = params_.downforceArea * frontShare *
                               (0.35f + 0.65f * frontH) * floorGain * sideGain;
-    aero.rearDownforceArea = params_.downforceArea * (1.f - params_.frontDownforceShare) *
+    aero.rearDownforceArea = params_.downforceArea * (1.f - frontShare) *
                              (0.30f + 0.70f * rearH) * floorGain * sideGain;
 
     // Damaged bodywork raises drag (torn surfaces).
@@ -176,17 +186,33 @@ Vehicle::AeroCoefficients Vehicle::ComputeAero() const {
     return aero;
 }
 
+float Vehicle::SteerEnvelopeDeg(float speed) const {
+    // Full lock = 0.95x the grip envelope delta = L * a_max(v) / v^2.
+    // a_max(v) = mu*g (load-sensitivity margin) + downforce term, so the
+    // envelope follows the tire / aero calibration instead of frozen magic
+    // numbers. The same curve caps AI corner speeds.
+    const float gripRef = 0.5f * (params_.frontTire.D0 + params_.rearTire.D0);
+    const float dfPerV2 = 0.5f * params_.airDensity * params_.downforceArea / params_.mass;
+    const float aMax = 9.81f * gripRef * 0.92f + dfPerV2 * speed * speed;
+    return std::min(21.f, 0.95f * params_.wheelbase * aMax / (speed * speed + 1.f) * kRadToDeg);
+}
+
 void Vehicle::Update(const VehicleInput& input, float dt) {
     if (!world_ || chassis_ == kInvalidBody) return;
 
     VehicleInput in = input;
     UpdateAssists(in);
 
+    const Transform transform = world_->GetTransform(chassis_);
+    const Vec3 velocity = world_->GetLinearVelocity(chassis_);
+    const float speed = Length(velocity);
+    const Vec3 forward = TransformDirection(transform, Vec3{0.f, 0.f, 1.f});
+    const float forwardSpeed = Dot(velocity, forward);
+
     // Speed-sensitive steering filter. Keyboard input steps to full lock
     // instantly, so the raw value must never reach the road wheels directly:
     //  - the max angle shrinks with speed toward the grip envelope (~2 deg at
-    //    250 km/h; the old curve still allowed ~3x what the tires can hold at
-    //    that speed, so any steer input snapped the car),
+    //    250 km/h),
     //  - both directions ramp gradually (BeamNG-style keyboard filtering):
     //    a key press eases the input in and out instead of stepping it, so a
     //    sudden input change never hits the chassis as a discontinuity.
@@ -195,18 +221,28 @@ void Vehicle::Update(const VehicleInput& input, float dt) {
     // Frame note: the vehicle frame is +Z forward / +Y up (right-handed), so
     // the geometric right side is -X and a right turn is a NEGATIVE yaw around
     // +Y. `in.steer` is defined as positive = steer right, hence the sign.
-    const float speedNow = state_.speed;
-    // Playable calibration: max wheel angle = 0.95x the grip envelope
-    // (delta_limit(v) = L * a_max(v) / v^2, a_max grows with downforce).
-    // Full lock sits AT the controllable edge instead of 1.3-1.5x beyond it —
-    // past the edge every keyboard input was a spin lottery. Slides still
-    // happen via throttle/handbrake/grass, never via gently holding a key.
-    const float steerRange = std::min(
-        21.f * kDegToRad, (2783.f / (speedNow * speedNow + 1.f) + 0.77f) * kDegToRad);
-    const float steerTarget = -in.steer * steerRange;
+    const float steerRange = SteerEnvelopeDeg(speed) * kDegToRad;
+    float steerTarget = -in.steer * steerRange;
+
+    // Steering assist ("转向与反打辅助"): counter-steer toward the velocity
+    // vector once the body actually slips. A dead zone (beta < ~3 deg) keeps
+    // ordinary cornering untouched; past it the correction ramps to a large
+    // fraction of the envelope and unwinds slides by itself. Strength mirrors
+    // the reference game's Full / Sport scaling.
+    if (params_.steerLevel != AssistLevel::Off && speed > 6.f && !in.handbrake) {
+        const float vRight = Dot(velocity, TransformDirection(transform, Vec3{-1.f, 0.f, 0.f}));
+        const float beta = std::atan2(vRight, std::max(std::fabs(forwardSpeed), 3.f));
+        const bool full = params_.steerLevel == AssistLevel::Full;
+        const float maxCorr = (full ? 0.85f : 0.45f) * steerRange;
+        const float slip = std::fabs(beta) > 0.05f
+                               ? (beta - std::copysign(0.05f, beta)) * (maxCorr / 0.07f)
+                               : 0.f;
+        steerTarget -= Clampf(slip, -maxCorr, maxCorr);
+    }
+
     const float tau = std::fabs(steerTarget) < std::fabs(steerAngle_)
                           ? 0.11f
-                          : std::min(0.10f + 0.0032f * speedNow, 0.34f);
+                          : std::min(0.10f + 0.0032f * speed, 0.34f);
     const float steerRate = steerRange / tau * dt;
     if (steerAngle_ < steerTarget) steerAngle_ = std::min(steerAngle_ + steerRate, steerTarget);
     else steerAngle_ = std::max(steerAngle_ - steerRate, steerTarget);
@@ -221,14 +257,6 @@ void Vehicle::Update(const VehicleInput& input, float dt) {
         state_.wingMode = (state_.wingMode == WingMode::ZMode) ? WingMode::XMode : WingMode::ZMode;
     }
     wingTogglePrev_ = in.wingToggle;
-
-    const Transform transform = world_->GetTransform(chassis_);
-    const Vec3 velocity = world_->GetLinearVelocity(chassis_);
-    const float speed = Length(velocity);
-    const Vec3 forward = TransformDirection(transform, Vec3{0.f, 0.f, 1.f});
-    const Vec3 up = TransformDirection(transform, Vec3{0.f, 1.f, 0.f});
-    const Vec3 right = TransformDirection(transform, Vec3{1.f, 0.f, 0.f});
-    const float forwardSpeed = Dot(velocity, forward);
 
     // DRS: only when requested, moving forward fast, and pointed reasonably
     // straight (mirrors real activation windows).
@@ -364,6 +392,15 @@ void Vehicle::UpdatePowertrain(const VehicleInput& input, float dt) {
         driveForce = driveTorque_ * totalRatioNow / wheelRadius;
     }
 
+    // TC feed-forward torque budget: cap drive force at the driven axle's
+    // traction budget so a lateral reserve survives corner exits (the
+    // slip-ratio cut in UpdateAssists handles the transients).
+    if (params_.tcLevel != AssistLevel::Off) {
+        const float rearLoad = state_.wheels[kRearLeft].load + state_.wheels[kRearRight].load;
+        const float reserve = (params_.tcLevel == AssistLevel::Full) ? 0.94f : 1.10f;
+        driveForce = std::min(driveForce, std::max(2000.f, rearLoad * params_.rearTire.D0 * reserve));
+    }
+
     // ERS overtake adds force at the same axle.
     if (state_.ersDeploying) {
         const float v = std::max(8.f, Length(world_->GetLinearVelocity(chassis_)));
@@ -379,10 +416,17 @@ void Vehicle::UpdatePowertrain(const VehicleInput& input, float dt) {
     if (input.handbrake) brakeForce += params_.brakeForceMax * 0.65f;
 
     // Split to wheels: drive/brake totals are distributed 50:50 per axle,
-    // brake biased 60:40 front like a real single-seater.
+    // brake biased 60:40 front like a real single-seater. With ESC on, the
+    // rear brake is trimmed while steering so trail-braking never steps the
+    // tail out (reference game's rearBrakeReserve).
     const float drivePerRear = driveForce * 0.5f;
     const float brakeFront = brakeForce * 0.6f * 0.5f;
-    const float brakeRear = brakeForce * 0.4f * 0.5f;
+    const float escTrim = (params_.escLevel == AssistLevel::Full)
+                              ? 1.f
+                              : (params_.escLevel == AssistLevel::Sport ? 0.58f : 0.f);
+    const float rearBrakeScale =
+        1.f - 0.39f * escTrim * Clampf(std::fabs(steerAngle_) * 5.7f, 0.f, 1.f);
+    const float brakeRear = brakeForce * 0.4f * 0.5f * rearBrakeScale;
 
     drivePerWheel_[kFrontLeft] = 0.f;
     drivePerWheel_[kFrontRight] = 0.f;
@@ -399,6 +443,28 @@ void Vehicle::UpdateWheels(float dt) {
     const Vec3 up = TransformDirection(transform, Vec3{0.f, 1.f, 0.f});
     const Vec3 forward = TransformDirection(transform, Vec3{0.f, 0.f, 1.f});
     const Vec3 right = TransformDirection(transform, Vec3{1.f, 0.f, 0.f});
+
+    // Simplified camber: static negative camber (top inboard) plus body roll
+    // (roll > 0 = leaning left). camber[] holds the wheel-top lean toward the
+    // geometric right [rad]; the tire converts it into camber thrust. The
+    // camber gain claws back most of the body-roll lean on the compressed
+    // side, the rest is what static negative camber is for.
+    const float rollF =
+        (state_.wheels[kFrontLeft].compression - state_.wheels[kFrontRight].compression) /
+        params_.trackWidth;
+    const float rollR =
+        (state_.wheels[kRearLeft].compression - state_.wheels[kRearRight].compression) /
+        params_.trackWidth;
+    constexpr float kStaticCamber = 0.035f;  // ~2 deg
+    constexpr float kCamberGain = 0.65f;
+    const float camberShiftF = (kCamberGain - 1.f) * rollF;
+    const float camberShiftR = (kCamberGain - 1.f) * rollR;
+    const float camber[4] = {
+        kStaticCamber + camberShiftF,
+        -kStaticCamber + camberShiftF,
+        kStaticCamber + camberShiftR,
+        -kStaticCamber + camberShiftR,
+    };
 
     for (int i = 0; i < 4; ++i) {
         const Vec3 hardpoint = TransformPoint(transform, hardpoints_[i]);
@@ -449,10 +515,20 @@ void Vehicle::UpdateWheels(float dt) {
             // Tire forces in the wheel plane. Off-track contacts (below the
             // road surface, i.e. the grass plane) get reduced grip so cutting
             // through the grass is never faster than staying on the asphalt.
+            // ABS releases brake pressure per wheel on lock-up (previous
+            // substep's slip ratio — the fresh kappa comes out of Compute).
+            float brakeForce = brakePerWheel_[i];
+            if (params_.absLevel != AssistLevel::Off && brakeForce > 1.f) {
+                const float thresh = (params_.absLevel == AssistLevel::Full) ? 0.115f : 0.18f;
+                const float release = (wheel.slipRatio < -thresh)
+                                          ? Clampf((-wheel.slipRatio - thresh) * 6.f, 0.f, 0.91f)
+                                          : 0.f;
+                brakeForce *= 1.f - release;
+            }
             const float surfaceGrip = hit.point.y < -0.02f ? 0.55f : 1.f;
             const TireModel::Output tire = tires_[i].Compute(
                 normalForce * surfaceGrip, wheel.contactVelocity, wheelForward, wheelRight,
-                drivePerWheel_[i], brakePerWheel_[i], dt);
+                drivePerWheel_[i], brakeForce, dt, camber[i]);
             world_->ApplyForce(chassis_, tire.force, hit.point);
             wheel.force = tire.force;
             wheel.slipRatio = tire.slipRatio;
@@ -479,46 +555,55 @@ void Vehicle::UpdateAssists(VehicleInput& input) {
     if (!world_) return;
     const Transform transform = world_->GetTransform(chassis_);
     const Vec3 velocity = world_->GetLinearVelocity(chassis_);
-    const Vec3 forward = TransformDirection(transform, Vec3{0.f, 0.f, 1.f});
-    const Vec3 right = TransformDirection(transform, Vec3{1.f, 0.f, 0.f});
+    // Geometric right side is -X in the vehicle frame (+Z forward / +Y up).
+    const Vec3 geoRight = TransformDirection(transform, Vec3{-1.f, 0.f, 0.f});
+    const Vec3 up = TransformDirection(transform, Vec3{0.f, 1.f, 0.f});
     const float speed = Length(velocity);
-    const float forwardSpeed = Dot(velocity, forward);
-    const float lateralSpeed = Dot(velocity, right);
+    const float forwardSpeed = Dot(velocity, TransformDirection(transform, Vec3{0.f, 0.f, 1.f}));
+    const float vRight = Dot(velocity, geoRight);
 
-    // TC: cut throttle when rear slip is high (approximated from lateral
-    // slide + throttle demand).
-    if (params_.tcLevel > 0.f) {
-        const float slide = std::fabs(lateralSpeed) / std::max(speed, 4.f);
-        const float slipEstimate = std::max(0.f, slide - 0.12f) * 2.2f;
-        if (slipEstimate > 0.15f) {
-            const float cut = Clampf((slipEstimate - 0.15f) * params_.tcLevel * 1.6f, 0.f, 0.85f);
-            input.throttle *= (1.f - cut);
-        }
+    // TC: throttle cut on driven-wheel slip ratio (previous substep's wheel
+    // spin state). Slip-based, so straight-line wheelspin is caught too.
+    if (params_.tcLevel != AssistLevel::Off) {
+        const float slip = std::max(state_.wheels[kRearLeft].slipRatio,
+                                    state_.wheels[kRearRight].slipRatio);
+        const float thresh = (params_.tcLevel == AssistLevel::Full) ? 0.115f : 0.20f;
+        const float cut = Clampf((slip - thresh) * 6.1f, 0.f, 0.94f);
+        input.throttle *= (1.f - cut);
     }
 
-    // ABS: ease off braking when the car is sliding heavily.
-    if (params_.absLevel > 0.f) {
-        const float slide = std::fabs(lateralSpeed) / std::max(speed, 4.f);
-        if (slide > 0.22f) {
-            const float cut = Clampf((slide - 0.22f) * params_.absLevel * 1.4f, 0.f, 0.6f);
-            input.brake *= (1.f - cut);
-        }
-    }
+    // ABS is applied per wheel in UpdateWheels (it modulates the brake split
+    // where the wheel's slip ratio is known).
 
-    // ESC: stability assist — catches genuine oversteer with real
-    // counter-steer so a slide is recoverable. Acts only when yaw exceeds the
-    // bicycle-model reference AND the body is actually sliding; normal
-    // turn-in yaw overshoot must not kick the wheel ("sudden slides" feel).
-    // Never adds steering on understeer.
-    if (params_.escLevel > 0.f && !input.handbrake) {
-        const Vec3 angVel = world_->GetAngularVelocity(chassis_);
-        const float yawRate = Dot(angVel, Vec3{0.f, 1.f, 0.f});
+    // ESC: preventive stability. Steps in as soon as the body slips past a
+    // small beta or the yaw drifts off the steering reference — long before
+    // a spin develops. Counter-steer + yaw damping + lateral damping; the
+    // rear-brake reserve lives in UpdatePowertrain.
+    escStrength_ = 0.f;
+    if (params_.escLevel != AssistLevel::Off && !input.handbrake && speed > 5.f) {
+        const float beta = std::atan2(vRight, std::max(std::fabs(forwardSpeed), 3.f));
+        const float yawRate = Dot(world_->GetAngularVelocity(chassis_), up);
         const float yawRef = forwardSpeed * std::tan(steerAngle_) / params_.wheelbase;
-        const float excess = std::fabs(yawRate) - std::fabs(yawRef);
-        if (excess > 0.45f && std::fabs(lateralSpeed) > 2.f) {
-            const float correction =
-                Clampf((yawRate - yawRef) * 0.4f * params_.escLevel, -0.5f, 0.5f);
-            input.steer = Clampf(input.steer + correction, -1.f, 1.f);
+        const float excess = yawRate - yawRef;
+        const bool full = params_.escLevel == AssistLevel::Full;
+        const float betaThresh = full ? 0.064f : 0.125f;
+        const float strength = full ? 1.f : 0.58f;
+        if (std::fabs(beta) > betaThresh || std::fabs(excess) > 0.31f) {
+            escStrength_ = strength;
+            // Small steer trim on top (the steering assist owns the big
+            // counter-steer); ESC's main actuators are the yaw torque and
+            // lateral damping below.
+            input.steer =
+                Clampf(input.steer + Clampf(beta * 0.55f + excess * 0.4f, -0.2f, 0.2f) * strength,
+                       -1.f, 1.f);
+            // Yaw damping about +Y (a right turn is negative yaw). Gains
+            // mirror the reference game's 6.6 / 4.3 stabilizer scaled by Iz.
+            const float iz = params_.mass * 1.6f;
+            world_->ApplyTorque(
+                chassis_, Vec3{0.f, -iz * (6.6f * excess + 4.3f * beta) * strength, 0.f});
+            // Lateral damping kills the sideways velocity component.
+            world_->ApplyForce(
+                chassis_, geoRight * (-1.9f * params_.mass * vRight * strength), transform.position);
         }
     }
 }

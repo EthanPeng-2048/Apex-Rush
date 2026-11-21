@@ -78,8 +78,10 @@ int RunFlatStabilityTest() {
 
         const VehicleState& s = car.State();
         check(v0 > 15.f, "flat: reach mid speed", v0, 15.f);
-        const float range = std::min(21.f, 2783.f / (s.speed * s.speed + 1.f) + 0.77f);
-        const float bound = 0.25f * range + 0.35f;
+        const float range = car.SteerEnvelopeDeg(s.speed);
+        // 0.25 tap + the steering-assist counter-steer trim (up to 0.85x the
+        // envelope once slipping) + slack for the input easing.
+        const float bound = 0.25f * range + 0.85f * range + 0.5f;
         check(std::fabs(s.steerAngleDeg) < bound, "flat: steer within speed limit",
               s.steerAngleDeg, bound);
         const float turnDeg =
@@ -106,8 +108,8 @@ int RunFlatStabilityTest() {
 
         const VehicleState& s = car.State();
         check(v0 > 40.f, "flat: reach racing speed", v0, 40.f);
-        const float range = std::min(21.f, 2783.f / (s.speed * s.speed + 1.f) + 0.77f);
-        const float bound = 0.25f * range + 0.35f;
+        const float range = car.SteerEnvelopeDeg(s.speed);
+        const float bound = 0.25f * range + 0.85f * range + 0.5f;
         check(std::fabs(s.steerAngleDeg) < bound, "flat: steer within speed limit",
               s.steerAngleDeg, bound);
         const float turnDeg =
@@ -167,7 +169,7 @@ int RunMenuTest() {
 
     press = InputState{};
     press.menuDown = true;
-    for (int i = 0; i < 7 && game.Phase() == RacePhase::Settings; ++i) frame(press);
+    for (int i = 0; i < 8 && game.Phase() == RacePhase::Settings; ++i) frame(press);
     press = InputState{};
     press.menuSelect = true;  // BACK row
     frame(press);

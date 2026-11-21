@@ -25,6 +25,13 @@ enum class WingMode : int {
     XMode = 1,   // 2026 low-drag (straights)
 };
 
+// Driver aids, graded like the F1 games: Off / Sport / Full.
+enum class AssistLevel : int {
+    Off = 0,
+    Sport = 1,
+    Full = 2,
+};
+
 // Complete parameter set for one car. Defaults approximate a 2026-spec F1
 // car at simcade level (Real Racing 3 / Monoposto feel).
 struct VehicleParams {
@@ -43,9 +50,9 @@ struct VehicleParams {
     float suspensionRestLength = 0.16f;
     float suspensionMaxTravel = 0.22f;
 
-    // Tires
-    TireModel::Params frontTire;
-    TireModel::Params rearTire;
+    // Tires (front = steering tire, rear = drive tire; see Params::Front/Rear)
+    TireModel::Params frontTire = TireModel::Params::Front();
+    TireModel::Params rearTire = TireModel::Params::Rear();
 
     // Powertrain (rear-wheel drive)
     float maxTorque = 420.f;          // Nm at the crank
@@ -63,15 +70,17 @@ struct VehicleParams {
     // Aero  (force = 0.5 * rho * coeff * v^2)
     float airDensity = 1.225f;
     float dragArea = 1.02f;           // Cd*A
-    float downforceArea = 3.3f;       // Cl*A ≈ 1.3x car weight at 250 km/h
+    float downforceArea = 5.7f;       // Cl*A ≈ 2.3x car weight at 250 km/h
     float frontDownforceShare = 0.44f;
     float centerOfPressureOffset = 0.1f;  // +Z moves aero balance rearward
+    float aeroPitchBalance = 0.35f;   // front-share shift per rad of nose-up pitch
 
-    // Assists (0 = off, 1 = full)
-    float absLevel = 1.f;
-    float tcLevel = 1.f;
-    float escLevel = 1.f;
-    float steerAssist = 1.f;
+    // Assists (graded: Off / Sport / Full). Defaults match the playability
+    // target: steering aid fully on, the rest at Sport.
+    AssistLevel absLevel = AssistLevel::Sport;
+    AssistLevel tcLevel = AssistLevel::Sport;
+    AssistLevel escLevel = AssistLevel::Sport;
+    AssistLevel steerLevel = AssistLevel::Full;
 
     // No-damage mode: collisions still bounce, but parts never lose health.
     bool damageEnabled = true;
@@ -160,6 +169,12 @@ public:
     const VehicleState& State() const { return state_; }
     const VehicleParams& Params() const { return params_; }
     BodyHandle Chassis() const { return chassis_; }
+
+    // Speed-sensitive full-lock road-wheel angle [deg]. Full lock sits at
+    // 0.95x the grip envelope delta = L * a_max(v) / v^2, so the extra ~5%
+    // covers bumps and surface noise instead of being a spin lottery. The
+    // same curve caps the AI speed target — keep them in one place.
+    float SteerEnvelopeDeg(float speed) const;
     float PartHealth(CarPart part) const {
         return state_.partHealth[static_cast<int>(part)];
     }
@@ -199,6 +214,10 @@ private:
     float steerAngle_ = 0.f;
     float throttleSmooth_ = 0.f;
     float brakeSmooth_ = 0.f;
+
+    // ESC intervention state from UpdateAssists, consumed by UpdatePowertrain
+    // (rear brake reserve while cornering) and UpdateAssists itself.
+    float escStrength_ = 0.f;
 
     // Per-wheel drive/brake force split (N), filled by UpdatePowertrain.
     std::array<float, 4> drivePerWheel_{};

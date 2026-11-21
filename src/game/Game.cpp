@@ -1,14 +1,50 @@
 #include "game/Game.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 
 #include "physics/Qu3eWorld.h"
 
 namespace apex {
 
 namespace {
+
+// Assist levels are stored as "off" / "sport" / "full"; legacy "true"/"false"
+// values map to sport / off so old config files keep working.
+AssistLevel ParseAssistLevel(const Config& config, const char* key, AssistLevel fallback) {
+    std::string v = config.GetString("assists", key, "");
+    for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (v == "full" || v == "2") return AssistLevel::Full;
+    if (v == "sport" || v == "true" || v == "1") return AssistLevel::Sport;
+    if (v == "off" || v == "false" || v == "0") return AssistLevel::Off;
+    return fallback;
+}
+
+const char* AssistLevelName(AssistLevel level) {
+    switch (level) {
+        case AssistLevel::Full:
+            return "FULL";
+        case AssistLevel::Sport:
+            return "SPORT";
+        default:
+            return "OFF";
+    }
+}
+
+// Playability target: steering aid fully on, the rest at Sport.
+AssistLevel DefaultAssistLevel(const char* key) {
+    return std::strcmp(key, "steer") == 0 ? AssistLevel::Full : AssistLevel::Sport;
+}
+
+void SaveAssistLevel(Config& config, const char* key, AssistLevel level) {
+    config.SetString("assists", key,
+                     level == AssistLevel::Full ? "full"
+                     : level == AssistLevel::Sport ? "sport"
+                                                   : "off");
+}
 
 std::string FormatTime(float seconds) {
     if (seconds <= 0.f) return "--:--.---";
@@ -51,9 +87,10 @@ void Game::SpawnRacers() {
         racer.isPlayer = (i == 0);
 
         VehicleParams params;
-        if (config_.GetBool("assists", "abs", true)) params.absLevel = 1.f; else params.absLevel = 0.f;
-        if (config_.GetBool("assists", "tc", true)) params.tcLevel = 1.f; else params.tcLevel = 0.f;
-        if (config_.GetBool("assists", "esc", true)) params.escLevel = 1.f; else params.escLevel = 0.f;
+        params.absLevel = ParseAssistLevel(config_, "abs", DefaultAssistLevel("abs"));
+        params.tcLevel = ParseAssistLevel(config_, "tc", DefaultAssistLevel("tc"));
+        params.escLevel = ParseAssistLevel(config_, "esc", DefaultAssistLevel("esc"));
+        params.steerLevel = ParseAssistLevel(config_, "steer", DefaultAssistLevel("steer"));
         params.damageEnabled = config_.GetBool("race", "damage", true);
 
         Transform pose;
@@ -212,25 +249,23 @@ void Game::UpdateAI(Racer& racer, float dt) {
     float steer = Clampf(-yawErr * 1.5f - lateralVel * 0.06f, -1.f, 1.f);
 
     // --- Speed target from the sharpest corner inside the braking horizon.
-    // Two caps: grip (v = sqrt(aLat / curvature)) and the steering envelope —
-    // the speed-sensitive wheel-angle limit makes tight corners physically
-    // unturnable above a speed (R=23 m needs ~9 deg but 25 m/s only allows
-    // 7 deg), so also solve 21deg / (1 + 0.032v + 0.0018v^2) >= 1.15 * L * curv.
+    // The grip budget is derived from the car's own tire / aero calibration:
+    // max lateral a(v) = aLatBase + dfPerV2*v^2 must cover the corner demand
+    // v^2*curv (curvMax already carries a 1.2x margin). The vehicle's steering
+    // envelope is 0.95x the same grip curve (see Vehicle::SteerEnvelopeDeg),
+    // so one constraint covers both.
     const float horizon = std::max(60.f, state.speed * state.speed / 24.f);
     float curvMax = 0.f;
     for (float dd = 0.f; dd <= horizon; dd += 10.f) {
         curvMax = std::max(curvMax, track_.CurvatureAt(d + dd) * 1.2f);
     }
     curvMax = std::max(curvMax, 0.0012f);
-    float vTarget = std::sqrt(13.5f / curvMax);
-    {
-        // Keep within the playable steering envelope (Vehicle::Update):
-        // delta_max(v) = 48.58/v^2 + 0.0135 rad; require 1.15x margin.
-        const float rhs = 1.15f * 3.6f * curvMax;
-        if (rhs > 0.0135f) {
-            vTarget = std::min(vTarget, std::sqrt(48.58f / (rhs - 0.0135f)));
-        }
-    }
+    const VehicleParams& p = racer.vehicle.Params();
+    const float gripRef = 0.5f * (p.frontTire.D0 + p.rearTire.D0);
+    const float aLatBase = 9.81f * gripRef * 0.92f;
+    const float dfPerV2 = 0.5f * p.airDensity * p.downforceArea / p.mass;
+    const float gripDenom = curvMax - dfPerV2;
+    float vTarget = gripDenom > 1e-4f ? std::sqrt(aLatBase / gripDenom) : 62.f;
     vTarget = Clampf(vTarget * 0.95f, 12.f, 62.f);
 
     const float total = track_.TotalLength();
@@ -564,7 +599,7 @@ void Game::UpdateMenu() {
 }
 
 void Game::UpdateSettings() {
-    constexpr int kRows = 8;  // circuit, laps, cars, damage, abs, tc, esc, back
+    constexpr int kRows = 9;  // circuit, laps, cars, damage, abs, tc, esc, steer, back
     const InputState& in = rawInput_;
     if (in.menuUp) settingsCursor_ = (settingsCursor_ + kRows - 1) % kRows;
     if (in.menuDown) settingsCursor_ = (settingsCursor_ + 1) % kRows;
@@ -611,11 +646,11 @@ void Game::UpdateSettings() {
             break;
         }
         default: {
-            static const char* kAssistKeys[3] = {"abs", "tc", "esc"};
+            static const char* kAssistKeys[4] = {"abs", "tc", "esc", "steer"};
             const char* key = kAssistKeys[settingsCursor_ - 4];
-            bool value = config_.GetBool("assists", key, true);
-            value = (dir != 0) ? (dir > 0) : !value;
-            config_.SetString("assists", key, value ? "true" : "false");
+            int level = static_cast<int>(ParseAssistLevel(config_, key, DefaultAssistLevel(key)));
+            level = (level + (dir != 0 ? (dir > 0 ? 1 : -1) : 1) + 3) % 3;
+            SaveAssistLevel(config_, key, static_cast<AssistLevel>(level));
             break;
         }
     }
@@ -663,19 +698,20 @@ void Game::RenderSettings() {
         std::string value;
     };
     const int cars = config_.GetInt("race", "cars", 4);
-    const Row rows[8] = {
+    const Row rows[9] = {
         {"CIRCUIT", std::to_string(circuitIndex_ + 1) + "/3"},
         {"LAPS", std::to_string(totalLaps_)},
         {"CARS", std::to_string(cars)},
         {"DAMAGE", config_.GetBool("race", "damage", true) ? "ON" : "OFF"},
-        {"ABS", config_.GetBool("assists", "abs", true) ? "ON" : "OFF"},
-        {"TRACTION CTRL", config_.GetBool("assists", "tc", true) ? "ON" : "OFF"},
-        {"STABILITY CTRL", config_.GetBool("assists", "esc", true) ? "ON" : "OFF"},
+        {"ABS", AssistLevelName(ParseAssistLevel(config_, "abs", DefaultAssistLevel("abs")))},
+        {"TRACTION CTRL", AssistLevelName(ParseAssistLevel(config_, "tc", DefaultAssistLevel("tc")))},
+        {"STABILITY CTRL", AssistLevelName(ParseAssistLevel(config_, "esc", DefaultAssistLevel("esc")))},
+        {"STEER ASSIST", AssistLevelName(ParseAssistLevel(config_, "steer", DefaultAssistLevel("steer")))},
         {"BACK", ""},
     };
 
     float y = h * 0.26f;
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < 9; ++i) {
         const bool selected = (i == settingsCursor_);
         renderer_.DrawRect2D(w * 0.5f - 300.f, y - 6.f, 600.f, 40.f,
                              selected ? Color{1.f, 0.55f, 0.15f, 0.22f}
