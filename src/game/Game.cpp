@@ -605,8 +605,8 @@ void Game::PublishSnapshot() {
         pose.state.transform = pose.chassis;
         pose.params = racer.vehicle.Params();
         pose.isPlayer = racer.isPlayer;
-        pose.tint = racer.isPlayer ? Color{0.15f, 0.55f, 1.f, 1.f}
-                                   : Color{0.9f, 0.45f, 0.12f, 1.f};
+        pose.tint = racer.isPlayer ? Color{0.88f, 0.92f, 1.0f, 1.f}
+                                   : Color{1.0f, 0.86f, 0.74f, 1.f};
         pose.lap = racer.lap;
         pose.position = racer.position;
         pose.lastLapTime = racer.lastLapTime;
@@ -688,7 +688,7 @@ void Game::Render3D() {
     }
 
     for (Racer& racer : racers_) {
-        Color tint = racer.isPlayer ? Color{0.15f, 0.55f, 1.f, 1.f} : Color{0.9f, 0.45f, 0.12f, 1.f};
+        Color tint = racer.isPlayer ? Color{0.88f, 0.92f, 1.0f, 1.f} : Color{1.0f, 0.86f, 0.74f, 1.f};
         racer.vehicle.Render(renderer_, tint);
     }
 }

@@ -23,10 +23,11 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parent.parent
 GLB_PATH = ROOT / "assets" / "models" / "racecar" / "RaceCar.glb"
 TEX_PATH = ROOT / "assets" / "models" / "racecar" / "RaceCar.jpg"
-OUT_PATH = ROOT / "src" / "vehicle" / "CarModelData.h"
+OUT_PATH = ROOT / "rush-engine" / "src" / "physics" / "CarModelData.h"
 
 WHEEL_RADIUS = 0.33          # must match VehicleParams::wheelRadius
 SCALE = 1.5                  # visual scale of the whole car
+LIVERY_SIZE = 512             # baked livery texture resolution (square)
 
 COMP_SIZE = {5120: 1, 5121: 1, 5122: 2, 5123: 2, 5125: 4, 5126: 4}
 COMP_FMT = {5120: "b", 5121: "B", 5122: "h", 5123: "H", 5125: "I", 5126: "f"}
@@ -208,32 +209,25 @@ def main():
             lines.append(", ".join(row))
         return ",\n    ".join(lines)
 
-    # Livery bake: sample the texture per vertex and keep its luminance as a
-    # grayscale value. The renderer multiplies this by the per-car team tint,
-    # so paint detail survives while each car keeps its colour.
-    tex = Image.open(TEX_PATH).convert("RGB")
-    tw, th = tex.size
-    texels = tex.load()
-
-    def bake_colors(uvs):
-        out_bytes = []
-        for u, v in uvs:
-            x = min(tw - 1, max(0, int(u * tw)))
-            y = min(th - 1, max(0, int(v * th)))
-            r, g, b = texels[x, y]
-            lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
-            gray = int(min(255, max(0, (0.35 + 0.65 * lum) * 255)))
-            out_bytes += [gray, gray, gray, 255]
-        return out_bytes
+    # Livery bake: downscale the paint texture to a square RGBA atlas and embed
+    # it. The lit renderer samples it per-vertex via UV and multiplies by the
+    # per-car tint, so each team keeps its colour on the same artwork.
+    livery = Image.open(TEX_PATH).convert("RGBA")
+    livery = livery.resize((LIVERY_SIZE, LIVERY_SIZE), Image.LANCZOS)
+    livery_pixels = list(livery.tobytes())
 
     def mesh_block(cpp_name, positions, uvs, indices):
         pos_flat = [c for p in positions for c in p]
         normals = recompute_normals(positions, indices)
         nrm_flat = [c for n in normals for c in n]
-        colors = bake_colors(uvs)
+        uv_flat = [c for uv in uvs for c in uv]
+        # White vertex color: the lit shader multiplies texture * vertexColor
+        # * tint, so the baked livery and per-car tint show through fully.
+        colors = [255, 255, 255, 255] * len(positions)
         return (
             f"const float k{cpp_name}Positions[] = {{\n    {fmt_floats(pos_flat)}\n}};\n\n"
             f"const float k{cpp_name}Normals[] = {{\n    {fmt_floats(nrm_flat)}\n}};\n\n"
+            f"const float k{cpp_name}Uvs[] = {{\n    {fmt_floats(uv_flat)}\n}};\n\n"
             f"const uint8_t k{cpp_name}Colors[] = {{\n    "
             + ", ".join(str(c) for c in colors)
             + "\n};\n\n"
@@ -258,7 +252,8 @@ def main():
     header.append("struct MeshBlob {")
     header.append("    const float* positions;")
     header.append("    const float* normals;")
-    header.append("    const uint8_t* colors;   // RGBA per vertex, livery baked as grayscale")
+    header.append("    const float* uvs;")
+    header.append("    const uint8_t* colors;   // RGBA per vertex (white; livery lives in kLiveryTexture)")
     header.append("    const uint16_t* indices;")
     header.append("    int vertexCount;")
     header.append("    int indexCount;")
@@ -268,9 +263,17 @@ def main():
     header.append("")
     header.append(mesh_block("Wheel", wheel_pos, wheel_uvs, wheel_idx))
     header.append("")
-    header.append(f"inline constexpr MeshBlob kBody{{kBodyPositions, kBodyNormals, kBodyColors, "
+    header.append(f"// Baked livery texture (RGBA8, {LIVERY_SIZE}x{LIVERY_SIZE}).")
+    header.append(f"const uint8_t kLiveryTexture[] = {{\n    "
+                  + ", ".join(str(c) for c in livery_pixels)
+                  + "\n};")
+    header.append(f"inline constexpr int kLiveryWidth = {LIVERY_SIZE};")
+    header.append(f"inline constexpr int kLiveryHeight = {LIVERY_SIZE};")
+    header.append("")
+    header.append("")
+    header.append(f"inline constexpr MeshBlob kBody{{kBodyPositions, kBodyNormals, kBodyUvs, kBodyColors, "
                   f"kBodyIndices, {len(body_pos)}, {len(body_idx)}}};")
-    header.append(f"inline constexpr MeshBlob kWheel{{kWheelPositions, kWheelNormals, kWheelColors, "
+    header.append(f"inline constexpr MeshBlob kWheel{{kWheelPositions, kWheelNormals, kWheelUvs, kWheelColors, "
                   f"kWheelIndices, {len(wheel_pos)}, {len(wheel_idx)}}};")
     header.append("")
     header.append("// Wheel anchors in model space (origin = wheelbase centre on the ground).")
