@@ -26,6 +26,7 @@ using namespace apex;
 // Swap the collision backend under test ([physics] engine).
 std::unique_ptr<IPhysicsWorld> MakeWorld(const char* engine) {
     if (engine && std::strcmp(engine, "nudge") == 0) return std::make_unique<NudgeWorld>();
+    if (engine && std::strcmp(engine, "rpc") == 0) return std::make_unique<RushPhysicsCore>();
     return std::make_unique<Qu3eWorld>();
 }
 
@@ -43,7 +44,7 @@ int RunFlatStabilityTest(IPhysicsWorld& world) {
     ground.transform.position = {0.f, -1.f, 0.f};
     ground.halfExtents = {2000.f, 1.f, 2000.f};
     ground.friction = 0.8f;
-    world.CreateBody(ground);
+    (void)world.CreateBody(ground);
 
     VehicleParams params;
     Transform pose;
@@ -147,7 +148,7 @@ int RunFlatStabilityTest(IPhysicsWorld& world) {
 
 // Menu/settings flow on the headless backend: boots into the menu (no
 // autostart), opens settings, comes back, starts a race — plus a render
-// smoke pass over the menu screens. Uses the real config.ini but never
+// smoke pass over the menu screens. Uses the real config.rushconf but never
 // changes a value, so the settings save round-trips the user's config.
 // Deliberately backend-agnostic and free of config overrides: leaving the
 // settings screen calls Config::Save, which would persist any override.
@@ -159,7 +160,7 @@ int RunMenuTest() {
     }
 
     Config config;
-    config.Load(DataPath("config.ini"));
+    config.Load(DataPath("config.rushconf"));
     Game game(backend, backend, config);
     if (!game.Init()) {
         std::printf("[FAIL] menu-test game init\n");
@@ -195,7 +196,7 @@ int RunMenuTest() {
     press = InputState{};
     press.menuDown = true;
     // Walk the whole list to the BACK row. Selecting anywhere else would
-    // change a value and Save() it into the real config.ini — the row count
+    // change a value and Save() it into the real config.rushconf — the row count
     // must stay in sync with Game::kSettingsRowCount.
     for (int i = 0; i < Game::kSettingsRowCount - 1 && game.Phase() == RacePhase::Settings; ++i) {
         frame(press);
@@ -259,7 +260,7 @@ int RunDrsZoneTest(const char* engine) {
     }
 
     Config config;
-    config.Load(DataPath("config.ini"));
+    config.Load(DataPath("config.rushconf"));
     config.SetString("race", "cars", "1");  // player only — no AI traffic
     config.SetString("race", "autostart", "true");
     config.SetString("physics", "engine", engine);
@@ -386,7 +387,7 @@ int RunAITest(const char* engine) {
     }
 
     Config config;
-    config.Load(DataPath("config.ini"));
+    config.Load(DataPath("config.rushconf"));
     config.SetString("race", "cars", "4");
     config.SetString("race", "autostart", "true");
     config.SetString("race", "autopilot", "true");
@@ -466,7 +467,7 @@ int RunAIDifficultyIsolationTest(const char* engine) {
     }
 
     Config config;
-    config.Load(DataPath("config.ini"));
+    config.Load(DataPath("config.rushconf"));
     config.SetString("race", "cars", "2");
     config.SetString("race", "autostart", "true");
     config.SetString("physics", "engine", engine);
@@ -519,6 +520,60 @@ int RunAIDifficultyIsolationTest(const char* engine) {
     return failures;
 }
 
+// Contact friction / raycast surface mu: every backend must report the
+// create-time Coulomb mu on GetFriction, fill RayHit.friction, and mix a
+// pair via GetContactFriction (native or MixFriction fallback).
+int RunFrictionRaycastTest(IPhysicsWorld& world) {
+    world.SetGravity({0.f, -9.81f, 0.f});
+
+    BodyDesc ground;
+    ground.transform.position = {0.f, -1.f, 0.f};
+    ground.halfExtents = {2000.f, 1.f, 2000.f};
+    ground.friction = 0.75f;
+    ground.userData = SurfaceTag(SurfaceType::Road);
+    const BodyHandle groundId = world.CreateBody(ground).value_or(kInvalidBody);
+
+    BodyDesc other;
+    other.transform.position = {5.f, 0.5f, 0.f};
+    other.halfExtents = {1.f, 1.f, 1.f};
+    other.friction = 0.3f;
+    other.mass = 0.f;
+    const BodyHandle otherId = world.CreateBody(other).value_or(kInvalidBody);
+
+    int failures = 0;
+    auto check = [&failures](bool ok, const char* what, float got, float want) {
+        std::printf("[%s] %s (got %.3f, target %.3f)\n", ok ? "PASS" : "FAIL", what, got, want);
+        if (!ok) ++failures;
+    };
+
+    const float groundMu = world.GetFriction(groundId).value_or(-1.f);
+    const float otherMu = world.GetFriction(otherId).value_or(-1.f);
+    check(std::fabs(groundMu - 0.75f) < 1e-4f, "friction: ground mu", groundMu, 0.75f);
+    check(std::fabs(otherMu - 0.3f) < 1e-4f, "friction: body mu", otherMu, 0.3f);
+
+    const float mixed = world.GetContactFriction(groundId, otherId).value_or(-1.f);
+    const float wantMixed = MixFriction(0.75f, 0.3f);
+    check(std::fabs(mixed - wantMixed) < 1e-4f, "friction: contact mix", mixed, wantMixed);
+
+    // Runtime set: native backends write through; nudge updates the query
+    // cache only (no NativeSetFriction). Both must change GetFriction.
+    (void)world.SetFriction(otherId, 0.55f);
+    const float afterSet = world.GetFriction(otherId).value_or(-1.f);
+    check(std::fabs(afterSet - 0.55f) < 1e-4f, "friction: set/get", afterSet, 0.55f);
+
+    const RayHit hit = world.Raycast({0.f, 5.f, 0.f}, {0.f, -1.f, 0.f}, 20.f, kInvalidBody);
+    check(hit.hit, "raycast: hits ground", hit.hit ? 1.f : 0.f, 1.f);
+    check(std::fabs(hit.friction - 0.75f) < 1e-4f, "raycast: surface friction", hit.friction,
+          0.75f);
+    const float mixAfter = MixFriction(world.GetFriction(groundId).value_or(-1.f),
+                                       world.GetFriction(otherId).value_or(-1.f));
+    const float mixWant = MixFriction(0.75f, world.GetFriction(otherId).value_or(-1.f));
+    check(std::fabs(mixAfter - mixWant) < 1e-4f, "friction: mix tracks set",
+          world.GetFriction(otherId).value_or(-1.f), 0.55f);
+
+    return failures;
+}
+
 // Wall slam: a high-speed head-on impact must destroy bodywork. Regression
 // for two bugs at once — "cornering blows half the car off" (impact speed
 // must be the normal closing speed, not the driving speed) and "wall rams
@@ -531,7 +586,7 @@ int RunWallCrashTest(IPhysicsWorld& world) {
     ground.transform.position = {0.f, -1.f, 0.f};
     ground.halfExtents = {2000.f, 1.f, 2000.f};
     ground.friction = 0.8f;
-    world.CreateBody(ground);
+    (void)world.CreateBody(ground);
 
     BodyDesc wall;
     wall.transform.position = {0.f, 1.f, 30.f};
@@ -539,14 +594,14 @@ int RunWallCrashTest(IPhysicsWorld& world) {
     wall.friction = 0.4f;
     wall.restitution = 0.1f;
     wall.userData = SurfaceTag(SurfaceType::Wall);
-    world.CreateBody(wall);
+    (void)world.CreateBody(wall);
 
     VehicleParams params;
     Transform pose;
     pose.position = {0.f, 0.55f, 0.f};
     Vehicle car;
     car.Spawn(world, pose, params);
-    world.SetLinearVelocity(car.Chassis(), {0.f, 0.f, 50.f});  // 180 km/h
+    (void)world.SetLinearVelocity(car.Chassis(), {0.f, 0.f, 50.f});  // 180 km/h
 
     const float dt = 1.f / 240.f;
     int contactEvents = 0;
@@ -586,7 +641,7 @@ int RunSeasonGateTest(IPhysicsWorld& world) {
     ground.transform.position = {0.f, -1.f, 0.f};
     ground.halfExtents = {2000.f, 1.f, 2000.f};
     ground.friction = 0.8f;
-    world.CreateBody(ground);
+    (void)world.CreateBody(ground);
 
     int failures = 0;
     auto check = [&failures](bool ok, const char* what, float got, float want) {
@@ -677,7 +732,7 @@ int RunSeasonGateTest(IPhysicsWorld& world) {
 // player car with scripted input and asserts acceleration, braking, steering
 // and reverse. Exits 0 on success, 1 on failure. No window is created, so it
 // runs on locked sessions and in CI. The full suite runs once per physics
-// backend (qu3e and nudge must both pass it).
+// backend (qu3e, nudge and rush-physics-core must all pass it).
 int RunDriveTestForEngine(Config& config, const char* engine) {
     config.SetString("physics", "engine", engine);
     // Pin the simulation environment: user config (assists / hz / season)
@@ -856,6 +911,12 @@ int RunDriveTestForEngine(Config& config, const char* engine) {
         failures += RunSeasonGateTest(*seasonWorld);
     }
 
+    // 5d) Contact friction + raycast surface mu (native / compat paths).
+    {
+        std::unique_ptr<IPhysicsWorld> frictionWorld = MakeWorld(engine);
+        failures += RunFrictionRaycastTest(*frictionWorld);
+    }
+
     // 6) Menu / settings flow (headless, backend-agnostic).
     failures += RunMenuTest();
 
@@ -874,15 +935,172 @@ int RunDriveTestForEngine(Config& config, const char* engine) {
     return failures;
 }
 
+// Threaded-sim smoke test: the same headless harness, but with the race
+// stages on the sim worker — exercises the intent mailbox, the triple-buffer
+// snapshot handoff and the snapshot HUD path that the inline drive-test can
+// never reach. Wall-clock paced (the worker ticks at real 60 Hz), so guards
+// are timeouts rather than frame counts.
+int RunThreadedSmokeTest(Config& config) {
+    config.SetString("physics", "engine", "qu3e");
+    config.SetString("physics", "hz", "240");
+    config.SetString("assists", "steer", "full");
+    config.SetString("assists", "esc", "full");
+    config.SetString("assists", "tc", "sport");
+    config.SetString("assists", "abs", "sport");
+    config.SetString("season", "drs", "1");
+    config.SetString("season", "active_aero", "0");
+    config.SetString("season", "overtake", "0");
+    config.SetString("race", "cars", "2");
+    config.SetString("race", "autopilot", "false");
+
+    NullBackend backend;
+    if (!backend.Init(1280, 720, "threaded-smoke")) {
+        std::printf("[FAIL] NullBackend init\n");
+        return 1;
+    }
+
+    int failures = 0;
+    auto check = [&failures](bool ok, const char* what, float got, float want) {
+        std::printf("[%s] %s (got %.2f, target %.2f)\n", ok ? "PASS" : "FAIL", what, got, want);
+        if (!ok) ++failures;
+    };
+
+    {
+        Game game(backend, backend, config);
+        game.SetThreadedSim(true);
+        if (!game.Init()) {
+            std::printf("[FAIL] Game init\n");
+            backend.Shutdown();
+            return 1;
+        }
+
+        using clock = std::chrono::steady_clock;
+        // Pump frames for `seconds` of wall time; RenderHUD every frame so
+        // the snapshot-backed HUD path is exercised throughout.
+        auto runWall = [&](double seconds, InputState input) {
+            backend.scripted = input;
+            const auto t0 = clock::now();
+            while (std::chrono::duration<double>(clock::now() - t0).count() < seconds) {
+                backend.BeginFrame();
+                game.Update();
+                game.RenderHUD();
+                backend.EndFrame();
+            }
+        };
+        // Pump until pred() or the wall timeout — the worker owns sim time.
+        auto waitWall = [&](double timeoutSec, InputState input, auto pred) {
+            backend.scripted = input;
+            const auto t0 = clock::now();
+            while (std::chrono::duration<double>(clock::now() - t0).count() < timeoutSec) {
+                backend.BeginFrame();
+                game.Update();
+                game.RenderHUD();
+                backend.EndFrame();
+                if (pred()) return true;
+            }
+            return pred();
+        };
+
+        // 1) Countdown → Racing on the worker (3.5 s sim + slack).
+        const bool reachedRacing =
+            waitWall(10.0, InputState{}, [&] { return game.Phase() == RacePhase::Racing; });
+        check(reachedRacing, "threaded: countdown -> racing", game.Phase() == RacePhase::Racing ? 1.f : 0.f, 1.f);
+
+        // 2) Snapshot handshake: valid, both cars, player is index 0.
+        {
+            const auto snap = game.FrameSnapshot();
+            const bool ok = snap && snap->valid && snap->cars.size() == 2 && snap->cars[0].isPlayer;
+            check(ok, "threaded: snapshot valid with 2 cars", snap && snap->valid ? 1.f : 0.f, 1.f);
+        }
+
+        // 3) Throttle through the mailbox accelerates the car (observed via
+        //    the snapshot — live racers_ belongs to the worker here).
+        const auto snap0 = game.FrameSnapshot();
+        const float v0 = snap0 ? snap0->cars[0].state.speed : 0.f;
+        InputState gas;
+        gas.throttle = 1.f;
+        runWall(2.0, gas);
+        const auto snap1 = game.FrameSnapshot();
+        const float v1 = snap1 ? snap1->cars[0].state.speed : 0.f;
+        check(v1 > v0 + 5.f, "threaded: throttle accelerates via mailbox", v1 - v0, 5.f);
+
+        // 4) One-frame ENTER edge survives the mailbox: restart lands on the
+        //    sim thread and phase drops back to Countdown, then re-arms.
+        InputState enter;
+        enter.restart = true;
+        runWall(0.05, enter);  // one-ish frames with the edge set
+        const bool gotRestart =
+            waitWall(5.0, InputState{}, [&] { return game.Phase() == RacePhase::Countdown; });
+        check(gotRestart, "threaded: restart edge reaches sim", gotRestart ? 1.f : 0.f, 1.f);
+        const bool reRaced =
+            waitWall(10.0, InputState{}, [&] { return game.Phase() == RacePhase::Racing; });
+        check(reRaced, "threaded: countdown -> racing after restart", reRaced ? 1.f : 0.f, 1.f);
+
+        // 5) ESC: pause is written on the main thread; the worker parks and
+        //    the menu stays up (no quit, no crash while joining).
+        InputState esc;
+        esc.pause = true;
+        runWall(0.05, esc);
+        check(game.Phase() == RacePhase::Menu, "threaded: ESC returns to menu",
+              game.Phase() == RacePhase::Menu ? 1.f : 0.f, 1.f);
+        runWall(0.5, InputState{});
+        check(game.Phase() == RacePhase::Menu && !game.WantsQuit(),
+              "threaded: menu stays after ESC", game.Phase() == RacePhase::Menu ? 1.f : 0.f, 1.f);
+
+        // 6) Menu → Race Setup → START on the async build path: the menu
+        //    thread must swap in the background-built world and arm the
+        //    countdown without ever blocking a frame on map IO.
+        auto tap = [&](InputState in) {
+            backend.scripted = in;
+            backend.BeginFrame();
+            game.Update();
+            game.RenderHUD();
+            backend.EndFrame();
+            backend.scripted = InputState{};
+        };
+        InputState select;
+        select.menuSelect = true;
+        tap(select);  // main menu: START RACE → Race Setup
+        check(game.Phase() == RacePhase::RaceSetup, "threaded: menu opens race setup",
+              game.Phase() == RacePhase::RaceSetup ? 1.f : 0.f, 1.f);
+        InputState down;
+        down.menuDown = true;
+        for (int i = 0; i < 4; ++i) tap(down);  // cursor → START RACE row
+        tap(select);                            // BeginRaceLoad
+        check(game.Phase() == RacePhase::RaceSetup, "threaded: build starts async",
+              game.Phase() == RacePhase::RaceSetup ? 1.f : 0.f, 1.f);
+        const bool loadedToCountdown =
+            waitWall(15.0, InputState{}, [&] { return game.Phase() == RacePhase::Countdown; });
+        check(loadedToCountdown, "threaded: async load arms countdown",
+              loadedToCountdown ? 1.f : 0.f, 1.f);
+        const bool rereachedRacing =
+            waitWall(10.0, InputState{}, [&] { return game.Phase() == RacePhase::Racing; });
+        check(rereachedRacing, "threaded: racing after async load", rereachedRacing ? 1.f : 0.f, 1.f);
+        {
+            const auto snap = game.FrameSnapshot();
+            const bool ok = snap && snap->valid && snap->cars.size() == 2;
+            check(ok, "threaded: snapshot valid after async load",
+                  snap && snap->valid ? 1.f : 0.f, 1.f);
+        }
+
+        // Game destructor joins the worker before backend.Shutdown().
+    }
+    backend.Shutdown();
+    std::printf("threaded-smoke: %s (%d failures)\n", failures == 0 ? "OK" : "FAILED", failures);
+    return failures;
+}
+
 int RunDriveTest(Config& config) {
     int failures = 0;
-    for (const char* engine : {"qu3e", "nudge"}) {
+    for (const char* engine : {"qu3e", "nudge", "rpc"}) {
         std::printf("=== physics backend: %s ===\n", engine);
         const auto start = std::chrono::steady_clock::now();
         failures += RunDriveTestForEngine(config, engine);
         const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - start;
         std::printf("drive-test[%s] wall time: %.2f s\n", engine, elapsed.count());
     }
+    std::printf("=== threaded sim smoke ===\n");
+    failures += RunThreadedSmokeTest(config);
     std::printf("drive-test: %s (%d failures)\n", failures == 0 ? "OK" : "FAILED", failures);
     return failures == 0 ? 0 : 1;
 }
@@ -991,7 +1209,7 @@ int main(int argc, char** argv) {
     }
 
     Config config;
-    config.Load(DataPath("config.ini"));
+    config.Load(DataPath("config.rushconf"));
     // Prove the rush-engine link is live (static libs drop unreferenced TUs).
     std::printf("rush-engine %s\n", rush::VersionString());
     // All CLI automation paths (tests, screenshots, scene dumps) skip the menu.
@@ -1020,7 +1238,7 @@ int main(int argc, char** argv) {
     if (bench) {
         // Local config only — never Save, same rule as the test paths.
         int rc = 0;
-        for (const char* engine : {"qu3e", "nudge"}) {
+        for (const char* engine : {"qu3e", "nudge", "rpc"}) {
             rc |= RunBench(config, benchCars, engine, 10.0);
         }
         return rc;
@@ -1088,9 +1306,9 @@ int main(int argc, char** argv) {
     }
 
     // A --shot/--settings run injects automation overrides; saving the config
-    // then would leak autostart=true / settings_qa into the user's config.ini
+    // then would leak autostart=true / settings_qa into the user's config.rushconf
     // and the main menu would silently disappear on the next launch.
-    if (!shotPath && !settingsShot) config.Save(DataPath("config.ini"));
+    if (!shotPath && !settingsShot) config.Save(DataPath("config.rushconf"));
     backend.Shutdown();
     return 0;
 }

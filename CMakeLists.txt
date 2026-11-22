@@ -55,7 +55,6 @@ add_subdirectory(rush-engine)
 add_executable(apex-rush
     src/main.cpp
     src/audio/MiniaudioAudio.cpp
-    src/game/MapData.cpp
     src/game/Track.cpp
     src/game/Game.cpp
 )
@@ -67,6 +66,13 @@ target_link_libraries(apex-rush PRIVATE raylib enet rush::engine)
 # full optimization costs minutes of compile time.
 set_property(SOURCE src/audio/MiniaudioAudio.cpp APPEND PROPERTY COMPILE_OPTIONS
              "$<$<CXX_COMPILER_ID:Clang>:-O1>" "$<$<CXX_COMPILER_ID:MSVC>:/O1>")
+
+# --- Developer tools (mapconv: CSV -> .rushmap) ------------------------------
+# OFF by default; debug-tools preset turns this on. Release never builds tools.
+option(APEX_BUILD_TOOLS "Build developer tools (mapconv)" OFF)
+if(APEX_BUILD_TOOLS)
+    add_subdirectory(tools/mapconv)
+endif()
 
 # --- Tests (ctest --preset release) ------------------------------------------
 enable_testing()

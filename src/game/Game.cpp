@@ -9,7 +9,6 @@
 #include <thread>
 #include <cstring>
 
-#include "game/MapData.h"
 import rush.engine.core;
 import rush.engine.job;
 import rush.engine.physics;
@@ -48,6 +47,57 @@ AssistLevel ParseAssistLevel(const Config& config, const char* key, AssistLevel 
     if (v == "sport" || v == "true" || v == "1") return AssistLevel::Sport;
     if (v == "off" || v == "false" || v == "0") return AssistLevel::Off;
     return fallback;
+}
+
+// Effective aero areas after game rules — damage, DRS, X/Z wing mode and
+// pitch balance. Written into VehicleInput each substep; the engine only
+// integrates q * A into forces and never re-derives these from part health
+// or feature flags (game owns rules, engine owns integration).
+void WriteVehicleAero(Racer& racer) {
+    const VehicleParams& p = racer.vehicle.Params();
+    const VehicleState& s = racer.vehicle.State();
+
+    const float frontH = s.partHealth[static_cast<int>(CarPart::FrontWing)];
+    const float rearH = s.partHealth[static_cast<int>(CarPart::RearWing)];
+    const float sideH = s.partHealth[static_cast<int>(CarPart::Sidepods)];
+    const float floorH = s.partHealth[static_cast<int>(CarPart::Floor)];
+
+    const float floorGain = 0.55f + 0.45f * floorH;
+    const float sideGain = 0.82f + 0.18f * sideH;
+
+    // Pitch shifts aero balance: a nose-down car (braking) moves the center
+    // of pressure forward. Nose-up pitch is positive (body forward.y > 0).
+    const float pitch = std::asin(
+        Clampf(TransformDirection(s.transform, Vec3{0.f, 0.f, 1.f}).y, -1.f, 1.f));
+    const float frontShare =
+        Clampf(p.frontDownforceShare - p.aeroPitchBalance * pitch, 0.30f, 0.58f);
+
+    float frontDfArea = p.downforceArea * frontShare * (0.35f + 0.65f * frontH) * floorGain *
+                        sideGain;
+    float rearDfArea = p.downforceArea * (1.f - frontShare) * (0.30f + 0.70f * rearH) * floorGain *
+                       sideGain;
+    float dragArea =
+        p.dragArea * (1.f + 0.35f * (1.f - sideH) + 0.25f * (1.f - frontH) + 0.30f * (1.f - rearH));
+
+    // 2026 X/Z-mode: X trims both downforce and drag, Z is high downforce.
+    if (s.wingMode == WingMode::XMode) {
+        frontDfArea *= 0.72f;
+        rearDfArea *= 0.78f;
+        dragArea *= 0.80f;
+    }
+
+    // DRS: rear wing flap opens — big drag cut, rear downforce loss. Predict
+    // this step's activation from input + season gates so the areas match
+    // the flags Vehicle::Update is about to latch (no one-substep lag).
+    const bool drsActive = p.drsEnabled && racer.input.drsRequest && racer.input.drsZone;
+    if (drsActive) {
+        dragArea *= 0.74f;
+        rearDfArea *= 0.55f;
+    }
+
+    racer.input.dragArea = dragArea;
+    racer.input.frontDownforceArea = frontDfArea;
+    racer.input.rearDownforceArea = rearDfArea;
 }
 
 const char* AssistLevelName(AssistLevel level) {
@@ -155,23 +205,27 @@ void Game::LoadSettings() {
     seasonOverride_ = config_.GetBool("season", "overtake", false);
 }
 
-void Game::SpawnRacers() {
-    // Large grids (up to 120) so the async bench can stress the sim;
-    // the settings CARS row cycles the same range.
-    const int carCount = std::clamp(config_.GetInt("race", "cars", 4), 1, 120);
-    racers_.resize(static_cast<size_t>(carCount));
+// Fill a fresh racer list from a config snapshot. Static so the async build
+// thread can run it against staging world/track objects without reading any
+// Game members.
+void Game::SpawnRacersInto(std::vector<Racer>& out, const Track& track, IPhysicsWorld& world,
+                           const RaceBuildConfig& cfg) {
+    // Large grids (up to 120) so the async bench can stress the sim; the
+    // settings CARS row cycles the same range.
+    const int carCount = std::clamp(cfg.carCount, 1, 120);
+    out.resize(static_cast<size_t>(carCount));
     for (int i = 0; i < carCount; ++i) {
-        Racer& racer = racers_[static_cast<size_t>(i)];
+        Racer& racer = out[static_cast<size_t>(i)];
         racer.name = (i == 0) ? "YOU" : ("AI " + std::to_string(i));
         racer.isPlayer = (i == 0);
 
         VehicleParams params;
         if (racer.isPlayer) {
             // Difficulty assists only apply to the player's car.
-            params.absLevel = ParseAssistLevel(config_, "abs", DefaultAssistLevel("abs"));
-            params.tcLevel = ParseAssistLevel(config_, "tc", DefaultAssistLevel("tc"));
-            params.escLevel = ParseAssistLevel(config_, "esc", DefaultAssistLevel("esc"));
-            params.steerLevel = ParseAssistLevel(config_, "steer", DefaultAssistLevel("steer"));
+            params.absLevel = cfg.absLevel;
+            params.tcLevel = cfg.tcLevel;
+            params.escLevel = cfg.escLevel;
+            params.steerLevel = cfg.steerLevel;
         } else {
             // AI cars run a fixed assist set so player difficulty settings
             // never change their behavior. Without the counter-steer / yaw
@@ -181,31 +235,54 @@ void Game::SpawnRacers() {
             params.escLevel = AssistLevel::Full;
             params.steerLevel = AssistLevel::Full;
         }
-        params.damageEnabled = config_.GetBool("race", "damage", true);
+        params.damageEnabled = cfg.damage;
         // Season rules apply to every car (player and AI alike).
-        params.drsEnabled = seasonDrs_;
-        params.activeAeroEnabled = seasonAero_;
-        params.overtakeEnabled = seasonOverride_;
+        params.drsEnabled = cfg.seasonDrs;
+        params.activeAeroEnabled = cfg.seasonAero;
+        params.overtakeEnabled = cfg.seasonOverride;
 
         Transform pose;
-        pose.position = track_.StartPosition(i);
-        pose.rotation = track_.StartRotation();
-        racer.vehicle.Spawn(*world_, pose, params, &racer);
+        pose.position = track.StartPosition(i);
+        pose.rotation = track.StartRotation();
+        racer.vehicle.Spawn(world, pose, params, &racer);
     }
 }
 
+Game::RaceBuildConfig Game::MakeRaceBuildConfig() {
+    RaceBuildConfig cfg;
+    cfg.mapName = mapName_;
+    cfg.fixedDt = fixedDt_;
+    cfg.engine = config_.GetString("physics", "engine", "qu3e");
+    cfg.carCount = std::clamp(config_.GetInt("race", "cars", 4), 1, 120);
+    cfg.damage = config_.GetBool("race", "damage", true);
+    cfg.absLevel = ParseAssistLevel(config_, "abs", DefaultAssistLevel("abs"));
+    cfg.tcLevel = ParseAssistLevel(config_, "tc", DefaultAssistLevel("tc"));
+    cfg.escLevel = ParseAssistLevel(config_, "esc", DefaultAssistLevel("esc"));
+    cfg.steerLevel = ParseAssistLevel(config_, "steer", DefaultAssistLevel("steer"));
+    cfg.seasonDrs = seasonDrs_;
+    cfg.seasonAero = seasonAero_;
+    cfg.seasonOverride = seasonOverride_;
+    return cfg;
+}
+
+// Build the selected collision backend: qu3e | nudge | rpc (Rush Physics Core).
+static std::unique_ptr<IPhysicsWorld> MakePhysicsWorld(const std::string& engine, float stepDt) {
+    if (engine == "nudge") return std::make_unique<NudgeWorld>();
+    if (engine == "rpc") return std::make_unique<RushPhysicsCore>(stepDt);
+    return std::make_unique<Qu3eWorld>(stepDt);
+}
+
+void Game::SpawnRacers() { SpawnRacersInto(racers_, track_, *world_, MakeRaceBuildConfig()); }
+
 // (Re)build world, track and grid from the current config — used at boot and
-// whenever the player starts a race from the menu.
+// whenever the player starts a race from the menu (inline / drive-test).
+// Interactive starts go through BeginRaceLoad() instead.
 void Game::StartRace() {
     LoadSettings();
     racers_.clear();
     drsWanted_ = false;
-    // Swap collision backends in-game via [physics] engine (qu3e | nudge).
-    if (config_.GetString("physics", "engine", "qu3e") == "nudge") {
-        world_ = std::make_unique<NudgeWorld>();
-    } else {
-        world_ = std::make_unique<Qu3eWorld>(fixedDt_);
-    }
+    // Swap collision backends in-game via [physics] engine (qu3e | nudge | rpc).
+    world_ = MakePhysicsWorld(config_.GetString("physics", "engine", "qu3e"), fixedDt_);
     world_->SetGravity({0.f, -9.81f, 0.f});
     BuildWorld();
     SpawnRacers();
@@ -215,7 +292,79 @@ void Game::StartRace() {
     accumulator_ = 0.f;
 }
 
-Game::~Game() { StopSimWorker(); }
+// Interactive race start: LoadSettings runs here (renderer/audio are main-
+// thread only), then the heavy build — map IO, collision, grid spawn — runs
+// on a background thread. The menu keeps rendering; PollRaceLoad() swaps the
+// result in when it's ready. Inline modes call StartRace() directly.
+void Game::BeginRaceLoad() {
+    LoadSettings();
+    const RaceBuildConfig cfg = MakeRaceBuildConfig();
+
+    loadCancelled_.store(false, std::memory_order_release);
+    loadDone_.store(false, std::memory_order_release);
+    loadThread_ = std::thread([this, cfg] {
+        auto built = std::make_unique<RaceBuildResult>();
+        built->world = MakePhysicsWorld(cfg.engine, cfg.fixedDt);
+        built->world->SetGravity({0.f, -9.81f, 0.f});
+        if (loadCancelled_.load(std::memory_order_acquire)) {
+            loadDone_.store(true, std::memory_order_release);
+            return;
+        }
+        built->map = LoadMapData(DataPath("assets/maps"), cfg.mapName);
+        built->track.BuildOffline(built->map, *built->world);
+        if (loadCancelled_.load(std::memory_order_acquire)) {
+            loadDone_.store(true, std::memory_order_release);
+            return;
+        }
+        SpawnRacersInto(built->racers, built->track, *built->world, cfg);
+        pending_ = std::move(built);
+        loadDone_.store(true, std::memory_order_release);
+    });
+}
+
+void Game::PollRaceLoad() {
+    if (!loadThread_.joinable() || !loadDone_.load(std::memory_order_acquire)) return;
+    loadThread_.join();
+    if (loadCancelled_.load(std::memory_order_acquire)) {
+        pending_.reset();
+        return;
+    }
+    if (pending_) {
+        FinishRaceLoad();
+    } else {
+        // Build bailed without a result (defensive): fall back to the
+        // synchronous path so START never deadlocks in RaceSetup.
+        StartRace();
+    }
+    pending_.reset();
+}
+
+void Game::FinishRaceLoad() {
+    // Main thread, sim worker parked (phase is still RaceSetup).
+    racers_.clear();  // vehicles drop their world refs before the world dies
+    track_.Dispose(renderer_);
+    world_ = std::move(pending_->world);
+    track_ = std::move(pending_->track);
+    track_.BuildMeshes(pending_->map, renderer_);
+    racers_ = std::move(pending_->racers);
+    drsWanted_ = false;
+    phase_ = RacePhase::Countdown;
+    phaseTimer_ = 3.5f;
+    raceClock_ = 0.f;
+    accumulator_ = 0.f;
+}
+
+void Game::CancelRaceLoad() {
+    if (!loadThread_.joinable()) return;
+    loadCancelled_.store(true, std::memory_order_release);
+    loadThread_.join();
+    pending_.reset();
+}
+
+Game::~Game() {
+    StopSimWorker();
+    CancelRaceLoad();
+}
 
 void Game::BuildWorld() {
     const MapData map = LoadMapData(DataPath("assets/maps"), mapName_);
@@ -227,16 +376,26 @@ void Game::Update() {
     const float frameDt = std::min(renderer_.FrameTime(), 0.1f);
 
     UpdatePlayerInput();
+    // Apply a finished async race build before dispatch — may flip
+    // RaceSetup → Countdown so this frame already starts the sim worker.
+    PollRaceLoad();
 
-    const bool menuPhase = phase_ == RacePhase::Menu || phase_ == RacePhase::Settings ||
-                           phase_ == RacePhase::RaceSetup;
+    // Single load: phase_ is written by both threads (pause vs. race rules),
+    // so read it once per frame for consistent dispatch.
+    const RacePhase ph = phase_;
+    const bool menuPhase =
+        ph == RacePhase::Menu || ph == RacePhase::Settings || ph == RacePhase::RaceSetup;
 
     if (menuPhase) {
         // Menus always own the caller thread; park the sim worker.
         StopSimWorker();
-        if (phase_ == RacePhase::Menu) {
+        // Decay the status line here too — the sim-owned decrement in
+        // UpdateSim doesn't run while parked, and a stale "car reset"
+        // message must not survive into the next race's HUD.
+        if (statusTimer_ > 0.f) statusTimer_ -= frameDt;
+        if (ph == RacePhase::Menu) {
             UpdateMenu();
-        } else if (phase_ == RacePhase::Settings) {
+        } else if (ph == RacePhase::Settings) {
             UpdateSettings();
         } else {
             UpdateRaceSetup();
@@ -245,7 +404,7 @@ void Game::Update() {
         // Race on the worker: main only feeds input + camera/audio from this
         // frame's snapshot copy. UpdateSim runs on simWorker_.
         if (!simWorker_.Running()) StartSimWorker();
-        // Take ONE stable copy per frame — Render3D and audio/camera below
+        // Take ONE stable handle per frame — Render3D and audio/camera below
         // must not observe a Publish that lands mid-draw (position flicker).
         frameSnap_ = snapshots_.CopyFront();
     } else {
@@ -253,16 +412,15 @@ void Game::Update() {
     }
 
     if (threadedSim_ && !menuPhase && simWorker_.Running()) {
-        // Main-thread half of the race frame: camera + status + audio from
-        // the frame snapshot (never touches racers_ while the worker owns them).
-        const RaceSnapshot& snap = frameSnap_;
-        if (snap.valid && !snap.cars.empty()) {
-            const VehicleState& s = snap.cars[0].state;
+        // Main-thread half of the race frame: camera + audio from the frame
+        // snapshot (never touches racers_ while the worker owns them).
+        // statusTimer_ is sim-owned and decremented in UpdateSim.
+        if (frameSnap_ && frameSnap_->valid && !frameSnap_->cars.empty()) {
+            const VehicleState& s = frameSnap_->cars[0].state;
             UpdateCameraFrom(s, frameDt);
         }
-        if (statusTimer_ > 0.f) statusTimer_ -= frameDt;
-        if (audio_ && snap.valid && !snap.cars.empty()) {
-            const VehicleState& s = snap.cars[0].state;
+        if (audio_ && frameSnap_ && frameSnap_->valid && !frameSnap_->cars.empty()) {
+            const VehicleState& s = frameSnap_->cars[0].state;
             AudioState audioState;
             audioState.engineRpm = s.rpm;
             audioState.engineLoad = s.throttle;
@@ -277,7 +435,6 @@ void Game::Update() {
         }
     } else {
         UpdateCamera(frameDt);
-        if (statusTimer_ > 0.f) statusTimer_ -= frameDt;
 
         if (audio_ && !racers_.empty()) {
             const VehicleState& s = racers_.front().vehicle.State();
@@ -302,6 +459,11 @@ void Game::Update() {
 }
 
 void Game::UpdateSim(float frameDt) {
+    // Latch the player mailbox before anything reads player.input — mapping,
+    // DRS zone latching, autopilot and restart all run on this thread so
+    // they never race the sim worker's view of racers_.
+    ApplyPlayerIntent();
+
     // Data-parallel AI: each car only writes its own VehicleInput.
     if (benchOn_) {
         const BenchClock::time_point t0 = BenchClock::now();
@@ -335,8 +497,11 @@ void Game::UpdateSim(float frameDt) {
         UpdateRace(frameDt);
     }
 
+    // Status line clock is sim-owned (UpdateRace may arm it for a reset).
+    if (statusTimer_ > 0.f) statusTimer_ -= frameDt;
+
     // Inline mode draws straight from racers_ — only the async path needs
-    // a published snapshot (and pays the copy cost).
+    // a published snapshot.
     if (threadedSim_) PublishSnapshot();
 }
 
@@ -345,10 +510,14 @@ void Game::PublishSnapshot() {
     snap.cars.resize(racers_.size());
     snap.phase = phase_;
     snap.raceClock = raceClock_;
+    snap.phaseTimer = phaseTimer_;
+    snap.statusText = statusText_;
+    snap.statusTimer = statusTimer_;
     for (std::size_t i = 0; i < racers_.size(); ++i) {
         Racer& racer = racers_[i];
         CarPose& pose = snap.cars[i];
         pose.chassis = world_ ? world_->GetTransform(racer.vehicle.Chassis())
+                                       .value_or(racer.vehicle.State().transform)
                               : racer.vehicle.State().transform;
         pose.state = racer.vehicle.State();
         pose.state.transform = pose.chassis;
@@ -356,6 +525,11 @@ void Game::PublishSnapshot() {
         pose.isPlayer = racer.isPlayer;
         pose.tint = racer.isPlayer ? Color{0.15f, 0.55f, 1.f, 1.f}
                                    : Color{0.9f, 0.45f, 0.12f, 1.f};
+        pose.lap = racer.lap;
+        pose.position = racer.position;
+        pose.lastLapTime = racer.lastLapTime;
+        pose.bestLapTime = racer.bestLapTime;
+        pose.raceTime = racer.raceTime;
     }
     snap.valid = true;
     snap.publishTime = std::chrono::duration<double>(
@@ -419,10 +593,11 @@ void Game::Render3D() {
         // already smooths; without this, all cars step together on each
         // Publish and the pack "vibrates" against the camera (worst at launch).
         const float ahead =
-            frameSnap_.valid ? Clampf(static_cast<float>(now - frameSnap_.publishTime), 0.f, 0.05f)
-                             : 0.f;
-        for (std::size_t i = 0; i < frameSnap_.cars.size(); ++i) {
-            const CarPose& pose = frameSnap_.cars[i];
+            frameSnap_ && frameSnap_->valid
+                ? Clampf(static_cast<float>(now - frameSnap_->publishTime), 0.f, 0.05f)
+                : 0.f;
+        for (std::size_t i = 0; frameSnap_ && i < frameSnap_->cars.size(); ++i) {
+            const CarPose& pose = frameSnap_->cars[i];
             Transform drawT = pose.chassis;
             drawT.position += pose.state.velocity * ahead;
             Vehicle::RenderPose(renderer_, drawT, pose.state, pose.params, pose.tint);
@@ -437,41 +612,71 @@ void Game::Render3D() {
 }
 
 void Game::UpdatePlayerInput() {
-    if (racers_.empty()) return;
-    Racer& player = racers_.front();
-
     rawInput_ = input_.Poll();
     const InputState& raw = rawInput_;
 
     // Menus own their input (UpdateMenu / UpdateSettings / UpdateRaceSetup);
-    // cars stay parked.
-    if (phase_ == RacePhase::Menu || phase_ == RacePhase::Settings ||
-        phase_ == RacePhase::RaceSetup) {
-        player.input = VehicleInput{};
+    // cars stay parked and the sim worker is (or will be) stopped.
+    const RacePhase ph = phase_;
+    if (ph == RacePhase::Menu || ph == RacePhase::Settings || ph == RacePhase::RaceSetup) {
+        std::lock_guard lock(intentMutex_);
+        intent_ = PlayerIntent{};
         return;
     }
 
     if (raw.cameraCycle) cameraMode_ = (cameraMode_ + 1) % 4;
 
-    // ESC/P drops back to the menu from any race phase.
+    // ESC/P drops back to the menu from any race phase. phase_ is atomic and
+    // this is the only main-thread write during a race — the worker observes
+    // it and parks without the main thread ever touching racers_ here.
     if (raw.pause) {
         phase_ = RacePhase::Menu;
         menuCursor_ = 0;
-        player.input = VehicleInput{};
+        std::lock_guard lock(intentMutex_);
+        intent_ = PlayerIntent{};
         return;
     }
 
+    // Everything that reads or writes racers_ (device→car mapping, DRS zone
+    // probe, autopilot, restart) runs on the sim thread via this mailbox —
+    // the worker may be stepping the player's car right now.
+    std::lock_guard lock(intentMutex_);
+    intent_.raw = raw;
+    intent_.autopilot = config_.GetBool("race", "autopilot", false);
+    // Edge requests are set-only here; ApplyPlayerIntent clears them after
+    // consumption so one-frame key edges survive any render/sim rate gap.
+    if (raw.restart) intent_.restart = true;
+    if (raw.drsToggle) intent_.drsToggle = true;
+    if (raw.wingModeToggle) intent_.wingToggle = true;
+}
+
+void Game::ApplyPlayerIntent() {
+    PlayerIntent it;
+    {
+        std::lock_guard lock(intentMutex_);
+        it = intent_;
+        intent_.restart = false;
+        intent_.drsToggle = false;
+        intent_.wingToggle = false;
+    }
+
+    if (racers_.empty()) return;
+    Racer& player = racers_.front();
+
+    // --- Input mapping (phase as of this sim tick).
     if (phase_ == RacePhase::Racing && !player.finished) {
+        const InputState& raw = it.raw;
         // DRS: F only arms/disarms inside a map-marked zone (authored on
         // straights), and only when the season enables DRS. Leaving the
         // zone closes DRS and resets the latch, so re-entering a zone later
-        // starts closed — the driver must re-arm.
+        // starts closed — the driver must re-arm. The zone probe needs the
+        // car's position, which only the sim thread may read mid-race.
         const float playerD =
             track_.ProjectDistance(player.vehicle.State().transform.position);
         const bool inDrsZone = track_.InDrsZone(playerD);
         if (!inDrsZone) {
             drsWanted_ = false;
-        } else if (raw.drsToggle && seasonDrs_) {
+        } else if (it.drsToggle && seasonDrs_) {
             drsWanted_ = !drsWanted_;
         }
         player.input.throttle = raw.throttle;
@@ -483,7 +688,7 @@ void Game::UpdatePlayerInput() {
         player.input.drsRequest = drsWanted_;
         // 2026 systems are gated by the season — the keys do nothing in
         // classic rules (and the HUD hides their hints).
-        player.input.wingToggle = raw.wingModeToggle && seasonAero_;
+        player.input.wingToggle = it.wingToggle && seasonAero_;
         player.input.overtake = raw.overtake && seasonOverride_;
     } else if (phase_ == RacePhase::Countdown) {
         player.input = VehicleInput{};
@@ -492,7 +697,8 @@ void Game::UpdatePlayerInput() {
         player.input.brake = 0.8f;
     }
 
-    if (raw.restart) {
+    // ENTER restarts: reset the whole grid back to the countdown.
+    if (it.restart) {
         for (Racer& racer : racers_) {
             const Transform pose{track_.StartPosition(racer.isPlayer ? 0 : 1),
                                  track_.StartRotation()};
@@ -509,8 +715,7 @@ void Game::UpdatePlayerInput() {
 
     // AI 代驾 (autopilot): the player car drives itself — demo mode and the
     // AI regression harness ([race] autopilot=true).
-    if (config_.GetBool("race", "autopilot", false) && phase_ == RacePhase::Racing &&
-        !player.finished) {
+    if (it.autopilot && phase_ == RacePhase::Racing && !player.finished) {
         player.input = VehicleInput{};
         UpdateAI(player, 0.f);
     }
@@ -628,10 +833,13 @@ void Game::StepPhysics(float dt) {
 
     BenchClock::time_point t = b ? BenchClock::now() : BenchClock::time_point{};
     // Vehicle::Update raycasts and applies forces on the shared IPhysicsWorld
-    // — the collision backends are not thread-safe, so this batch stays
-    // serial until the engine owns multi-island stepping (future physics
-    // customization). AI above is pure state→input and is safe to split.
+    // — backends are not thread-safe, so this batch stays serial. Parallel
+    // vehicle substeps are an L2 concern only (never inside rpc*/qu3e/nudge).
+    // AI above is pure state→input and is safe to split.
+    // Aero areas are game rules (damage / DRS / wing mode / pitch): write
+    // them into the input each substep so the engine only applies forces.
     for (Racer& racer : racers_) {
+        WriteVehicleAero(racer);
         racer.vehicle.Update(racer.input, dt);
     }
     if (b) {
@@ -831,21 +1039,41 @@ void Game::RenderHUD() {
         return;
     }
     if (racers_.empty()) return;
-    const Racer& player = racers_.front();
-    const VehicleState& state = player.vehicle.State();
+
+    // Race HUD fields: while the sim worker owns racers_, every sim-written
+    // field (position, lap times, clocks, status line) comes from this
+    // frame's snapshot taken in Update(); inline mode reads the live
+    // members on this same thread.
+    const bool snapHud = threadedSim_ && simWorker_.Running() && frameSnap_ &&
+                         frameSnap_->valid && !frameSnap_->cars.empty();
+    const VehicleState& state =
+        snapHud ? frameSnap_->cars[0].state : racers_.front().vehicle.State();
+    const int position = snapHud ? frameSnap_->cars[0].position : racers_.front().position;
+    const int lap = snapHud ? frameSnap_->cars[0].lap : racers_.front().lap;
+    const float lastLapTime =
+        snapHud ? frameSnap_->cars[0].lastLapTime : racers_.front().lastLapTime;
+    const float bestLapTime =
+        snapHud ? frameSnap_->cars[0].bestLapTime : racers_.front().bestLapTime;
+    const float raceTime = snapHud ? frameSnap_->cars[0].raceTime : racers_.front().raceTime;
+    const float raceClock = snapHud ? frameSnap_->raceClock : raceClock_;
+    const float phaseTimer = snapHud ? frameSnap_->phaseTimer : phaseTimer_;
+    const float statusTimer = snapHud ? frameSnap_->statusTimer : statusTimer_;
+    const std::string& statusText = snapHud ? frameSnap_->statusText : statusText_;
+    const int carCount =
+        snapHud ? static_cast<int>(frameSnap_->cars.size()) : static_cast<int>(racers_.size());
 
     const float w = static_cast<float>(renderer_.ScreenWidth());
     const float h = static_cast<float>(renderer_.ScreenHeight());
 
     // Top-left: position + lap.
     char buffer[128];
-    std::snprintf(buffer, sizeof(buffer), "P%d/%d   LAP %d/%d", player.position,
-                  static_cast<int>(racers_.size()), std::min(player.lap + 1, totalLaps_), totalLaps_);
+    std::snprintf(buffer, sizeof(buffer), "P%d/%d   LAP %d/%d", position, carCount,
+                  std::min(lap + 1, totalLaps_), totalLaps_);
     renderer_.DrawRect2D(10.f, 10.f, 340.f, 92.f, Color{0.f, 0.f, 0.f, 0.45f});
     renderer_.DrawText2D(buffer, 22.f, 18.f, 22, Color::White());
-    renderer_.DrawText2D("TIME  " + FormatTime(raceClock_), 22.f, 46.f, 18, Color::Gray());
-    renderer_.DrawText2D("LAST  " + FormatTime(player.lastLapTime) + "   BEST " +
-                             FormatTime(player.bestLapTime),
+    renderer_.DrawText2D("TIME  " + FormatTime(raceClock), 22.f, 46.f, 18, Color::Gray());
+    renderer_.DrawText2D("LAST  " + FormatTime(lastLapTime) + "   BEST " +
+                             FormatTime(bestLapTime),
                          22.f, 70.f, 18, Color::Yellow());
 
     // Bottom-right: speed + gear + rpm bar.
@@ -905,7 +1133,7 @@ void Game::RenderHUD() {
 
     // Phase overlays.
     if (phase_ == RacePhase::Countdown) {
-        const int count = std::min(3, static_cast<int>(std::ceil(phaseTimer_ - 0.5f)));
+        const int count = std::min(3, static_cast<int>(std::ceil(phaseTimer - 0.5f)));
         renderer_.DrawRect2D(w * 0.5f - 70.f, h * 0.5f - 70.f, 140.f, 140.f, Color{0.f, 0.f, 0.f, 0.5f});
         if (count > 0) {
             std::snprintf(buffer, sizeof(buffer), "%d", count);
@@ -916,16 +1144,16 @@ void Game::RenderHUD() {
     } else if (phase_ == RacePhase::Finished) {
         renderer_.DrawRect2D(w * 0.5f - 220.f, h * 0.5f - 90.f, 440.f, 180.f, Color{0.f, 0.f, 0.f, 0.6f});
         renderer_.DrawText2D("RACE FINISHED", w * 0.5f - 150.f, h * 0.5f - 60.f, 36, Color::White());
-        std::snprintf(buffer, sizeof(buffer), "P%d   TIME %s   BEST %s", player.position,
-                      FormatTime(player.raceTime > 0.f ? player.raceTime : raceClock_).c_str(),
-                      FormatTime(player.bestLapTime).c_str());
+        std::snprintf(buffer, sizeof(buffer), "P%d   TIME %s   BEST %s", position,
+                      FormatTime(raceTime > 0.f ? raceTime : raceClock).c_str(),
+                      FormatTime(bestLapTime).c_str());
         renderer_.DrawText2D(buffer, w * 0.5f - 190.f, h * 0.5f - 8.f, 22, Color::Yellow());
         renderer_.DrawText2D("ENTER = RESTART    ESC = MENU", w * 0.5f - 190.f, h * 0.5f + 40.f, 20,
                              Color::Gray());
     }
 
-    if (statusTimer_ > 0.f && !statusText_.empty()) {
-        renderer_.DrawText2D(statusText_, w * 0.5f - 80.f, h - 200.f, 22, Color::Orange());
+    if (statusTimer > 0.f && !statusText.empty()) {
+        renderer_.DrawText2D(statusText, w * 0.5f - 80.f, h - 200.f, 22, Color::Orange());
     }
 
     // Help line lists only the keys this season actually wires up.
@@ -973,7 +1201,7 @@ void Game::UpdateSettings() {
     if (in.menuDown) settingsCursor_ = (settingsCursor_ + 1) % kRows;
 
     auto backToMenu = [this]() {
-        config_.Save(DataPath("config.ini"));
+        config_.Save(DataPath("config.rushconf"));
         phase_ = RacePhase::Menu;
         menuCursor_ = 0;
     };
@@ -1084,11 +1312,19 @@ void Game::UpdateSettings() {
             break;
         }
         case 13: {
-            // Collision backend swap (qu3e | nudge) — rebuilt on next race.
-            const bool nudge = config_.GetString("physics", "engine", "qu3e") == "nudge";
-            config_.SetString("physics", "engine",
-                              (dir != 0) ? (dir > 0 ? "nudge" : "qu3e")
-                                         : (nudge ? "qu3e" : "nudge"));
+            // Collision backend swap (qu3e | nudge | rpc) — rebuilt on next race.
+            static const char* kEngines[3] = {"qu3e", "nudge", "rpc"};
+            const std::string cur = config_.GetString("physics", "engine", "qu3e");
+            int idx = 0;
+            for (int i = 0; i < 3; ++i) {
+                if (cur == kEngines[i]) idx = i;
+            }
+            if (dir != 0) {
+                idx = (idx + (dir > 0 ? 1 : 2)) % 3;
+            } else {
+                idx = (idx + 1) % 3;
+            }
+            config_.SetString("physics", "engine", kEngines[idx]);
             break;
         }
         case 14: {
@@ -1117,6 +1353,19 @@ void Game::UpdateSettings() {
 void Game::UpdateRaceSetup() {
     constexpr int kRows = kRaceSetupRowCount;
     const InputState& in = rawInput_;
+
+    // Async build in flight: freeze the screen (RenderRaceSetup shows
+    // LOADING); only BACK cancels — the join waits out the build stages.
+    if (loadThread_.joinable()) {
+        if (in.menuBack) {
+            CancelRaceLoad();
+            config_.Save(DataPath("config.rushconf"));
+            phase_ = RacePhase::Menu;
+            menuCursor_ = 0;
+        }
+        return;
+    }
+
     if (audio_ && (in.menuUp || in.menuDown || in.menuLeft || in.menuRight || in.menuSelect)) {
         audio_->PlayUIClick();
     }
@@ -1124,7 +1373,7 @@ void Game::UpdateRaceSetup() {
     if (in.menuDown) raceSetupCursor_ = (raceSetupCursor_ + 1) % kRows;
 
     if (in.menuBack) {
-        config_.Save(DataPath("config.ini"));
+        config_.Save(DataPath("config.rushconf"));
         phase_ = RacePhase::Menu;
         menuCursor_ = 0;
         return;
@@ -1164,13 +1413,17 @@ void Game::UpdateRaceSetup() {
         }
         case 4: {
             // START
-            config_.Save(DataPath("config.ini"));
-            StartRace();
+            config_.Save(DataPath("config.rushconf"));
+            if (threadedSim_) {
+                BeginRaceLoad();  // menu keeps rendering; PollRaceLoad swaps in
+            } else {
+                StartRace();  // inline / drive-test / WASM: deterministic
+            }
             break;
         }
         default: {
             // BACK
-            config_.Save(DataPath("config.ini"));
+            config_.Save(DataPath("config.rushconf"));
             phase_ = RacePhase::Menu;
             menuCursor_ = 0;
             break;
@@ -1283,6 +1536,20 @@ void Game::RenderRaceSetup() {
     const std::string title = "RACE SETUP";
     const Vec2f titleSize = renderer_.MeasureText2D(title, 42);
     renderer_.DrawText2D(title, w * 0.5f - titleSize.x * 0.5f, h * 0.18f, 42, Color::White());
+
+    // Async build in flight: the rows are frozen (input is gated in
+    // UpdateRaceSetup) — show progress instead of a dead-looking menu.
+    if (loadThread_.joinable()) {
+        const std::string loading = "LOADING...";
+        const Vec2f loadSize = renderer_.MeasureText2D(loading, 36);
+        renderer_.DrawText2D(loading, w * 0.5f - loadSize.x * 0.5f, h * 0.48f, 36,
+                             Color::Orange());
+        const std::string cancelHint = "ESC TO CANCEL";
+        const Vec2f cancelSize = renderer_.MeasureText2D(cancelHint, 18);
+        renderer_.DrawText2D(cancelHint, w * 0.5f - cancelSize.x * 0.5f, h - 52.f, 18,
+                             Color::Gray());
+        return;
+    }
 
     struct Row {
         const char* label;

@@ -2,7 +2,9 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "audio/IAudio.h"
@@ -95,6 +97,13 @@ public:
         VehicleParams params;
         bool isPlayer = false;
         Color tint{1.f, 1.f, 1.f, 1.f};
+        // Race statistics — HUD reads these from the snapshot while the sim
+        // worker owns racers_ (position/lap/… are written by the sim).
+        int lap = 0;
+        int position = 1;
+        float lastLapTime = 0.f;
+        float bestLapTime = 0.f;
+        float raceTime = 0.f;
     };
     struct RaceSnapshot {
         std::vector<CarPose> cars;
@@ -105,16 +114,64 @@ public:
         // cars move continuously between snapshot ticks (camera is smoothed;
         // discrete car steps showed up as synchronized "all cars flash").
         double publishTime = 0.0;
+        // Countdown overlay + transient status line ("AI 3 reset") — both
+        // sim-owned; the HUD must not read the live members mid-step.
+        float phaseTimer = 0.f;
+        std::string statusText;
+        float statusTimer = 0.f;
     };
     void SetThreadedSim(bool on);
     bool ThreadedSim() const { return threadedSim_; }
+    // Last snapshot taken by Update() on the main thread. Null before the
+    // first race frame. Tests must read this instead of Racers()/PlayerState()
+    // while the sim worker is running — those are live racers_ views.
+    std::shared_ptr<const RaceSnapshot> FrameSnapshot() const { return frameSnap_; }
 
 private:
+    // Async race build: everything the background thread reads, snapshotted
+    // on the main thread so the worker never touches config_ or renderer_.
+    struct RaceBuildConfig {
+        std::string mapName;
+        float fixedDt = 1.f / 240.f;
+        // [physics] engine: "qu3e" | "nudge" | "rpc" (Rush Physics Core).
+        std::string engine = "qu3e";
+        int carCount = 4;
+        bool damage = true;
+        AssistLevel absLevel = AssistLevel::Sport;
+        AssistLevel tcLevel = AssistLevel::Sport;
+        AssistLevel escLevel = AssistLevel::Full;
+        AssistLevel steerLevel = AssistLevel::Full;
+        bool seasonDrs = true;
+        bool seasonAero = false;
+        bool seasonOverride = false;
+    };
+    // Staging result: built off-thread, applied on the main thread in one
+    // swap (meshes are the only half that needs the renderer).
+    struct RaceBuildResult {
+        std::unique_ptr<IPhysicsWorld> world;
+        Track track;  // offline half only; BuildMeshes runs on main
+        MapData map;
+        std::vector<Racer> racers;
+    };
+
     void BuildWorld();
     void LoadSettings();
     void SpawnRacers();
+    static void SpawnRacersInto(std::vector<Racer>& out, const Track& track,
+                                IPhysicsWorld& world, const RaceBuildConfig& cfg);
+    RaceBuildConfig MakeRaceBuildConfig();
+    // Async path (interactive): snapshot config, spawn the build thread.
+    void BeginRaceLoad();
+    // Join a finished build and swap it in (called once per Update).
+    void PollRaceLoad();
+    void FinishRaceLoad();
+    void CancelRaceLoad();
     void StartRace();
     void UpdatePlayerInput();
+    // Sim-thread half of player control: consumes the intent mailbox
+    // (input mapping, DRS latching, autopilot, restart). Never called on
+    // the main thread while the sim worker is running.
+    void ApplyPlayerIntent();
     void UpdateMenu();
     void UpdateSettings();
     void UpdateRaceSetup();
@@ -143,7 +200,9 @@ private:
     Track track_;
     std::vector<Racer> racers_;
 
-    RacePhase phase_ = RacePhase::Countdown;
+    // Atomic: written by the main thread (pause → Menu) and the sim worker
+    // (countdown → Racing → Finished) while both may be live.
+    std::atomic<RacePhase> phase_{RacePhase::Countdown};
     float phaseTimer_ = 3.5f;
     float raceClock_ = 0.f;
     int totalLaps_ = 3;
@@ -170,8 +229,9 @@ private:
 
     // Latched DRS request: F only arms/disarms inside a map-marked DRS zone;
     // leaving the zone closes DRS and resets the latch, so re-entering a
-    // zone later starts closed (the driver must re-arm).
-    bool drsWanted_ = false;
+    // zone later starts closed (the driver must re-arm). Written on the sim
+    // thread (zone check needs the car's position); read by test hooks.
+    std::atomic<bool> drsWanted_{false};
 
     // Season feature gates ([season] in config): classic (DRS) and 2026
     // (active aero + override) never mix. The settings screen exposes a
@@ -187,17 +247,40 @@ private:
     int settingsCursor_ = 0;
     int raceSetupCursor_ = 0;
 
+    // Main → sim control mailbox. Continuous fields (axes) are overwritten
+    // every main-thread frame; edge requests are set-only by the producer
+    // and cleared by the sim on consume, so a render loop faster than the
+    // sim tick can't swallow a one-frame IsKeyPressed edge.
+    struct PlayerIntent {
+        InputState raw{};
+        bool autopilot = false;
+        bool restart = false;
+        bool drsToggle = false;
+        bool wingToggle = false;
+    };
+    std::mutex intentMutex_;
+    PlayerIntent intent_;
+
     bool benchOn_ = false;
     BenchSample bench_;
 
     // Async sim worker + snapshot handshake (rush.engine.runtime).
     // frameSnap_ is the main thread's once-per-frame CopyFront() — camera,
-    // audio and Render3D all read this so they never mix two sim ticks.
+    // audio, HUD and Render3D all read this so they never mix two sim ticks.
+    // shared_ptr handoff: no per-frame deep copy of the snapshot payload.
     bool threadedSim_ = false;
-    rush::SnapshotDoubleBuffer<RaceSnapshot> snapshots_;
-    RaceSnapshot frameSnap_;
+    rush::SnapshotTripleBuffer<RaceSnapshot> snapshots_;
+    std::shared_ptr<const RaceSnapshot> frameSnap_;
     rush::SimThread simWorker_;
     std::atomic<bool> simRun_{false};
+
+    // Async race build handoff (RaceSetup → Countdown). The worker fills
+    // pending_ then raises loadDone_; the main thread joins before reading
+    // pending_ (join synchronizes the handoff — no payload lock needed).
+    std::thread loadThread_;
+    std::unique_ptr<RaceBuildResult> pending_;
+    std::atomic<bool> loadDone_{false};
+    std::atomic<bool> loadCancelled_{false};
 };
 
 }  // namespace apex

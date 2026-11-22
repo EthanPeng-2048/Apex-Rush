@@ -1,9 +1,9 @@
-﻿#pragma once
+#pragma once
 
 #include <vector>
 
 import rush.engine.core;
-#include "game/MapData.h"
+// MapData is exported by rush.engine.core
 import rush.engine.physics;
 import rush.engine.render;
 
@@ -18,9 +18,19 @@ namespace apex {
 //  - start/finish line and DRS zone ranges expressed as spline arc length
 class Track {
 public:
-    // Build from map data. Safe to call again on an existing track (settings
-    // change): previous meshes are destroyed and body lists cleared first.
+    // Build from map data (synchronous). Safe to call again on an existing
+    // track (settings change): previous meshes are destroyed and body lists
+    // cleared first.
     void Build(const MapData& map, IPhysicsWorld& world, IRenderer& renderer);
+
+    // Thread-safe half: resample + static collision + DRS zones. Touches no
+    // renderer, so a background loader can run it against a private world.
+    // Only valid on a fresh track (or after Dispose) — bodies accumulate.
+    void BuildOffline(const MapData& map, IPhysicsWorld& world);
+
+    // Main-thread half: generate + upload render meshes from a prior
+    // BuildOffline. The renderer is not thread-safe.
+    void BuildMeshes(const MapData& map, IRenderer& renderer);
 
     // Release render meshes (called by Build before rebuilding).
     void Dispose(IRenderer& renderer);

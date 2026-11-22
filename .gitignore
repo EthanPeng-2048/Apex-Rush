@@ -10,6 +10,10 @@ dist/
 *.ilk
 *.log
 config.ini
+config.rushconf
 .playwright-mcp/
 build-web/
 .deps/
+build-tools/
+*.rushmap
+*.rushconf

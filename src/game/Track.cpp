@@ -1,4 +1,4 @@
-﻿#include "game/Track.h"
+#include "game/Track.h"
 
 #include <algorithm>
 #include <vector>
@@ -188,16 +188,22 @@ void Track::Dispose(IRenderer& renderer) {
 
 void Track::Build(const MapData& map, IPhysicsWorld& world, IRenderer& renderer) {
     Dispose(renderer);
+    BuildOffline(map, world);
+    BuildMeshes(map, renderer);
+}
+
+void Track::BuildOffline(const MapData& map, IPhysicsWorld& world) {
     Resample(map, 4.f);
     BuildPhysics(map, world);
-    BuildMesh(map, renderer);
 
-    // DRS activation zones come from map data (zones.csv lap fractions).
+    // DRS activation zones come from map data (map DRS lap fractions).
     // A map without zones.csv has no DRS — never guess a zone.
     for (const MapData::DrsZone& zone : map.drsZones) {
         drsZones_.push_back({zone.start * totalLength_, zone.end * totalLength_});
     }
 }
+
+void Track::BuildMeshes(const MapData& map, IRenderer& renderer) { BuildMesh(map, renderer); }
 
 Vec3 Track::PositionAt(float distance) const {
     if (samples_.empty()) return {};
@@ -283,7 +289,9 @@ void Track::BuildPhysics(const MapData& map, IPhysicsWorld& world) {
     ground.mass = 0.f;
     ground.friction = 0.7f;
     ground.userData = SurfaceTag(SurfaceType::Grass);
-    groundBodies_.push_back(world.CreateBody(ground));
+    if (auto groundId = world.CreateBody(ground)) {
+        groundBodies_.push_back(*groundId);
+    }
 
     // Layered slabs per sample: asphalt, then per-side grass and gravel
     // runoff bands (road edge outward), then the barrier wall. Boxes follow
@@ -302,7 +310,7 @@ void Track::BuildPhysics(const MapData& map, IPhysicsWorld& world) {
         road.friction = 0.9f;
         road.restitution = 0.f;
         road.userData = SurfaceTag(SurfaceType::Road);
-        world.CreateBody(road);
+        (void)world.CreateBody(road);
 
         for (int side = -1; side <= 1; side += 2) {
             const float sgn = static_cast<float>(side);
@@ -319,7 +327,7 @@ void Track::BuildPhysics(const MapData& map, IPhysicsWorld& world) {
                 slab.mass = 0.f;
                 slab.friction = 0.7f;
                 slab.userData = SurfaceTag(SurfaceType::Grass);
-                world.CreateBody(slab);
+                (void)world.CreateBody(slab);
             }
             offset += grass;
 
@@ -332,7 +340,7 @@ void Track::BuildPhysics(const MapData& map, IPhysicsWorld& world) {
                 slab.mass = 0.f;
                 slab.friction = 0.5f;
                 slab.userData = SurfaceTag(SurfaceType::Gravel);
-                world.CreateBody(slab);
+                (void)world.CreateBody(slab);
             }
             offset += gravel;
 
@@ -346,7 +354,9 @@ void Track::BuildPhysics(const MapData& map, IPhysicsWorld& world) {
             wall.friction = 0.55f;
             wall.restitution = 0.12f;
             wall.userData = SurfaceTag(SurfaceType::Wall);
-            wallBodies_.push_back(world.CreateBody(wall));
+            if (auto wallId = world.CreateBody(wall)) {
+                wallBodies_.push_back(*wallId);
+            }
         }
     }
 }

@@ -23,7 +23,7 @@
 | **吞吐** | 251 steps/s | 556 steps/s | **≈2.2×** |
 | 帧率（墙钟） | 31.4 fps | 69.5 fps | **≈2.2×** |
 
-基线时 AI 占 update 的 **61%**——并行化后 AI 只剩 17%，瓶颈回落到 `world.Step`（qu3e 内部，属后续定制物理的范围）。
+基线时 AI 占 update 的 **61%**——并行化后 AI 只剩 17%，瓶颈回落到 `world.Step`（qu3e 内部；RPC 深度定制仅限碰撞，不含车体）。
 
 ## nudge（备选后端）· 100 车
 
@@ -34,13 +34,13 @@
 | vehicle / 子步 | 69.9 ms | 67.2 ms | **仍串行**（IPhysicsWorld 非线程安全） |
 | 墙钟 | 409 s | 377 s | 提升有限 |
 
-nudge 的主成本在逐车 `vehicle.Update`（射线悬挂 + 轮胎）。并行车辆子步需要引擎侧多岛/锁分片，已列为定制物理阶段的工作；届时 nudge 才会真正吃满多核。
+nudge 的主成本在逐车 `vehicle.Update`（射线悬挂 + 轮胎）。并行车辆子步只能在 **L2 游戏/引擎编排**做（分片或与 Step 交错）；**不**下沉进物理库，也无「引擎内置车辆共仿真」规划。
 
 ## 架构层面的性能资产（本轮交付）
 
 1. **`rush.engine.events`**：物理接触只 `Publish`，游戏在独立 stage `Drain`——生产者栈零回调，模块间无阻塞等待。
 2. **`rush.engine.job`**：exstl 线程池封装；`Configure(0)` 串行降级保证 drive-test 确定性。
-3. **`rush.engine.runtime`**：仿真线程 + `SnapshotDoubleBuffer`；实机比赛阶段 sim 与主线程渲染/输入重叠，菜单仍单线程。
+3. **`rush.engine.runtime`**：仿真线程 + `SnapshotTripleBuffer`（三缓冲 shared_ptr：Publish O(1) 指针交换、CopyFront 只付引用计数）；实机比赛阶段 sim 与主线程渲染/输入重叠，菜单仍单线程。
 4. **C++20 named modules**：`import rush.engine.{core,physics,render,events,job,runtime}`。
 
 ## 复现
@@ -60,5 +60,5 @@ build\apex-rush.exe --drive-test   # 双后端 0 failures
 ## 结论
 
 - **百车 qu3e 同步主循环 → 全异步引擎：update 31.8→14.4 ms，墙钟 19.1→8.6 s（≈2.2×），AI 段 7.9×。**
-- 余下大头是 `world.Step`（qu3e）与串行 `vehicle.Update`（nudge）——对应「物理引擎自己定制并行」的下一阶段。
+- 余下大头是 `world.Step`（qu3e/rpc 碰撞）与串行 `vehicle.Update`（L2 车体，永不进 L1）——碰撞并行只动 RPC/qu3e 内核；vehicle 并行只动 L2。
 - 实机路径额外获得 **仿真线程与渲染重叠**（headless bench 不度量该项）。

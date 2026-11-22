@@ -16,13 +16,26 @@
       "name": "release",
       "displayName": "Clang Release (O3 + ThinLTO)",
       "inherits": "clang-base",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "APEX_BUILD_TOOLS": "OFF"
+      }
     },
     {
       "name": "debug",
       "displayName": "Clang Debug",
       "inherits": "clang-base",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "APEX_BUILD_TOOLS": "OFF"
+      }
+    },
+    {
+      "name": "debug-tools",
+      "displayName": "Clang Debug + Tools (game + mapconv)",
+      "inherits": "debug",
+      "binaryDir": "${sourceDir}/build-tools",
+      "cacheVariables": { "APEX_BUILD_TOOLS": "ON" }
     },
     {
       "name": "web",
@@ -30,12 +43,16 @@
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build-web",
       "toolchainFile": "$env{EMSDK}/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "APEX_BUILD_TOOLS": "OFF"
+      }
     }
   ],
   "buildPresets": [
     { "name": "release", "configurePreset": "release", "jobs": 32 },
     { "name": "debug", "configurePreset": "debug", "jobs": 32 },
+    { "name": "debug-tools", "configurePreset": "debug-tools", "jobs": 32 },
     { "name": "web", "configurePreset": "web", "jobs": 32 }
   ],
   "testPresets": [
