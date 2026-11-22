@@ -969,7 +969,6 @@ int main(int argc, char** argv) {
     bool settingsShot = false;
     bool bench = false;
     int benchCars = 16;
-    bool jitterProbe = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--drive-test") == 0) {
             driveTest = true;
@@ -988,8 +987,6 @@ int main(int argc, char** argv) {
                 if (benchCars < 1) benchCars = 1;
                 if (benchCars > 120) benchCars = 120;
             }
-        } else if (std::strcmp(argv[i], "--jitter-probe") == 0) {
-            jitterProbe = true;
         }
     }
 
@@ -997,11 +994,6 @@ int main(int argc, char** argv) {
     config.Load(DataPath("config.ini"));
     // Prove the rush-engine link is live (static libs drop unreferenced TUs).
     std::printf("rush-engine %s\n", rush::VersionString());
-    if (jitterProbe) {
-        rush::JitterProbe::Get().SetLogPath(DataPath("jitter_probe.log"));
-        rush::JitterProbe::Get().SetEnabled(true);
-        std::printf("jitter probe on -> %s\n", DataPath("jitter_probe.log").c_str());
-    }
     // All CLI automation paths (tests, screenshots, scene dumps) skip the menu.
     if ((driveTest || dumpPath || shotPath || bench) && !menuShot && !settingsShot) {
         config.SetString("race", "autostart", "true");

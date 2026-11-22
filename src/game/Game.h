@@ -105,7 +105,6 @@ public:
         // cars move continuously between snapshot ticks (camera is smoothed;
         // discrete car steps showed up as synchronized "all cars flash").
         double publishTime = 0.0;
-        unsigned long long gen = 0;
     };
     void SetThreadedSim(bool on);
     bool ThreadedSim() const { return threadedSim_; }
@@ -197,7 +196,6 @@ private:
     bool threadedSim_ = false;
     rush::SnapshotDoubleBuffer<RaceSnapshot> snapshots_;
     RaceSnapshot frameSnap_;
-    unsigned long long snapGen_ = 0;
     rush::SimThread simWorker_;
     std::atomic<bool> simRun_{false};
 };
