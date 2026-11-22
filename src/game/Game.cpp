@@ -200,6 +200,7 @@ void Game::StartRace() {
     LoadSettings();
     racers_.clear();
     drsWanted_ = false;
+    rush::JitterProbe::Get().ResetHistories();
     // Swap collision backends in-game via [physics] engine (qu3e | nudge).
     if (config_.GetString("physics", "engine", "qu3e") == "nudge") {
         world_ = std::make_unique<NudgeWorld>();
@@ -356,6 +357,9 @@ void Game::PublishSnapshot() {
         pose.isPlayer = racer.isPlayer;
         pose.tint = racer.isPlayer ? Color{0.15f, 0.55f, 1.f, 1.f}
                                    : Color{0.9f, 0.45f, 0.12f, 1.f};
+        // Jitter probe (engine diagnostics): sim-side pose sequence.
+        rush::JitterProbe::Get().Observe("publish", static_cast<int>(i), pose.chassis.position.x,
+                                         pose.chassis.position.z);
     }
     snap.valid = true;
     snapshots_.Publish();
@@ -408,14 +412,21 @@ void Game::Render3D() {
     // Menus / inline mode: worker is stopped (or never started) and the main
     // thread owns racers_ again.
     if (threadedSim_ && simWorker_.Running()) {
-        for (const CarPose& pose : frameSnap_.cars) {
+        for (std::size_t i = 0; i < frameSnap_.cars.size(); ++i) {
+            const CarPose& pose = frameSnap_.cars[i];
+            // Jitter probe: what this frame actually draws.
+            rush::JitterProbe::Get().Observe("render", static_cast<int>(i),
+                                             pose.chassis.position.x, pose.chassis.position.z);
             Vehicle::RenderPose(renderer_, pose.chassis, pose.state, pose.params, pose.tint);
         }
         return;
     }
 
-    for (Racer& racer : racers_) {
+    for (std::size_t i = 0; i < racers_.size(); ++i) {
+        Racer& racer = racers_[i];
         Color tint = racer.isPlayer ? Color{0.15f, 0.55f, 1.f, 1.f} : Color{0.9f, 0.45f, 0.12f, 1.f};
+        const Transform& t = racer.vehicle.State().transform;
+        rush::JitterProbe::Get().Observe("render", static_cast<int>(i), t.position.x, t.position.z);
         racer.vehicle.Render(renderer_, tint);
     }
 }
