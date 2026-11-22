@@ -365,6 +365,12 @@ void Game::PublishSnapshot() {
         if (i == 0) {
             rush::JitterProbe::Get().Trace("pub_player", pose.chassis.position.x,
                                            pose.chassis.position.y, pose.chassis.position.z);
+            // Wheel/shadow inputs: chassis can be smooth while visuals pop.
+            const WheelState& w0 = pose.state.wheels[0];
+            const WheelState& w3 = pose.state.wheels[3];
+            rush::JitterProbe::Get().Trace(
+                "pub_wh", w0.suspensionLength,
+                (w0.grounded ? 1.f : 0.f) + (w3.grounded ? 2.f : 0.f), w0.contactPoint.y);
         }
     }
     snap.valid = true;
@@ -427,6 +433,11 @@ void Game::Render3D() {
             if (i == 0) {
                 rush::JitterProbe::Get().Trace("rnd_player", pose.chassis.position.x,
                                                pose.chassis.position.y, pose.chassis.position.z);
+                const WheelState& w0 = pose.state.wheels[0];
+                const WheelState& w3 = pose.state.wheels[3];
+                rush::JitterProbe::Get().Trace(
+                    "rnd_wh", w0.suspensionLength,
+                    (w0.grounded ? 1.f : 0.f) + (w3.grounded ? 2.f : 0.f), w0.contactPoint.y);
             }
             Vehicle::RenderPose(renderer_, pose.chassis, pose.state, pose.params, pose.tint);
         }
