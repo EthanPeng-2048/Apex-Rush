@@ -187,15 +187,13 @@ private:
     BenchSample bench_;
 
     // Async sim worker + snapshot handshake (rush.engine.runtime).
+    // frameSnap_ is the main thread's once-per-frame CopyFront() — camera,
+    // audio and Render3D all read this so they never mix two sim ticks.
     bool threadedSim_ = false;
     rush::SnapshotDoubleBuffer<RaceSnapshot> snapshots_;
+    RaceSnapshot frameSnap_;
     rush::SimThread simWorker_;
     std::atomic<bool> simRun_{false};
-    // Player input written by the main thread, read by the sim worker.
-    std::atomic<float> asyncThrottle_{0.f};
-    std::atomic<float> asyncBrake_{0.f};
-    std::atomic<float> asyncSteer_{0.f};
-    std::atomic<uint32_t> asyncBits_{0};  // VehicleInput flag bits
 };
 
 }  // namespace apex

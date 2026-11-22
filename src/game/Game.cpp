@@ -242,24 +242,22 @@ void Game::Update() {
             UpdateRaceSetup();
         }
     } else if (threadedSim_) {
-        // Race on the worker: main only feeds input bits + camera/audio from
-        // the published snapshot. UpdateSim runs on simWorker_.
+        // Race on the worker: main only feeds input + camera/audio from this
+        // frame's snapshot copy. UpdateSim runs on simWorker_.
         if (!simWorker_.Running()) StartSimWorker();
-        // Player input is already applied to racers_[0].input by
-        // UpdatePlayerInput (same memory the worker reads — single-writer
-        // after the main thread finishes this call; worker publishes after).
-        // Camera / status / audio consume the latest snapshot below.
+        // Take ONE stable copy per frame — Render3D and audio/camera below
+        // must not observe a Publish that lands mid-draw (position flicker).
+        frameSnap_ = snapshots_.CopyFront();
     } else {
         UpdateSim(frameDt);
     }
 
-    if (threadedSim_ && !menuPhase) {
+    if (threadedSim_ && !menuPhase && simWorker_.Running()) {
         // Main-thread half of the race frame: camera + status + audio from
-        // snapshot (never touches racers_ while the worker owns them).
-        const RaceSnapshot& snap = snapshots_.Front();
+        // the frame snapshot (never touches racers_ while the worker owns them).
+        const RaceSnapshot& snap = frameSnap_;
         if (snap.valid && !snap.cars.empty()) {
             const VehicleState& s = snap.cars[0].state;
-            // Lightweight camera follow using the snapshot player pose.
             UpdateCameraFrom(s, frameDt);
         }
         if (statusTimer_ > 0.f) statusTimer_ -= frameDt;
@@ -405,9 +403,12 @@ void Game::StopSimWorker() {
 void Game::Render3D() {
     track_.Render(renderer_);
 
-    if (threadedSim_) {
-        const RaceSnapshot& snap = snapshots_.Front();
-        for (const CarPose& pose : snap.cars) {
+    // While the sim worker owns racers_, draw only the frame snapshot taken
+    // in Update() — never a live Front() that Publish can retarget mid-loop.
+    // Menus / inline mode: worker is stopped (or never started) and the main
+    // thread owns racers_ again.
+    if (threadedSim_ && simWorker_.Running()) {
+        for (const CarPose& pose : frameSnap_.cars) {
             Vehicle::RenderPose(renderer_, pose.chassis, pose.state, pose.params, pose.tint);
         }
         return;
