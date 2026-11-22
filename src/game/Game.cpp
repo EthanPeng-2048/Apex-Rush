@@ -358,8 +358,14 @@ void Game::PublishSnapshot() {
         pose.tint = racer.isPlayer ? Color{0.15f, 0.55f, 1.f, 1.f}
                                    : Color{0.9f, 0.45f, 0.12f, 1.f};
         // Jitter probe (engine diagnostics): sim-side pose sequence.
+        const Quat& r = pose.chassis.rotation;
         rush::JitterProbe::Get().Observe("publish", static_cast<int>(i), pose.chassis.position.x,
-                                         pose.chassis.position.z);
+                                         pose.chassis.position.y, pose.chassis.position.z, r.x,
+                                         r.y, r.z, r.w);
+        if (i == 0) {
+            rush::JitterProbe::Get().Trace("pub_player", pose.chassis.position.x,
+                                           pose.chassis.position.y, pose.chassis.position.z);
+        }
     }
     snap.valid = true;
     snapshots_.Publish();
@@ -414,9 +420,14 @@ void Game::Render3D() {
     if (threadedSim_ && simWorker_.Running()) {
         for (std::size_t i = 0; i < frameSnap_.cars.size(); ++i) {
             const CarPose& pose = frameSnap_.cars[i];
-            // Jitter probe: what this frame actually draws.
+            const Quat& r = pose.chassis.rotation;
             rush::JitterProbe::Get().Observe("render", static_cast<int>(i),
-                                             pose.chassis.position.x, pose.chassis.position.z);
+                                             pose.chassis.position.x, pose.chassis.position.y,
+                                             pose.chassis.position.z, r.x, r.y, r.z, r.w);
+            if (i == 0) {
+                rush::JitterProbe::Get().Trace("rnd_player", pose.chassis.position.x,
+                                               pose.chassis.position.y, pose.chassis.position.z);
+            }
             Vehicle::RenderPose(renderer_, pose.chassis, pose.state, pose.params, pose.tint);
         }
         return;
@@ -426,7 +437,12 @@ void Game::Render3D() {
         Racer& racer = racers_[i];
         Color tint = racer.isPlayer ? Color{0.15f, 0.55f, 1.f, 1.f} : Color{0.9f, 0.45f, 0.12f, 1.f};
         const Transform& t = racer.vehicle.State().transform;
-        rush::JitterProbe::Get().Observe("render", static_cast<int>(i), t.position.x, t.position.z);
+        const Quat& r = t.rotation;
+        rush::JitterProbe::Get().Observe("render", static_cast<int>(i), t.position.x, t.position.y,
+                                         t.position.z, r.x, r.y, r.z, r.w);
+        if (i == 0) {
+            rush::JitterProbe::Get().Trace("rnd_player", t.position.x, t.position.y, t.position.z);
+        }
         racer.vehicle.Render(renderer_, tint);
     }
 }
