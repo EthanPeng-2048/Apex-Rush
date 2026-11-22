@@ -18,6 +18,7 @@ import rush.engine.job;
 #include "game/Game.h"
 import rush.engine.physics;
 import rush.engine.render;
+import rush.engine.input;
 
 namespace {
 
@@ -29,6 +30,57 @@ std::unique_ptr<IPhysicsWorld> MakeWorld(const char* engine) {
     if (engine && std::strcmp(engine, "rpc") == 0) return std::make_unique<RushPhysicsCore>();
     return std::make_unique<Qu3eWorld>();
 }
+
+// Scripted test input: NullInputSource + InputSystem wired for headless
+// tests. set() translates a semantic InputState (legacy field set) into the
+// raw keys/axes the recognizers consume, so test code keeps its old shape
+// while the game consumes pure InputBus events.
+struct ScriptedInput {
+    NullInputSource source;
+    InputSystem system{source};
+
+    // Discrete flags publish their Click events directly. The legacy tests
+    // treat "press menuDown = true for N frames" as N cursor moves, but a
+    // Click recognizer fires only once per key-down edge. Publishing the
+    // edge event per frame reproduces the old scripted semantics exactly;
+    // Hold actions below still run through the gesture recognizers.
+    void press(const char* name) {
+        InputEvent ev;
+        ev.nameId = InternInputName(std::string(name) + ".click");
+        ev.gesture = Gesture::Click;
+        ev.value = 1.f;
+        ev.tSec = system.Now();
+        InputBus().Publish(ev);
+    }
+
+    void set(const InputState& s) {
+        RawFrame f;
+        f.axes[0] = s.throttle;   // 0..1 analog (keyboard gives 0/1)
+        f.axes[1] = s.brake;
+        f.axes[2] = s.steer;      // -1..1 analog
+        f.keys[static_cast<size_t>(KeyCode::W)] = s.throttle > 0.5f;
+        f.keys[static_cast<size_t>(KeyCode::S)] = s.brake > 0.5f;
+        f.keys[static_cast<size_t>(KeyCode::Space)] = s.handbrake;
+        f.keys[static_cast<size_t>(KeyCode::R)] = s.reverse;
+        f.keys[static_cast<size_t>(KeyCode::LShift)] = s.overtake;
+        f.keys[static_cast<size_t>(KeyCode::B)] = s.lookBack;
+        source.scripted = f;
+
+        // Edge-triggered actions: one event per set() call (old IsKeyPressed
+        // semantics — a press held across frames keeps moving the cursor).
+        if (s.drsToggle) press("drs");
+        if (s.wingModeToggle) press("wing");
+        if (s.cameraCycle) press("camera");
+        if (s.pause) press("pause");
+        if (s.restart) press("restart");
+        if (s.menuUp) press("menu.up");
+        if (s.menuDown) press("menu.down");
+        if (s.menuLeft) press("menu.left");
+        if (s.menuRight) press("menu.right");
+        if (s.menuSelect) press("menu.select");
+        if (s.menuBack) press("menu.back");
+    }
+};
 
 // High-speed steering stability on a bare ground plane. The circuit is a
 // ~120 m radius loop, so any straight run drifts into the wall within ~3 s
@@ -148,12 +200,13 @@ int RunFlatStabilityTest(IPhysicsWorld& world) {
 
 // Menu/settings flow on the headless backend: boots into the menu (no
 // autostart), opens settings, comes back, starts a race — plus a render
-// smoke pass over the menu screens. Uses the real config.rushconf but never
-// changes a value, so the settings save round-trips the user's config.
-// Deliberately backend-agnostic and free of config overrides: leaving the
-// settings screen calls Config::Save, which would persist any override.
+// smoke pass over the menu screens. Test mode is active (Config::SetTestMode),
+// so no config.rushconf is read or written: the settings/race-setup Save
+// calls inside Game become no-ops and can never leak overrides into the
+// user's file. Values not pinned here fall back to code defaults.
 int RunMenuTest() {
     NullBackend backend;
+    ScriptedInput testInput;
     if (!backend.Init(1280, 720, "menu-test")) {
         std::printf("[FAIL] menu-test backend init\n");
         return 1;
@@ -161,7 +214,7 @@ int RunMenuTest() {
 
     Config config;
     config.Load(DataPath("config.rushconf"));
-    Game game(backend, backend, config);
+    Game game(backend, testInput.system, config);
     if (!game.Init()) {
         std::printf("[FAIL] menu-test game init\n");
         return 1;
@@ -174,7 +227,7 @@ int RunMenuTest() {
         if (!ok) ++failures;
     };
     auto frame = [&](InputState in) {
-        backend.scripted = in;
+        testInput.set(in);
         backend.BeginFrame();
         game.Update();
         game.RenderHUD();
@@ -254,6 +307,7 @@ int RunMenuTest() {
 // closed. Regression for "DRS opens anywhere" and "re-entry auto-opens".
 int RunDrsZoneTest(const char* engine) {
     NullBackend backend;
+    ScriptedInput testInput;
     if (!backend.Init(1280, 720, "drs-zone-test")) {
         std::printf("[FAIL] drs-zone-test backend init\n");
         return 1;
@@ -274,7 +328,7 @@ int RunDrsZoneTest(const char* engine) {
     config.SetString("season", "active_aero", "0");
     config.SetString("season", "overtake", "0");
 
-    Game game(backend, backend, config);
+    Game game(backend, testInput.system, config);
     if (!game.Init()) {
         std::printf("[FAIL] drs-zone-test game init\n");
         return 1;
@@ -304,7 +358,7 @@ int RunDrsZoneTest(const char* engine) {
         while (yawErr < -kPi) yawErr += 2.f * kPi;
         const float lateralVel = Dot(s.velocity, right);
         in.steer = Clampf(-yawErr * 1.5f - lateralVel * 0.06f, -1.f, 1.f);
-        backend.scripted = in;
+        testInput.set(in);
         backend.BeginFrame();
         game.Update();
         game.RenderHUD();
@@ -381,6 +435,7 @@ int RunDrsZoneTest(const char* engine) {
 // same AI via [race] autopilot.
 int RunAITest(const char* engine) {
     NullBackend backend;
+    ScriptedInput testInput;
     if (!backend.Init(1280, 720, "ai-test")) {
         std::printf("[FAIL] ai-test backend init\n");
         return 1;
@@ -400,7 +455,7 @@ int RunAITest(const char* engine) {
     config.SetString("assists", "tc", "sport");
     config.SetString("assists", "abs", "sport");
 
-    Game game(backend, backend, config);
+    Game game(backend, testInput.system, config);
     if (!game.Init()) {
         std::printf("[FAIL] ai-test game init\n");
         return 1;
@@ -412,7 +467,7 @@ int RunAITest(const char* engine) {
         if (!ok) ++failures;
     };
     auto frame = [&]() {
-        backend.scripted = InputState{};
+        testInput.set(InputState{});
         backend.BeginFrame();
         game.Update();
         backend.EndFrame();
@@ -461,6 +516,7 @@ int RunAITest(const char* engine) {
 // player assist off the AI must still run its fixed aids and keep racing.
 int RunAIDifficultyIsolationTest(const char* engine) {
     NullBackend backend;
+    ScriptedInput testInput;
     if (!backend.Init(1280, 720, "ai-diff-test")) {
         std::printf("[FAIL] ai-diff-test backend init\n");
         return 1;
@@ -476,7 +532,7 @@ int RunAIDifficultyIsolationTest(const char* engine) {
     config.SetString("assists", "tc", "off");
     config.SetString("assists", "abs", "off");
 
-    Game game(backend, backend, config);
+    Game game(backend, testInput.system, config);
     if (!game.Init()) {
         std::printf("[FAIL] ai-diff-test game init\n");
         return 1;
@@ -504,7 +560,7 @@ int RunAIDifficultyIsolationTest(const char* engine) {
     InputState driveAway;
     driveAway.throttle = 1.f;
     for (int i = 0; i < 720; ++i) {
-        backend.scripted = driveAway;
+        testInput.set(driveAway);
         backend.BeginFrame();
         game.Update();
         backend.EndFrame();
@@ -746,6 +802,7 @@ int RunDriveTestForEngine(Config& config, const char* engine) {
     config.SetString("season", "active_aero", "0");
     config.SetString("season", "overtake", "0");
     NullBackend backend;
+    ScriptedInput testInput;
     if (!backend.Init(1280, 720, "drive-test")) {
         std::printf("[FAIL] NullBackend init\n");
         return 1;
@@ -754,7 +811,7 @@ int RunDriveTestForEngine(Config& config, const char* engine) {
     // Solo run: AI cars would ram the stationary test car and skew the numbers.
     config.SetString("race", "cars", "1");
 
-    Game game(backend, backend, config);
+    Game game(backend, testInput.system, config);
     if (!game.Init()) {
         std::printf("[FAIL] Game init\n");
         return 1;
@@ -768,7 +825,7 @@ int RunDriveTestForEngine(Config& config, const char* engine) {
 
     // The update loop mirrors main: Poll() returns our scripted state.
     auto run = [&](float seconds, InputState input) {
-        backend.scripted = input;
+        testInput.set(input);
         const int frames = static_cast<int>(seconds / backend.frameDt + 0.5f);
         for (int i = 0; i < frames; ++i) {
             backend.BeginFrame();
@@ -954,6 +1011,7 @@ int RunThreadedSmokeTest(Config& config) {
     config.SetString("race", "autopilot", "false");
 
     NullBackend backend;
+    ScriptedInput testInput;
     if (!backend.Init(1280, 720, "threaded-smoke")) {
         std::printf("[FAIL] NullBackend init\n");
         return 1;
@@ -966,7 +1024,7 @@ int RunThreadedSmokeTest(Config& config) {
     };
 
     {
-        Game game(backend, backend, config);
+        Game game(backend, testInput.system, config);
         game.SetThreadedSim(true);
         if (!game.Init()) {
             std::printf("[FAIL] Game init\n");
@@ -978,7 +1036,7 @@ int RunThreadedSmokeTest(Config& config) {
         // Pump frames for `seconds` of wall time; RenderHUD every frame so
         // the snapshot-backed HUD path is exercised throughout.
         auto runWall = [&](double seconds, InputState input) {
-            backend.scripted = input;
+            testInput.set(input);
             const auto t0 = clock::now();
             while (std::chrono::duration<double>(clock::now() - t0).count() < seconds) {
                 backend.BeginFrame();
@@ -989,7 +1047,7 @@ int RunThreadedSmokeTest(Config& config) {
         };
         // Pump until pred() or the wall timeout — the worker owns sim time.
         auto waitWall = [&](double timeoutSec, InputState input, auto pred) {
-            backend.scripted = input;
+            testInput.set(input);
             const auto t0 = clock::now();
             while (std::chrono::duration<double>(clock::now() - t0).count() < timeoutSec) {
                 backend.BeginFrame();
@@ -1051,12 +1109,12 @@ int RunThreadedSmokeTest(Config& config) {
         //    thread must swap in the background-built world and arm the
         //    countdown without ever blocking a frame on map IO.
         auto tap = [&](InputState in) {
-            backend.scripted = in;
+            testInput.set(in);
             backend.BeginFrame();
             game.Update();
             game.RenderHUD();
             backend.EndFrame();
-            backend.scripted = InputState{};
+            testInput.set(InputState{});
         };
         InputState select;
         select.menuSelect = true;
@@ -1090,8 +1148,197 @@ int RunThreadedSmokeTest(Config& config) {
     return failures;
 }
 
+// InputSystem gesture recognizer unit tests: exercises Hold begin/level/end,
+// PressRelease down/up, Click, DoubleClick, LongPress, multi-key OR, and the
+// menu/race context gate — all through the pure InputBus (no callbacks).
+int RunInputTest() {
+    NullInputSource source;
+    InputSystem input(source);
+    InputRegistry& reg = input.Registry();
+    int failures = 0;
+    auto check = [&failures](bool ok, const char* what, float got, float want) {
+        std::printf("[%s] input: %s (got %.2f, target %.2f)\n", ok ? "PASS" : "FAIL", what, got, want);
+        if (!ok) ++failures;
+    };
+    auto key = [](KeyCode k) {
+        DeviceKey d;
+        d.kind = DeviceKind::Keyboard;
+        d.code = static_cast<uint16_t>(k);
+        return d;
+    };
+    std::vector<InputEvent> events;
+    auto drain = [&]() {
+        events.clear();
+        InputBus().Drain(events);
+    };
+    auto names = [&]() {
+        std::vector<std::string> out;
+        for (const InputEvent& e : events) out.push_back(std::string(InputNameOf(e.nameId)));
+        return out;
+    };
+    auto has = [&](const char* n) {
+        for (const InputEvent& e : events)
+            if (InputNameOf(e.nameId) == n) return true;
+        return false;
+    };
+
+    // --- Hold: throttle (W + Up OR) ------------------------------------------
+    reg.Register({.name = "throttle", .gesture = Gesture::Hold,
+                  .keys = {{.key = key(KeyCode::W)}, {.key = key(KeyCode::Up)}},
+                  .context = "race"});
+    reg.Register({.name = "handbrake", .gesture = Gesture::Hold,
+                  .keys = {{.key = key(KeyCode::Space)}}, .context = "race"});
+    reg.Register({.name = "restart", .gesture = Gesture::PressRelease,
+                  .keys = {{.key = key(KeyCode::Enter)}}});
+    reg.Register({.name = "drs", .gesture = Gesture::Click,
+                  .keys = {{.key = key(KeyCode::F)}}, .context = "race"});
+    reg.Register({.name = "select", .gesture = Gesture::DoubleClick,
+                  .keys = {{.key = key(KeyCode::G)}}});
+    reg.Register({.name = "hold", .gesture = Gesture::LongPress,
+                  .keys = {{.key = key(KeyCode::H)}}});
+
+    input.SetActiveContext("race");
+
+    // Hold begin + level on first down.
+    source.scripted = RawFrame{};
+    source.scripted.keys[static_cast<size_t>(KeyCode::W)] = true;
+    input.PumpOnce();
+    drain();
+    check(has("throttle.begin"), "hold: begin fires", has("throttle.begin") ? 1.f : 0.f, 1.f);
+    check(has("throttle.level"), "hold: level fires on down", has("throttle.level") ? 1.f : 0.f, 1.f);
+    check(input.ActionValue("throttle") > 0.9f, "hold: action value while held",
+          input.ActionValue("throttle"), 1.f);
+
+    // Up key also holds (multi-key OR).
+    source.scripted = RawFrame{};
+    source.scripted.keys[static_cast<size_t>(KeyCode::Up)] = true;
+    input.PumpOnce();
+    drain();
+    check(input.ActionValue("throttle") > 0.9f, "hold: OR key holds", input.ActionValue("throttle"), 1.f);
+
+    // Release ends the hold.
+    source.scripted = RawFrame{};
+    input.PumpOnce();
+    drain();
+    check(has("throttle.end"), "hold: end fires on release", has("throttle.end") ? 1.f : 0.f, 1.f);
+    check(input.ActionValue("throttle") < 0.1f, "hold: value clears on release",
+          input.ActionValue("throttle"), 0.f);
+
+    // --- PressRelease: down/up two events ------------------------------------
+    source.scripted = RawFrame{};
+    source.scripted.keys[static_cast<size_t>(KeyCode::Enter)] = true;
+    input.PumpOnce();
+    drain();
+    check(has("restart.down"), "pressrelease: down fires", has("restart.down") ? 1.f : 0.f, 1.f);
+    check(!has("restart.up"), "pressrelease: no up while held", has("restart.up") ? 0.f : 1.f, 1.f);
+    source.scripted = RawFrame{};
+    input.PumpOnce();
+    drain();
+    check(has("restart.up"), "pressrelease: up fires on release", has("restart.up") ? 1.f : 0.f, 1.f);
+
+    // --- Click on press edge + context gate ----------------------------------
+    source.scripted = RawFrame{};
+    source.scripted.keys[static_cast<size_t>(KeyCode::F)] = true;
+    input.PumpOnce();
+    drain();
+    check(has("drs.click"), "click: fires on press edge", has("drs.click") ? 1.f : 0.f, 1.f);
+    // Same key, repeated press, emits again.
+    source.scripted = RawFrame{};
+    input.PumpOnce();
+    drain();
+    source.scripted.keys[static_cast<size_t>(KeyCode::F)] = true;
+    input.PumpOnce();
+    drain();
+    check(has("drs.click"), "click: re-press fires again", has("drs.click") ? 1.f : 0.f, 1.f);
+
+    // Context gate: switch to menu, F (race-gated) must not fire.
+    input.SetActiveContext("menu");
+    source.scripted = RawFrame{};
+    source.scripted.keys[static_cast<size_t>(KeyCode::F)] = true;
+    input.PumpOnce();
+    drain();
+    check(!has("drs.click"), "context: race-gated click frozen in menu",
+          has("drs.click") ? 0.f : 1.f, 1.f);
+
+    // --- DoubleClick: two presses inside the window --------------------------
+    input.SetActiveContext("race");
+    // Press 1: a click, sets lastRelease.
+    source.scripted = RawFrame{};
+    source.scripted.keys[static_cast<size_t>(KeyCode::G)] = true;
+    input.PumpOnce();
+    drain();
+    source.scripted = RawFrame{};
+    input.PumpOnce();
+    drain();
+    // Press 2 within the window: dblclick, no extra click.
+    source.scripted.keys[static_cast<size_t>(KeyCode::G)] = true;
+    input.PumpOnce();
+    drain();
+    check(has("select.dblclick"), "dblclick: second press in window fires",
+          has("select.dblclick") ? 1.f : 0.f, 1.f);
+    check(!has("select.click"), "dblclick: second press suppresses extra click",
+          has("select.click") ? 0.f : 1.f, 1.f);
+    source.scripted = RawFrame{};
+    input.PumpOnce();
+    drain();
+
+    // --- LongPress: held past threshold fires once ---------------------------
+    input.SetActiveContext("race");
+    source.scripted = RawFrame{};
+    source.scripted.keys[static_cast<size_t>(KeyCode::H)] = true;
+    input.PumpOnce();  // pressStart
+    drain();
+    // Advance the clock beyond longPressMs (500ms) and hold.
+    std::this_thread::sleep_for(std::chrono::milliseconds(550));
+    source.scripted.keys[static_cast<size_t>(KeyCode::H)] = true;
+    input.PumpOnce();
+    drain();
+    check(has("hold.longpress"), "longpress: fires past threshold",
+          has("hold.longpress") ? 1.f : 0.f, 1.f);
+    source.scripted = RawFrame{};
+    input.PumpOnce();
+    drain();
+
+    // --- Axis binding (analog) ----------------------------------------------
+    reg.Register({.name = "steer", .gesture = Gesture::Hold,
+                  .keys = {{.axisIndex = 2, .axisScale = 1.f}}, .context = "race"});
+    source.scripted = RawFrame{};
+    source.scripted.axes[2] = 0.35f;
+    input.PumpOnce();
+    drain();
+    check(std::fabs(input.ActionValue("steer") - 0.35f) < 1e-3f,
+          "axis: analog value flows to action", input.ActionValue("steer"), 0.35f);
+    source.scripted = RawFrame{};
+    input.PumpOnce();
+    drain();
+    check(input.ActionValue("steer") < 1e-3f, "axis: clears on release",
+          input.ActionValue("steer"), 0.f);
+
+    // --- Config rebind (ApplyOverrides) -------------------------------------
+    Config cfg;
+    cfg.SetString("input", "throttle.keys", "lshift,space");
+    auto ov = reg.ApplyOverrides(cfg, "input");
+    check(ov.has_value(), "overrides: valid rebind ok", ov.has_value() ? 1.f : 0.f, 1.f);
+    source.scripted = RawFrame{};
+    source.scripted.keys[static_cast<size_t>(KeyCode::LShift)] = true;
+    input.PumpOnce();
+    drain();
+    check(input.ActionValue("throttle") > 0.9f, "overrides: rebound key drives action",
+          input.ActionValue("throttle"), 1.f);
+    source.scripted = RawFrame{};
+    input.PumpOnce();
+    drain();
+    cfg.SetString("input", "throttle.keys", "???");
+    ov = reg.ApplyOverrides(cfg, "input");
+    check(!ov.has_value(), "overrides: unrecognized key returns Err", ov.has_value() ? 0.f : 1.f, 1.f);
+
+    return failures;
+}
+
 int RunDriveTest(Config& config) {
     int failures = 0;
+    std::printf("=== input recognizers ===\n");
+    failures += RunInputTest();
     for (const char* engine : {"qu3e", "nudge", "rpc"}) {
         std::printf("=== physics backend: %s ===\n", engine);
         const auto start = std::chrono::steady_clock::now();
@@ -1120,12 +1367,13 @@ int RunBench(Config& config, int cars, const char* engine, double raceSeconds) {
     config.SetString("assists", "abs", "sport");
 
     NullBackend backend;
+    ScriptedInput testInput;
     if (!backend.Init(1280, 720, "bench")) {
         std::printf("[FAIL] bench backend init\n");
         return 1;
     }
 
-    Game game(backend, backend, config);
+    Game game(backend, testInput.system, config);
     if (!game.Init()) {
         std::printf("[FAIL] bench game init\n");
         return 1;
@@ -1133,7 +1381,7 @@ int RunBench(Config& config, int cars, const char* engine, double raceSeconds) {
     game.SetBench(true);
 
     auto frame = [&]() {
-        backend.scripted = InputState{};
+        testInput.set(InputState{});
         backend.BeginFrame();
         game.Update();
         backend.EndFrame();
@@ -1208,6 +1456,14 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Test/automation mode: never read or write config.rushconf. Tests pin
+    // their environment in memory; the user's settings must survive untouched
+    // (a settings/race-setup Save from a test would leak automation overrides
+    // like race.autostart=true into the user's config).
+    if (driveTest || bench || dumpPath || shotPath || menuShot || settingsShot) {
+        Config::SetTestMode(true);
+    }
+
     Config config;
     config.Load(DataPath("config.rushconf"));
     // Prove the rush-engine link is live (static libs drop unreferenced TUs).
@@ -1246,10 +1502,11 @@ int main(int argc, char** argv) {
 
     if (dumpPath) {
         NullBackend backend;
+        ScriptedInput testInput;
         backend.captureDraws = true;
         backend.Init(1280, 720, "dump-scene");
         config.SetString("race", "cars", "2");
-        Game game(backend, backend, config);
+        Game game(backend, testInput.system, config);
         if (!game.Init()) return 1;
         for (int i = 0; i < 260; ++i) {  // settle past the countdown
             backend.BeginFrame();
@@ -1272,6 +1529,13 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Input runs on its own thread: RaylibInputSource samples the device,
+    // InputSystem recognizes gestures and publishes to InputBus; the game
+    // drains on the main thread. Tests/WASM keep PumpOnce inline instead.
+    RaylibInputSource inputSource;
+    InputSystem inputSystem(inputSource);
+    inputSystem.Start();
+
     // Interactive runs get sound (miniaudio: WASAPI/DirectSound on Windows).
     // Tests and CLI capture paths stay silent and headless.
     MiniaudioAudio audio;
@@ -1279,7 +1543,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "audio: device init failed, running silent\n");
     }
 
-    Game game(backend, backend, config, &audio);
+    Game game(backend, inputSystem, config, &audio);
     // Native play: race stages run on the sim worker; menus stay on main.
     // Headless tests / --bench keep inline (deterministic pump).
     #if !defined(__EMSCRIPTEN__)
@@ -1309,6 +1573,7 @@ int main(int argc, char** argv) {
     // then would leak autostart=true / settings_qa into the user's config.rushconf
     // and the main menu would silently disappear on the next launch.
     if (!shotPath && !settingsShot) config.Save(DataPath("config.rushconf"));
+    inputSystem.Stop();
     backend.Shutdown();
     return 0;
 }

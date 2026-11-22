@@ -1,5 +1,7 @@
 # Rush Engine 性能对比报告
 
+状态：**现行基准报告**（架构背景见 [architecture.md](architecture.md)；RPC 碰撞侧另见 [rpc-refactor.md](rpc-refactor.md)）
+
 改造前（单线程同步主循环）vs 改造后（Rush Engine：事件总线 + JobSystem 并行 AI + 仿真线程/快照）。
 
 ## 测试方法

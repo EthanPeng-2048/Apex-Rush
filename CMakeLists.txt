@@ -79,6 +79,13 @@ enable_testing()
 add_test(NAME drive-test COMMAND apex-rush --drive-test)
 set_tests_properties(drive-test PROPERTIES TIMEOUT 900)
 
+# L1 physics unit tests: pure rush-physics-core, no engine / no game.
+add_executable(rpc-tests
+    rush-engine/third_party/rush-physics-core/tests/test_compute_aabb.cpp
+)
+target_link_libraries(rpc-tests PRIVATE rush-physics-core)
+add_test(NAME rpc-compute-aabb COMMAND rpc-tests)
+
 if(WIN32)
     target_link_libraries(apex-rush PRIVATE winmm)
     # nudge's solver uses large stack frames (upstream builds with 8 MB too).

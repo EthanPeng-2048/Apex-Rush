@@ -12,9 +12,14 @@ import rush.engine.core;
 #include "game/Track.h"
 import rush.engine.physics;
 import rush.engine.render;
+import rush.engine.input;
 import rush.engine.runtime;
 
 namespace apex {
+
+// Declares the input events the game consumes (event name + gesture + keys).
+// Called by Game::Init; tests may also call it directly before PumpOnce.
+void RegisterGameInput(InputSystem& input);
 
 // Race phases drive UI and input gating.
 enum class RacePhase {
@@ -52,7 +57,7 @@ public:
     // audio + BACK.
     static constexpr int kSettingsRowCount = 17;
 
-    Game(IRenderer& renderer, IInput& input, Config& config, IAudio* audio = nullptr);
+    Game(IRenderer& renderer, InputSystem& input, Config& config, IAudio* audio = nullptr);
     ~Game();
 
     bool Init();
@@ -192,7 +197,7 @@ private:
     void UpdateCameraFrom(const VehicleState& player, float dt);
 
     IRenderer& renderer_;
-    IInput& input_;
+    InputSystem& input_;
     Config& config_;
     IAudio* audio_ = nullptr;  // optional; null in headless tests
 

@@ -13,6 +13,7 @@ import rush.engine.core;
 import rush.engine.job;
 import rush.engine.physics;
 import rush.engine.render;
+import rush.engine.input;
 
 namespace apex {
 
@@ -154,11 +155,92 @@ std::string Pad(const std::string& s, size_t width) {
 
 }  // namespace
 
-Game::Game(IRenderer& renderer, IInput& input, Config& config, IAudio* audio)
+// Game-side input registration: declare the events the game consumes, their
+// gesture kinds and default key bindings. Called from Game::Init before any
+// phase runs; the input thread recognizes these and publishes to InputBus.
+void RegisterGameInput(InputSystem& input) {
+    InputRegistry& reg = input.Registry();
+    const DeviceKey kb = {DeviceKind::Keyboard, 0, 0};
+    auto key = [&](KeyCode k) {
+        DeviceKey d = kb;
+        d.code = static_cast<uint16_t>(k);
+        return d;
+    };
+
+    // Race continuous axes (Hold): keyboard OR-analog. The axis bindings let
+    // scripted tests (NullInputSource.scripted.axes) inject analog throttle /
+    // brake / steer; the keyboard keys bind the same names for real play.
+    reg.Register({.name = "throttle", .gesture = Gesture::Hold,
+                  .keys = {{.key = key(KeyCode::W)}, {.key = key(KeyCode::Up)},
+                           {.axisIndex = 0, .axisScale = 1.f}},
+                  .context = "race"});
+    reg.Register({.name = "brake", .gesture = Gesture::Hold,
+                  .keys = {{.key = key(KeyCode::S)}, {.key = key(KeyCode::Down)},
+                           {.axisIndex = 1, .axisScale = 1.f}},
+                  .context = "race"});
+    reg.Register({.name = "steer", .gesture = Gesture::Hold,
+                  .keys = {{.key = key(KeyCode::A), .axisScale = -1.f},
+                           {.key = key(KeyCode::D), .axisScale = 1.f},
+                           {.key = key(KeyCode::Left), .axisScale = -1.f},
+                           {.key = key(KeyCode::Right), .axisScale = 1.f},
+                           {.axisIndex = 2, .axisScale = 1.f}},
+                  .context = "race"});
+    reg.Register({.name = "handbrake", .gesture = Gesture::Hold,
+                  .keys = {{.key = key(KeyCode::Space)}}, .context = "race"});
+    reg.Register({.name = "reverse", .gesture = Gesture::Hold,
+                  .keys = {{.key = key(KeyCode::R)}}, .context = "race"});
+    reg.Register({.name = "overtake", .gesture = Gesture::Hold,
+                  .keys = {{.key = key(KeyCode::LShift)}, {.key = key(KeyCode::RShift)}},
+                  .context = "race"});
+    reg.Register({.name = "lookback", .gesture = Gesture::Hold,
+                  .keys = {{.key = key(KeyCode::B)}}, .context = "race"});
+
+    // Race discrete actions (Click): DRS / wing / camera / pause / restart.
+    reg.Register({.name = "drs", .gesture = Gesture::Click,
+                  .keys = {{.key = key(KeyCode::F)}}, .context = "race"});
+    reg.Register({.name = "wing", .gesture = Gesture::Click,
+                  .keys = {{.key = key(KeyCode::V)}}, .context = "race"});
+    reg.Register({.name = "camera", .gesture = Gesture::Click,
+                  .keys = {{.key = key(KeyCode::C)}}, .context = "race"});
+    reg.Register({.name = "pause", .gesture = Gesture::Click,
+                  .keys = {{.key = key(KeyCode::Escape)}, {.key = key(KeyCode::P)}}});
+    reg.Register({.name = "restart", .gesture = Gesture::Click,
+                  .keys = {{.key = key(KeyCode::Enter)}}});
+
+    // Menu navigation (Click, context-gated to menu phases).
+    reg.Register({.name = "menu.up", .gesture = Gesture::Click,
+                  .keys = {{.key = key(KeyCode::Up)}, {.key = key(KeyCode::W)}},
+                  .context = "menu"});
+    reg.Register({.name = "menu.down", .gesture = Gesture::Click,
+                  .keys = {{.key = key(KeyCode::Down)}, {.key = key(KeyCode::S)}},
+                  .context = "menu"});
+    reg.Register({.name = "menu.left", .gesture = Gesture::Click,
+                  .keys = {{.key = key(KeyCode::Left)}, {.key = key(KeyCode::A)}},
+                  .context = "menu"});
+    reg.Register({.name = "menu.right", .gesture = Gesture::Click,
+                  .keys = {{.key = key(KeyCode::Right)}, {.key = key(KeyCode::D)}},
+                  .context = "menu"});
+    reg.Register({.name = "menu.select", .gesture = Gesture::Click,
+                  .keys = {{.key = key(KeyCode::Enter)}, {.key = key(KeyCode::Space)}},
+                  .context = "menu"});
+    reg.Register({.name = "menu.back", .gesture = Gesture::Click,
+                  .keys = {{.key = key(KeyCode::Escape)}}, .context = "menu"});
+}
+
+Game::Game(IRenderer& renderer, InputSystem& input, Config& config, IAudio* audio)
     : renderer_(renderer), input_(input), config_(config), audio_(audio) {}
 
 bool Game::Init() {
     StartRace();
+    // Register the game's input events: modules that need input declare
+    // their (event name, gesture, keys) here — the input thread recognizes
+    // them and publishes to InputBus; the game only Drain()s.
+    RegisterGameInput(input_);
+    // User rebinds from config.rushconf [input] (<name>.keys = "a,d"). A bad
+    // value is non-fatal: keep the registered defaults.
+    if (auto r = input_.Registry().ApplyOverrides(config_, "input"); !r) {
+        std::fprintf(stderr, "[input] rebind skipped: %s\n", r.error().message.c_str());
+    }
     // Tests and automation skip straight to the grid; normal launches open
     // the main menu over the parked scene. `race.settings_qa` opens the
     // settings screen directly for --shot QA captures (never saved).
@@ -612,13 +694,24 @@ void Game::Render3D() {
 }
 
 void Game::UpdatePlayerInput() {
-    rawInput_ = input_.Poll();
-    const InputState& raw = rawInput_;
-
     // Menus own their input (UpdateMenu / UpdateSettings / UpdateRaceSetup);
     // cars stay parked and the sim worker is (or will be) stopped.
     const RacePhase ph = phase_;
-    if (ph == RacePhase::Menu || ph == RacePhase::Settings || ph == RacePhase::RaceSetup) {
+    const bool menuPhase =
+        ph == RacePhase::Menu || ph == RacePhase::Settings || ph == RacePhase::RaceSetup;
+
+    // Switch the input context before sampling so race-gated events
+    // (throttle, DRS, ...) freeze in menus and menu registrations take over.
+    input_.SetActiveContext(menuPhase ? "menu" : "race");
+    // Inline mode (drive-test / WASM / headless): sample + recognize now;
+    // threaded mode pumps on the input thread and only Consume() runs here.
+    if (!input_.Running()) input_.PumpOnce();
+
+    rawInput_ = InputState{};
+    input_.Consume(rawInput_);
+    const InputState& raw = rawInput_;
+
+    if (menuPhase) {
         std::lock_guard lock(intentMutex_);
         intent_ = PlayerIntent{};
         return;
