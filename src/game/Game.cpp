@@ -374,6 +374,10 @@ void Game::PublishSnapshot() {
         }
     }
     snap.valid = true;
+    snap.gen = ++snapGen_;
+    snap.publishTime = std::chrono::duration<double>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
     snapshots_.Publish();
 }
 
@@ -424,22 +428,40 @@ void Game::Render3D() {
     // Menus / inline mode: worker is stopped (or never started) and the main
     // thread owns racers_ again.
     if (threadedSim_ && simWorker_.Running()) {
+        const double now = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+        // Hold each published pose for a beat, then extrapolate along world
+        // velocity so every car advances smoothly between sim ticks. Camera
+        // already smooths; without this, all cars step together on each
+        // Publish and the pack "vibrates" against the camera (worst at launch).
+        const float ahead =
+            frameSnap_.valid ? Clampf(static_cast<float>(now - frameSnap_.publishTime), 0.f, 0.05f)
+                             : 0.f;
         for (std::size_t i = 0; i < frameSnap_.cars.size(); ++i) {
             const CarPose& pose = frameSnap_.cars[i];
+            Transform drawT = pose.chassis;
+            drawT.position += pose.state.velocity * ahead;
+            // Probe the raw published pose (not the extrapolated draw pose)
+            // so hits still mean "snapshot content jumped".
             const Quat& r = pose.chassis.rotation;
-            rush::JitterProbe::Get().Observe("render", static_cast<int>(i),
-                                             pose.chassis.position.x, pose.chassis.position.y,
-                                             pose.chassis.position.z, r.x, r.y, r.z, r.w);
+            rush::JitterProbe::Get().Observe("render", static_cast<int>(i), pose.chassis.position.x,
+                                             pose.chassis.position.y, pose.chassis.position.z, r.x,
+                                             r.y, r.z, r.w);
             if (i == 0) {
                 rush::JitterProbe::Get().Trace("rnd_player", pose.chassis.position.x,
                                                pose.chassis.position.y, pose.chassis.position.z);
+                rush::JitterProbe::Get().Trace("rnd_draw", drawT.position.x, drawT.position.y,
+                                               drawT.position.z);
                 const WheelState& w0 = pose.state.wheels[0];
                 const WheelState& w3 = pose.state.wheels[3];
                 rush::JitterProbe::Get().Trace(
                     "rnd_wh", w0.suspensionLength,
                     (w0.grounded ? 1.f : 0.f) + (w3.grounded ? 2.f : 0.f), w0.contactPoint.y);
+                rush::JitterProbe::Get().Trace("rnd_gen", static_cast<float>(ahead),
+                                               static_cast<float>(frameSnap_.gen % 100000), 0.f);
             }
-            Vehicle::RenderPose(renderer_, pose.chassis, pose.state, pose.params, pose.tint);
+            Vehicle::RenderPose(renderer_, drawT, pose.state, pose.params, pose.tint);
         }
         return;
     }
