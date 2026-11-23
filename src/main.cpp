@@ -985,6 +985,138 @@ int RunWallCrashTest(IPhysicsWorld& world) {
     return ok ? 0 : 1;
 }
 
+// T4: per-part collision boxes. The backend must tag the contacting shape
+// with its CarPart value (qu3e/rpc composite bodies); nudge runs its legacy
+// single box and reports -1, which the vehicle maps via the coordinate
+// regions. Also verifies the damage mapping prefers the tag, and that the
+// sidepod collateral rule survives the tag path.
+int RunPartCollisionTest(IPhysicsWorld& world, const char* engine) {
+    int failures = 0;
+    auto check = [&failures](bool ok, const char* what, float got, float want) {
+        std::printf("[%s] parts: %s (got %.2f, target %.2f)\n", ok ? "PASS" : "FAIL", what, got,
+                    want);
+        if (!ok) ++failures;
+    };
+
+    world.SetGravity({0.f, -9.81f, 0.f});
+    BodyDesc ground;
+    ground.transform.position = {0.f, -1.f, 0.f};
+    ground.halfExtents = {2000.f, 1.f, 2000.f};
+    ground.friction = 0.8f;
+    const BodyHandle groundB = world.CreateBody(ground).value_or(kInvalidBody);
+    const float dt = 1.f / 240.f;
+
+    // --- L1: tag propagation ------------------------------------------------
+    {
+        BodyDesc carDesc;
+        carDesc.transform.position = {0.f, 1.f, 0.f};
+        carDesc.mass = 750.f;
+        ShapeDesc fw;
+        fw.localTransform.position = {0.f, 0.06f, 1.68f};
+        fw.halfExtents = {0.72f, 0.05f, 0.18f};
+        fw.partTag = static_cast<int>(CarPart::FrontWing);
+        carDesc.shapes.push_back(fw);
+        ShapeDesc main;
+        main.localTransform.position = {0.f, 0.15f, 0.f};
+        main.halfExtents = {0.58f, 0.18f, 1.35f};
+        carDesc.shapes.push_back(main);
+        const BodyHandle carB = world.CreateBody(carDesc).value_or(kInvalidBody);
+
+        // Wall A overlaps the front-wing box (z 1.50..1.86 for qu3e/rpc).
+        BodyDesc wallA;
+        wallA.transform.position = {0.f, 1.06f, 1.87f};
+        wallA.halfExtents = {4.f, 2.f, 0.15f};
+        wallA.userData = SurfaceTag(SurfaceType::Wall);
+        (void)world.CreateBody(wallA);
+        // Wall B overlaps the untagged main box / nudge's single box.
+        BodyDesc wallB;
+        wallB.transform.position = {0.f, 1.f, 0.6f};
+        wallB.halfExtents = {4.f, 2.f, 0.15f};
+        wallB.userData = SurfaceTag(SurfaceType::Wall);
+        (void)world.CreateBody(wallB);
+
+        world.Step(dt);
+        const std::vector<ContactEvent> contacts = world.DrainContacts();
+        int wingTags = 0, untagged = 0;
+        for (const ContactEvent& e : contacts) {
+            if (e.bodyA != carB && e.bodyB != carB) continue;
+            const int part = (e.bodyA == carB) ? e.partA : e.partB;
+            if (part == static_cast<int>(CarPart::FrontWing)) ++wingTags;
+            if (part == -1) ++untagged;
+        }
+        if (std::strcmp(engine, "nudge") == 0) {
+            check(wingTags == 0, "nudge reports no part tags", static_cast<float>(wingTags), 0.f);
+            check(untagged > 0, "nudge single-box contact is untagged (-1)",
+                  static_cast<float>(untagged), 1.f);
+        } else {
+            check(wingTags > 0, "front-wing box tagged in contact",
+                  static_cast<float>(wingTags), 1.f);
+            check(untagged > 0, "untagged main box reports -1", static_cast<float>(untagged),
+                  1.f);
+        }
+        (void)world.DestroyBody(carB);
+    }
+
+    // --- L2: damage mapping prefers the tag --------------------------------
+    const auto spawnCar = [&]() {
+        Vehicle car;
+        Transform pose;
+        pose.position = {0.f, 0.55f, 0.f};
+        car.Spawn(world, pose, VehicleParams{});
+        return car;
+    };
+    {
+        Vehicle car = spawnCar();
+        ContactEvent ev;
+        ev.bodyA = car.Chassis();
+        ev.bodyB = groundB;
+        ev.worldPoint = car.State().transform.position + Vec3{0.f, 0.06f, 1.68f};
+        ev.worldNormal = {0.f, 0.f, -1.f};
+        ev.impactSpeed = 25.f;
+        ev.partA = static_cast<int>(CarPart::FrontWing);
+        ev.partB = -1;
+        car.ProcessContacts({ev}, dt);
+        const float fw = car.PartHealth(CarPart::FrontWing);
+        check(fw < 1.f, "tagged front-wing contact damages the wing", fw, 1.f);
+        check(car.PartHealth(CarPart::RearWing) == 1.f, "other parts untouched",
+              car.PartHealth(CarPart::RearWing), 1.f);
+        car.Despawn();
+    }
+    {
+        Vehicle car = spawnCar();
+        ContactEvent ev;
+        ev.bodyA = car.Chassis();
+        ev.bodyB = groundB;
+        ev.worldPoint = car.State().transform.position + Vec3{0.f, 0.06f, 1.68f};
+        ev.worldNormal = {0.f, 0.f, -1.f};
+        ev.impactSpeed = 25.f;
+        ev.partA = -1;
+        ev.partB = -1;
+        car.ProcessContacts({ev}, dt);
+        const float fw = car.PartHealth(CarPart::FrontWing);
+        check(fw < 1.f, "untagged contact falls back to coordinate region", fw, 1.f);
+        car.Despawn();
+    }
+    {
+        Vehicle car = spawnCar();
+        ContactEvent ev;
+        ev.bodyA = car.Chassis();
+        ev.bodyB = groundB;
+        ev.worldPoint = car.State().transform.position;
+        ev.worldNormal = {0.f, 0.f, -1.f};
+        ev.impactSpeed = 25.f;
+        ev.partA = static_cast<int>(CarPart::Sidepods);
+        ev.partB = -1;
+        car.ProcessContacts({ev}, dt);
+        check(car.PartHealth(CarPart::Floor) < 1.f,
+              "sidepod hit clips the floor edge (collateral rule)",
+              car.PartHealth(CarPart::Floor), 1.f);
+        car.Despawn();
+    }
+
+    return failures;
+}
+
 // Season feature gates: classic (DRS) and 2026 (active aero + override)
 // must not leak into each other — a disabled system ignores its input even
 // if the game layer forwards it. Vehicle-level check of the VehicleParams
@@ -1259,6 +1391,12 @@ int RunDriveTestForEngine(Config& config, const char* engine) {
     {
         std::unique_ptr<IPhysicsWorld> crashWorld = MakeWorld(engine);
         failures += RunWallCrashTest(*crashWorld);
+    }
+
+    // 5b2) Per-part collision boxes: tags, fallback and damage mapping.
+    {
+        std::unique_ptr<IPhysicsWorld> partsWorld = MakeWorld(engine);
+        failures += RunPartCollisionTest(*partsWorld, engine);
     }
 
     // 5c) Season gates: classic DRS and 2026 aero/override never leak.
