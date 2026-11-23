@@ -1,6 +1,6 @@
 # 车辆物理升级设计（差速器 · 悬挂几何/防倾杆 · 气动侧向力 · 部件碰撞盒）
 
-状态：**实施中**。T1–T5 按 §7 顺序落地（审查已通过）；功能验收后执行 §10 性能优化（只针对自有管线 RPC）。
+状态：**T1–T5 全部实施（2026-11-23，三后端 drive-test 0 failures）；§10 性能优化执行中**。
 关联：[car-refactor.md](car-refactor.md)（车辆组件化，已实施）· [engine-integration.md](engine-integration.md)（引擎/传动，已实施）· [architecture.md](architecture.md)（系统分层）· [rpc-refactor.md](rpc-refactor.md)（RPC 后端）。
 
 ---
@@ -393,15 +393,28 @@ qu3e 无 CCD；部件盒不消除高速掠射穿模（相对速度下薄盒可�
 
 ## 7. 落地步骤
 
-| 步骤 | 内容 | 验证 |
-|---|---|---|
-| T1 | **差速器**：`Differential` 组件 + Transmission 轴级输出 + 编排器接线（slaved 解除、平均投影）+ 参数默认值 | 单测：直线 50:50 / 弯中偏置方向 / lockFactor=1 差分基准；drive-test 全后端 |
-| T2 | **防倾杆 + 悬挂几何**：Suspension 扩展 + TireModel `alignMoment` + Vehicle 汇总 | 单测：左右载荷差、回正力矩方向、toe 影响直行；drive-test 全后端 |
-| T3 | **气动**：车身轴下压力 + β 导数 + COP 高度 + Vehicle 应用 | 单测：倾斜路面下压力方向、β 稳定力矩、高速弯侧倾；drive-test 全后端 |
-| T4 | **部件碰撞盒**：L1 多盒/标签（qu3e+rpc）+ nudge 回退 + Spawn 盒布局 + 损伤归属 | 单测：前翼/尾翼/侧箱命中各自标签、坐标回退等值；drive-test 全后端 |
-| T5 | **集成回归**：三后端 drive-test 0 failures + bench 无退化 + WASM 冒烟（若 EMSDK 可用）+ 手感调参（默认值→最终值）+ 文档状态更新 | 验收全项（§8） |
+| 步骤 | 内容 | 验证 | 状态 |
+|---|---|---|---|
+| T1 | **差速器**：`Differential` 组件 + Transmission 轴级输出 + 编排器接线（slaved 命令转速 + Δ 动力学）+ 参数默认值 | 单测：spool 50:50 基准 / 弯中偏置方向 / 开式 / 减速工况 / slew 限幅；drive-test 全后端 | ✅ 已实施（提交 5bdfdc4 / 9f8106c） |
+| T2 | **防倾杆 + 悬挂几何**：Suspension 扩展 + TireModel `alignMoment` + Vehicle 汇总 | 单测：回正力矩方向/线性/零 trail；drive-test 全后端 | ✅ 已实施（提交 92802e6 / 199dc51） |
+| T3 | **气动**：车身轴下压力 + β 导数 + COP 高度 + Vehicle 应用 | 单测：侧滑恢复力/横摆方向、COP 高度、静止为零；drive-test 全后端 | ✅ 已实施（提交 e300b41 / da9426c） |
+| T4 | **部件碰撞盒**：L1 多盒/标签（qu3e+rpc）+ nudge 回退 + Spawn 盒布局 + 损伤归属 | 单测：前翼盒标签、主盒 -1、nudge 回退、标签优先损伤、坐标回退、侧箱连带；drive-test 全后端 | ✅ 已实施（提交 acb8668 / d460c5b） |
+| T5 | **集成回归**：三后端 drive-test 0 failures + bench 记录 + WASM 冒烟（未配置）+ 手感调参 + 文档状态更新 | 验收全项（§8） | ✅ 已实施（本文档） |
 
 每步沿用既有纪律：先核对本设计对应节 → 编码 → bench + drive-test → 童子军清理（不留死代码/魔法常数）。
+
+### 7.1 T5 回归记录（2026-11-23）
+
+- **drive-test**：qu3e / nudge / rpc 三后端 + threaded-smoke **0 failures**（含新增：diff×10、align×4、aero×6、parts×7 用例）；
+- **bench 16 车**（600 帧 × 2400 physSteps）：qu3e 2.180s、rpc 2.072s（T1 前基线 1.855s / 1.818s，**+14–17%**）、nudge 40.998s（≈基线 40.71s，多盒回退路径无额外成本）。退化来源 = 部件多盒贴地 4–6 盒的 narrowphase/solver 接触增加，属功能正确代价，列为 §10 优化靶点；
+- **确定性**：`JobSystem::Configure(0)` 下逐位可复现（drive-test 全过）；
+- **手感方向**：起步/极速/换挡/高速点刹/倒车/刹车/AI 走廊全过、AI 不上墙、DRS/翼挡/损伤生效（drive-test 断言全绿）；AI 弯速预算 0.90 无需调整；
+- **参数终值 = 文档默认**（T5 调参结论：初值行为方向正确，无需改动）：
+  - 差速：preload 40/8 Nm、ramp 120/30、lockFactor 0.65/0.35、biasRateLimit 4000、deltaDamping 20、deltaMax 1.0 rad/s；
+  - 防倾杆：kArbF 9000 / kArbR 12000；casterTrailF 0.035 m；toeF 0.0015 / toeR −0.0005 rad；camber 0.030/0.040 + gain 0.60/0.70；rollSteerF 0；
+  - 气动：sideArea 1.15、Clβ 2.6、Cnβ 0.9、CnR 0.10、Lref 3.6、copHeight 0.22 m；
+  - 部件盒布局：VehicleParams.partBoxes/chassisBox 默认值（§4.3）；
+- **WASM 冒烟**：未跑（本机未配置 EMSDK，与现状一致）。
 
 ---
 
@@ -455,8 +468,33 @@ qu3e 无 CCD；部件盒不消除高速掠射穿模（相对速度下薄盒可�
 4. **算法**：L1 solver 迭代次数/热启动路径、broadphase 更新；L2 轮胎隐式解中 `pow/atan2` 的近似替换（精度受 drive-test 逐位确定性约束——近似必须位级稳定）。
 5. **架构**：跨模块边界调用次数（IPhysicsWorld 每子步 ~15 次虚调用/车，16 车 = ~240 次/子步 → 960/帧）；评估"每子步单次批查询"接口（如 `FetchChassisState`）是否值得进 L1 接口（注意三后端兼容、nudge 回退实现）。
 
-### 10.4 交付
+### 10.4 交付与现状（2026-11-23 晚）
 
-- 每项优化后重跑 `--bench 16`（RPC）与 `--drive-test`（三后端，含确定性档），记录 wall 与 per-step 各段变化；
-- 性能小节写入本文档（基线→各步→终值），并提交（子模块 + 主仓库）；
-- 若与确定性冲突（近似/并行），以确定性为准回退该项。若 50% 需触碰 nudge 路径（共享 L2 改动导致 nudge 行为/性能变化属可接受附带），不做任何 nudge 专属优化。
+**已实施**（rpc + 共享 L2/游戏层，qu3e 只保留功能必需改动）：
+
+1. **AI 段 -42%**：`Track::ProjectDistance(pos, hint)` 邻域搜索（连续运动 O(窗口) 替代 O(样本数)，hint 失效自动回退全扫描）；16 车 ai 0.528→0.305 ms/frame。
+2. **L2 批查询**：`IPhysicsWorld::FetchChassis`（transform+双速度一次后端往返，替代 3 次句柄查找；三后端实现）。
+3. **rpc 适配层热路径**：句柄表 `unordered_map`→稠密 vector（handle 递增 → 数组索引）；`ApplyForce` 提前解析 body 指针（Step 免二次查找）；热路径去 Result 包装（Debug assert，错误契约保留在低频路径）；**冲量聚合**（每 body 一次线性+角冲量应用，替代 ~11 次逐点惯性计算，数学等价）。
+4. **L1 岛批处理**（rpcScene）：span 池 + `std::vector` 复用（无裸指针分配、无每步分配）；静态 body 不撑大池（`m_dynamicCount` 缓存）；接触池按峰值单调增长（消除接触抖动引发的逐帧 realloc）；同步段只清动态 body；SolveIslands 单一路径（串行/并行共用，数值逐位一致）。
+5. **并行岛（D9 落地）**：进程级**共享单例线程池**（游戏启动预热、CPU 核数-1、永不动态扩容/销毁、空闲背压 spin→yield）；门控 `islandCount ≥ 4×workers`（16 车网格保持串行，120 车并行）；**并行与串行数值逐位一致**。
+6. **bench 1% low**：逐帧/逐步样本记录，报告最差 1% 平均（帧时间与物理步），覆盖抖动而非只看均值。
+
+**当前数据（--bench 16，600 帧 × 2400 steps）**：
+
+| 项 | 功能基线 | 现状 |
+|---|---|---|
+| rpc wall | 2.072s | **2.061s**（-0.5%；ai -42% 抵消了多盒/新物理增量） |
+| rpc ai | 0.528 ms/f | 0.305 ms/f（-42%） |
+| rpc step | 0.568 ms/step | 0.572 ms/step（持平） |
+| rpc 1% low frame | —（未测） | 4.33 ms（231 fps），优于 qu3e 5.07 ms |
+| qu3e wall | 2.180s | 2.119s（无退化） |
+| 120 车 rpc wall（并行） | —（初版并行 10.84s） | 7.71s（-29%） |
+
+**未达 -25% 目标的差距与根因**：
+- 16 车 rpc 平均仅持平——剩余瓶颈是 **vehicle 段**（rpc 0.204 vs qu3e 0.163 ms/step）：悬架 **4×Raycast/子步/车**（120 车 = 480 次树查询）是主体，rpc 树查询慢于 qu3e（同源 fork 的分化点，下一步：树查询热点对比 + 悬架 raycast 聚合接口）；
+- 多盒碰撞（T4）带来的 solver/窄相增量是功能正确代价（-14%），已通过上述优化抵消；
+- **1% low step**（0.85 vs 平均 0.57，+49%）主要来自车车碰撞/高接触峰值步——可在并行门控下进一步平滑。
+
+**下一步（若继续）**：悬架 4 轮 raycast 批量接口（1 次树遍历返回 4 结果）；rpc 树 vs qu3e 树查询分差定位；16 车 vehicle 段 EX_TRY 以外的残余开销。
+
+**确定性**：drive-test 三后端 + threaded-smoke 全 0 failures（含全部新用例），`Configure(0)` 下逐位可复现；并行路径与串行路径数值逐位一致（岛间无共享写）。

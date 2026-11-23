@@ -1864,16 +1864,35 @@ int RunBench(Config& config, int cars, const char* engine, double raceSeconds) {
     const Game::BenchSample& s = game.Bench();
     const double n = s.frames > 0 ? static_cast<double>(s.frames) : 1.0;
     const double steps = s.physSteps > 0 ? static_cast<double>(s.physSteps) : 1.0;
+
+    // Worst-percentile ("1% low"): the mean of the slowest 1% of samples —
+    // the perceived frame rate / physics hitchiness, not just the average.
+    const auto worstPct = [](std::vector<double>& v, double pct) -> double {
+        if (v.size() < 2) return v.empty() ? 0.0 : v.front();
+        std::sort(v.begin(), v.end());
+        const size_t k = std::max<size_t>(1, v.size() * pct / 100.0);
+        double sum = 0.0;
+        for (size_t i = v.size() - k; i < v.size(); ++i) sum += v[i];
+        return sum / static_cast<double>(k);
+    };
+    auto frameTimes = s.frameTimesMs;
+    auto stepTimes = s.stepTimesMs;
+    const double frame1Low = worstPct(frameTimes, 1.0);
+    const double step1Low = worstPct(stepTimes, 1.0);
+
     std::printf("bench racers=%zu\n", game.Racers().size());
     std::printf(
         "bench[%s] cars=%d frames=%ld physSteps=%ld wall=%.3fs\n"
         "  per-frame ms:  update=%.3f  ai=%.3f  race=%.3f\n"
         "  per-step  ms:  vehicle=%.4f  step=%.4f  contact=%.4f\n"
+        "  1%% low:        frame=%.3f ms (%.1f fps)  step=%.4f ms  vehicle=%.4f ms\n"
         "  sim-share:     ai=%.1f%%  vehicle=%.1f%%  step=%.1f%%  contact=%.1f%%  race=%.1f%%\n"
         "  throughput:    %.1f steps/s wall, %.1f frames/s wall\n",
         engine, cars, s.frames, s.physSteps, wall.count(),
         1e3 * s.updateSec / n, 1e3 * s.aiSec / n, 1e3 * s.raceSec / n,
         1e3 * s.vehicleSec / steps, 1e3 * s.stepSec / steps, 1e3 * s.contactSec / steps,
+        frame1Low, frame1Low > 0.0 ? 1000.0 / frame1Low : 0.0, step1Low,
+        1e3 * s.vehicleSec / steps,
         100.0 * s.aiSec / std::max(s.updateSec, 1e-12),
         100.0 * s.vehicleSec / std::max(s.updateSec, 1e-12),
         100.0 * s.stepSec / std::max(s.updateSec, 1e-12),

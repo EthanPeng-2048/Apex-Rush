@@ -238,8 +238,32 @@ float Track::CurvatureAt(float distance) const {
     return samples_[i].curvature;
 }
 
-float Track::ProjectDistance(const Vec3& worldPos) const {
+float Track::ProjectDistance(const Vec3& worldPos, float hint) const {
     if (samples_.empty()) return 0.f;
+
+    // Neighbourhood search around the hint: a car moves < 1 m per frame, so
+    // scanning a small window around the previous projection finds the best
+    // sample for a fraction of the full-scan cost. The hint is only trusted
+    // when it lands within the window's reach (reset/teleport recovery).
+    if (hint >= 0.f) {
+        const float h = std::fmod(hint, totalLength_);
+        const int center = static_cast<int>(h / spacing_);
+        const int win = static_cast<int>(20.f / spacing_) + 2;  // +-20 m
+        const size_t n = samples_.size();
+        float bestErr = 1e30f;
+        float bestDist = hint;
+        for (int i = -win; i <= win; ++i) {
+            const size_t idx = (static_cast<int>(center) + i + static_cast<int>(n)) % n;
+            const Sample& s = samples_[idx];
+            const float err = LengthSq(s.position - worldPos);
+            if (err < bestErr) {
+                bestErr = err;
+                bestDist = s.distance;
+            }
+        }
+        if (bestErr < 25.f * 25.f) return bestDist;
+    }
+
     float bestDist = 0.f;
     float bestErr = 1e30f;
     for (const Sample& s : samples_) {

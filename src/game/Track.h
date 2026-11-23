@@ -44,7 +44,11 @@ public:
     float CurvatureAt(float distance) const;
 
     // Progress helpers: project a world position onto the centerline.
-    float ProjectDistance(const Vec3& worldPos) const;
+    // `hint` (arc-length distance from a previous projection, -1 = none)
+    // turns the O(samples) full scan into a O(window) neighbourhood search
+    // for continuously-moving objects (cars); the hint is discarded when it
+    // is not near the position (teleport / reset recovery).
+    float ProjectDistance(const Vec3& worldPos, float hint = -1.f) const;
 
     // Zones: [0] start/finish at distance 0. DRS zones are [start, end],
     // converted from map-data lap fractions by Build.

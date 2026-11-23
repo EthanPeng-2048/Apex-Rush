@@ -88,8 +88,18 @@ public:
         double updateSec = 0.0;
         long frames = 0;
         long physSteps = 0;
+        // Per-sample times [ms] for the worst-percentile (1% low) analysis:
+        // one entry per frame (update section) and per physics substep
+        // (world Step section). Sorted at report time in RunBench.
+        std::vector<double> frameTimesMs;
+        std::vector<double> stepTimesMs;
     };
-    void SetBench(bool on) { benchOn_ = on; }
+    void SetBench(bool on) {
+        benchOn_ = on;
+        // Bench runs the parallel-island path (bit-identical numerics, only
+        // execution order changes; drive-test never enables it).
+        if (world_) world_->SetParallelIslands(on);
+    }
     void ResetBench() { bench_ = BenchSample{}; }
     const BenchSample& Bench() const { return bench_; }
 

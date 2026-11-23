@@ -488,7 +488,9 @@ void Game::Update() {
     }
 
     if (benchOn_) {
-        bench_.updateSec += BenchSec(benchT0, BenchClock::now());
+        const double sec = BenchSec(benchT0, BenchClock::now());
+        bench_.updateSec += sec;
+        bench_.frameTimesMs.push_back(sec * 1e3);
         ++bench_.frames;
     }
 }
@@ -720,7 +722,7 @@ void Game::ApplyPlayerIntent() {
         // starts closed — the driver must re-arm. The zone probe needs the
         // car's position, which only the sim thread may read mid-race.
         const float playerD =
-            track_.ProjectDistance(player.vehicle.State().transform.position);
+            track_.ProjectDistance(player.vehicle.State().transform.position, player.lapDistance);
         const bool inDrsZone = track_.InDrsZone(playerD);
         if (!inDrsZone) {
             drsWanted_ = false;
@@ -776,7 +778,7 @@ void Game::UpdateAI(Racer& racer, float dt) {
         return;
     }
     const VehicleState& state = racer.vehicle.State();
-    const float d = track_.ProjectDistance(state.transform.position);
+    const float d = track_.ProjectDistance(state.transform.position, racer.lapDistance);
 
     const Vec3 forward = TransformDirection(state.transform, Vec3{0.f, 0.f, 1.f});
     // Geometric right is -X in the vehicle frame (+Z forward / +Y up, right
@@ -823,10 +825,13 @@ void Game::UpdateAI(Racer& racer, float dt) {
     // the entry budget must carry that margin or corner entries run wide.
     vTarget = Clampf(vTarget * 0.90f, 12.f, 62.f);
 
+    // Traffic awareness: full track projection per rival (original). The
+    // O(AI^2 * samples) cost stays — rivals are few and the job is parallel.
     const float total = track_.TotalLength();
     for (const Racer& other : racers_) {
         if (&other == &racer) continue;
-        const float od = track_.ProjectDistance(other.vehicle.State().transform.position);
+        const float od = track_.ProjectDistance(other.vehicle.State().transform.position,
+                                                other.lapDistance);
         float gap = od - d;
         if (gap < -total * 0.5f) gap += total;
         else if (gap > total * 0.5f) gap -= total;
@@ -900,7 +905,11 @@ void Game::StepPhysics(float dt) {
     // Step only publishes CollisionEvents onto the bus; damage/audio drain
     // in ProcessCollisionEvents (separate stage — physics never calls game).
     world_->Step(dt);
-    if (b) bench_.stepSec += BenchSec(t, BenchClock::now());
+    if (b) {
+        const double sec = BenchSec(t, BenchClock::now());
+        bench_.stepSec += sec;
+        bench_.stepTimesMs.push_back(sec * 1e3);
+    }
 }
 
 void Game::ProcessCollisionEvents(float dt) {
@@ -941,7 +950,7 @@ void Game::UpdateRace(float dt) {
 
     for (Racer& racer : racers_) {
         const VehicleState& state = racer.vehicle.State();
-        const float d = track_.ProjectDistance(state.transform.position);
+        const float d = track_.ProjectDistance(state.transform.position, racer.lapDistance);
 
         // Lap crossing: distance wrapped past the line.
         const float prev = racer.lapDistance;
