@@ -198,6 +198,127 @@ int RunFlatStabilityTest(IPhysicsWorld& world) {
     return failures;
 }
 
+// Component-level differential regression (backend-agnostic — the Differential
+// never touches IPhysicsWorld, so it runs once per drive-test, not per engine):
+//  1. spool-equivalence baseline: preload=ramp=0 with lockFactor=1 splits
+//     exactly 50:50 (bias = 0) for any split state — the old rigid-driveline
+//     behaviour, used as the difference reference;
+//  2. cornering: a growing split (outer wheel faster, delta>0) pushes bias
+//     toward the faster wheel — driveL > driveR;
+//  3. open differential: lockFactor=0 caps the bias at 0 → 50:50 even under a
+//     growing split;
+//  4. decel parameter set: engine braking (negative axle drive) uses the decel
+//     lockFactor, capping the bias far below the accel cap;
+//  5. slew limit: the bias torque cannot step more than biasRateLimit*dt per
+//     substep, and converges to the preload over subsequent substeps.
+int RunDifferentialTest() {
+    int failures = 0;
+    auto check = [&failures](bool ok, const char* what, float got, float want) {
+        std::printf("[%s] diff: %s (got %.2f, target %.2f)\n", ok ? "PASS" : "FAIL", what, got,
+                    want);
+        if (!ok) ++failures;
+    };
+
+    const float r = 0.33f;
+    Differential::Input in;
+    in.wheelRadius = r;
+    in.wheelInertia = 1.5f;  // rear tire inertia, as the orchestrator passes it
+    in.fxTorqueDiff = 0.f;   // no tire reaction in the component harness
+
+    {
+        DifferentialParams p;
+        p.preloadAccel = 0.f;
+        p.rampAccel = 0.f;
+        p.lockFactorAccel = 1.f;
+        Differential d;
+        d.Init(p);
+        in.dt = 1.f;
+        in.axleDrive = 9000.f;
+        for (int i = 0; i < 4; ++i) {
+            const Differential::Output out = d.Step(in);
+            check(out.driveL == 4500.f, "spool baseline: exact 50:50 split",
+                  out.driveL, 4500.f);
+            check(out.driveR == 4500.f, "spool baseline: exact 50:50 split",
+                  out.driveR, 4500.f);
+        }
+    }
+
+    {
+        Differential d;  // defaults: preloadAccel 40, rampAccel 120, lock 0.65
+        d.Init(DifferentialParams{});
+        in.dt = 1.f;  // one-shot steps: slew (4000 Nm/s) is never binding
+        in.axleDrive = 9000.f;
+        // Preload spins the split up (no tire reaction here), then the ramp
+        // term takes over: the fast (left) wheel must get more drive.
+        Differential::Output out;
+        for (int i = 0; i < 2; ++i) out = d.Step(in);
+        check(out.driveL > out.driveR, "corner: bias toward the faster wheel",
+              out.driveL - out.driveR, 1.f);
+    }
+
+    {
+        DifferentialParams p;
+        p.lockFactorAccel = 0.f;  // open diff
+        Differential d;
+        d.Init(p);
+        in.dt = 1.f;
+        in.axleDrive = 9000.f;
+        Differential::Output out;
+        for (int i = 0; i < 4; ++i) out = d.Step(in);
+        check(std::fabs(out.driveL - out.driveR) < 1e-3f,
+              "open diff: bias capped at zero -> 50:50", out.driveL - out.driveR, 0.f);
+    }
+
+    {
+        // Decel vs accel parameter sets at the same split: engine braking
+        // must bias far below power (decel lockFactor/ramp). Steady state
+        // with no tire reaction: the split grows to the clutch slip limit,
+        // so bias = preload + ramp * 2*deltaMax per set.
+        const float dm = DifferentialParams{}.deltaMax;
+        Differential d;  // defaults
+        d.Init(DifferentialParams{});
+        in.dt = 0.1f;
+        in.axleDrive = -9000.f;  // engine braking
+        Differential::Output out;
+        for (int i = 0; i < 60; ++i) out = d.Step(in);
+        const float biasDecel = (out.driveL - out.driveR) * r;
+        const float wantDecel = 8.f + 30.f * 2.f * dm;
+        check(std::fabs(biasDecel - wantDecel) < 1e-1f, "decel: bias uses the decel ramp",
+              biasDecel, wantDecel);
+        Differential da;
+        da.Init(DifferentialParams{});
+        in.axleDrive = 9000.f;  // power
+        for (int i = 0; i < 60; ++i) out = da.Step(in);
+        const float biasAccel = (out.driveL - out.driveR) * r;
+        check(biasAccel > 2.f * biasDecel, "decel: bias far below power bias", biasAccel,
+              2.f * biasDecel);
+    }
+
+    {
+        DifferentialParams p;
+        p.rampAccel = 0.f;  // isolate the preload slew from the ramp term
+        Differential d;
+        d.Init(p);
+        in.dt = 1.f / 240.f;
+        in.axleDrive = 9000.f;
+        const float slewPerStep = 4000.f / 240.f;  // 16.667 Nm
+        // driveL - driveR = bias / r, so bias = (driveL - driveR) * r.
+        const auto o1 = d.Step(in);
+        const float b1 = (o1.driveL - o1.driveR) * r;
+        check(std::fabs(b1 - slewPerStep) < 1e-2f, "slew: bias rate limited per substep", b1,
+              slewPerStep);
+        const auto o2 = d.Step(in);
+        const float b2 = (o2.driveL - o2.driveR) * r;
+        check(std::fabs(b2 - 2.f * slewPerStep) < 1e-2f, "slew: bias slews toward preload", b2,
+              2.f * slewPerStep);
+        const auto o3 = d.Step(in);
+        const float b3 = (o3.driveL - o3.driveR) * r;
+        check(std::fabs(b3 - 40.f) < 1e-2f, "slew: bias converges to preload", b3, 40.f);
+    }
+
+    return failures;
+}
+
 // Menu/settings flow on the headless backend: boots into the menu (no
 // autostart), opens settings, comes back, starts a race — plus a render
 // smoke pass over the menu screens. Test mode is active (Config::SetTestMode),
@@ -1433,6 +1554,8 @@ int RunDriveTest(Config& config) {
     int failures = 0;
     std::printf("=== input recognizers ===\n");
     failures += RunInputTest();
+    std::printf("=== differential component ===\n");
+    failures += RunDifferentialTest();
     for (const char* engine : {"qu3e", "nudge", "rpc"}) {
         std::printf("=== physics backend: %s ===\n", engine);
         const auto start = std::chrono::steady_clock::now();
