@@ -50,56 +50,9 @@ AssistLevel ParseAssistLevel(const Config& config, const char* key, AssistLevel 
     return fallback;
 }
 
-// Effective aero areas after game rules — damage, DRS, X/Z wing mode and
-// pitch balance. Written into VehicleInput each substep; the engine only
-// integrates q * A into forces and never re-derives these from part health
-// or feature flags (game owns rules, engine owns integration).
-void WriteVehicleAero(Racer& racer) {
-    const VehicleParams& p = racer.vehicle.Params();
-    const VehicleState& s = racer.vehicle.State();
-
-    const float frontH = s.partHealth[static_cast<int>(CarPart::FrontWing)];
-    const float rearH = s.partHealth[static_cast<int>(CarPart::RearWing)];
-    const float sideH = s.partHealth[static_cast<int>(CarPart::Sidepods)];
-    const float floorH = s.partHealth[static_cast<int>(CarPart::Floor)];
-
-    const float floorGain = 0.55f + 0.45f * floorH;
-    const float sideGain = 0.82f + 0.18f * sideH;
-
-    // Pitch shifts aero balance: a nose-down car (braking) moves the center
-    // of pressure forward. Nose-up pitch is positive (body forward.y > 0).
-    const float pitch = std::asin(
-        Clampf(TransformDirection(s.transform, Vec3{0.f, 0.f, 1.f}).y, -1.f, 1.f));
-    const float frontShare =
-        Clampf(p.frontDownforceShare - p.aeroPitchBalance * pitch, 0.30f, 0.58f);
-
-    float frontDfArea = p.downforceArea * frontShare * (0.35f + 0.65f * frontH) * floorGain *
-                        sideGain;
-    float rearDfArea = p.downforceArea * (1.f - frontShare) * (0.30f + 0.70f * rearH) * floorGain *
-                       sideGain;
-    float dragArea =
-        p.dragArea * (1.f + 0.35f * (1.f - sideH) + 0.25f * (1.f - frontH) + 0.30f * (1.f - rearH));
-
-    // 2026 X/Z-mode: X trims both downforce and drag, Z is high downforce.
-    if (s.wingMode == WingMode::XMode) {
-        frontDfArea *= 0.72f;
-        rearDfArea *= 0.78f;
-        dragArea *= 0.80f;
-    }
-
-    // DRS: rear wing flap opens — big drag cut, rear downforce loss. Predict
-    // this step's activation from input + season gates so the areas match
-    // the flags Vehicle::Update is about to latch (no one-substep lag).
-    const bool drsActive = p.drsEnabled && racer.input.drsRequest && racer.input.drsZone;
-    if (drsActive) {
-        dragArea *= 0.74f;
-        rearDfArea *= 0.55f;
-    }
-
-    racer.input.dragArea = dragArea;
-    racer.input.frontDownforceArea = frontDfArea;
-    racer.input.rearDownforceArea = rearDfArea;
-}
+// Aero force rules live in the engine's AeroKit now (part health → area,
+// DRS / X-Z wing mode / pitch balance). The game only applies damage via
+// Vehicle::ProcessContacts.
 
 const char* AssistLevelName(AssistLevel level) {
     switch (level) {
@@ -304,18 +257,18 @@ void Game::SpawnRacersInto(std::vector<Racer>& out, const Track& track, IPhysics
         VehicleParams params;
         if (racer.isPlayer) {
             // Difficulty assists only apply to the player's car.
-            params.absLevel = cfg.absLevel;
-            params.tcLevel = cfg.tcLevel;
-            params.escLevel = cfg.escLevel;
-            params.steerLevel = cfg.steerLevel;
+            params.assists.absLevel = cfg.absLevel;
+            params.assists.tcLevel = cfg.tcLevel;
+            params.assists.escLevel = cfg.escLevel;
+            params.controls.steerLevel = cfg.steerLevel;
         } else {
             // AI cars run a fixed assist set so player difficulty settings
             // never change their behavior. Without the counter-steer / yaw
             // aids the AI spins at the assists-off difficulty.
-            params.absLevel = AssistLevel::Sport;
-            params.tcLevel = AssistLevel::Sport;
-            params.escLevel = AssistLevel::Full;
-            params.steerLevel = AssistLevel::Full;
+            params.assists.absLevel = AssistLevel::Sport;
+            params.assists.tcLevel = AssistLevel::Sport;
+            params.assists.escLevel = AssistLevel::Full;
+            params.controls.steerLevel = AssistLevel::Full;
         }
         params.damageEnabled = cfg.damage;
         // Season rules apply to every car (player and AI alike).
@@ -546,7 +499,7 @@ void Game::UpdateSim(float frameDt) {
     // they never race the sim worker's view of racers_.
     ApplyPlayerIntent();
 
-    // Data-parallel AI: each car only writes its own VehicleInput.
+    // Data-parallel AI: each car only writes its own CarInput.
     if (benchOn_) {
         const BenchClock::time_point t0 = BenchClock::now();
         rush::JobSystem::Get().ParallelFor(racers_.size(), [&](std::size_t i) {
@@ -612,6 +565,8 @@ void Game::PublishSnapshot() {
         pose.lastLapTime = racer.lastLapTime;
         pose.bestLapTime = racer.bestLapTime;
         pose.raceTime = racer.raceTime;
+        pose.partHealth = racer.vehicle.Aero().StateRef().partHealth;
+        pose.damageTotal = racer.vehicle.Aero().DamageTotal();
     }
     snap.valid = true;
     snap.publishTime = std::chrono::duration<double>(
@@ -784,7 +739,7 @@ void Game::ApplyPlayerIntent() {
         player.input.wingToggle = it.wingToggle && seasonAero_;
         player.input.overtake = raw.overtake && seasonOverride_;
     } else if (phase_ == RacePhase::Countdown) {
-        player.input = VehicleInput{};
+        player.input = CarInput{};
     } else {
         player.input.throttle = 0.f;
         player.input.brake = 0.8f;
@@ -809,7 +764,7 @@ void Game::ApplyPlayerIntent() {
     // AI 代驾 (autopilot): the player car drives itself — demo mode and the
     // AI regression harness ([race] autopilot=true).
     if (it.autopilot && phase_ == RacePhase::Racing && !player.finished) {
-        player.input = VehicleInput{};
+        player.input = CarInput{};
         UpdateAI(player, 0.f);
     }
 }
@@ -817,7 +772,7 @@ void Game::ApplyPlayerIntent() {
 void Game::UpdateAI(Racer& racer, float dt) {
     (void)dt;
     if (phase_ != RacePhase::Racing) {
-        racer.input = VehicleInput{};
+        racer.input = CarInput{};
         return;
     }
     const VehicleState& state = racer.vehicle.State();
@@ -860,10 +815,13 @@ void Game::UpdateAI(Racer& racer, float dt) {
     const VehicleParams& p = racer.vehicle.Params();
     const float gripRef = 0.5f * (p.frontTire.D0 + p.rearTire.D0);
     const float aLatBase = 9.81f * gripRef * 0.92f;
-    const float dfPerV2 = 0.5f * p.airDensity * p.downforceArea / p.mass;
+    const float dfPerV2 = 0.5f * p.aero.airDensity * p.aero.downforceArea / p.mass;
     const float gripDenom = curvMax - dfPerV2;
     float vTarget = gripDenom > 1e-4f ? std::sqrt(aLatBase / gripDenom) : 62.f;
-    vTarget = Clampf(vTarget * 0.95f, 12.f, 62.f);
+    // 0.90 safety factor: the rigid driveline couples the brakes to the crank
+    // inertia, so real decel is ~77% of the old free-wheeling calibration —
+    // the entry budget must carry that margin or corner entries run wide.
+    vTarget = Clampf(vTarget * 0.90f, 12.f, 62.f);
 
     const float total = track_.TotalLength();
     for (const Racer& other : racers_) {
@@ -929,10 +887,9 @@ void Game::StepPhysics(float dt) {
     // — backends are not thread-safe, so this batch stays serial. Parallel
     // vehicle substeps are an L2 concern only (never inside rpc*/qu3e/nudge).
     // AI above is pure state→input and is safe to split.
-    // Aero areas are game rules (damage / DRS / wing mode / pitch): write
-    // them into the input each substep so the engine only applies forces.
+    // Aero areas are computed inside Vehicle's AeroKit now (damage / DRS /
+    // wing mode / pitch); the engine applies the forces each substep.
     for (Racer& racer : racers_) {
-        WriteVehicleAero(racer);
         racer.vehicle.Update(racer.input, dt);
     }
     if (b) {
@@ -1141,6 +1098,9 @@ void Game::RenderHUD() {
                          frameSnap_->valid && !frameSnap_->cars.empty();
     const VehicleState& state =
         snapHud ? frameSnap_->cars[0].state : racers_.front().vehicle.State();
+    const std::array<float, 4>& partHealth =
+        snapHud ? frameSnap_->cars[0].partHealth
+                : racers_.front().vehicle.Aero().StateRef().partHealth;
     const int position = snapHud ? frameSnap_->cars[0].position : racers_.front().position;
     const int lap = snapHud ? frameSnap_->cars[0].lap : racers_.front().lap;
     const float lastLapTime =
@@ -1195,7 +1155,7 @@ void Game::RenderHUD() {
     renderer_.DrawText2D("DAMAGE", 20.f, baseY + 56.f, 16, Color::Gray());
     static const char* kPartNames[4] = {"FW", "RW", "SP", "FL"};
     for (int i = 0; i < 4; ++i) {
-        const float health = state.partHealth[i];
+        const float health = partHealth[i];
         const float x = 20.f + static_cast<float>(i) * 68.f;
         renderer_.DrawRect2D(x, baseY + 80.f, 60.f, 12.f, Color{0.15f, 0.15f, 0.18f, 0.9f});
         renderer_.DrawRect2D(x + 2.f, baseY + 82.f, 56.f * health, 8.f,

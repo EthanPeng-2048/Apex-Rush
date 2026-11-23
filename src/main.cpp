@@ -111,7 +111,7 @@ int RunFlatStabilityTest(IPhysicsWorld& world) {
     };
 
     const float dt = 1.f / 240.f;  // matches Game::kFixedDt
-    auto step = [&](const VehicleInput& in, float seconds) {
+    auto step = [&](const CarInput& in, float seconds) {
         const int n = static_cast<int>(seconds / dt + 0.5f);
         for (int i = 0; i < n; ++i) {
             car.Update(in, dt);
@@ -126,18 +126,18 @@ int RunFlatStabilityTest(IPhysicsWorld& world) {
         return std::fabs(Dot(s.velocity, Cross(heading(), Vec3{0.f, 1.f, 0.f})));
     };
 
-    step(VehicleInput{}, 1.0f);  // settle on the suspension
+    step(CarInput{}, 1.0f);  // settle on the suspension
 
     // Phase A: mid speed. Even at ~75 km/h the old ESC reference already
     // ratcheted a 0.25 tap to full lock.
     {
-        VehicleInput accel;
+        CarInput accel;
         accel.throttle = 1.f;
         step(accel, 2.2f);
         const float v0 = car.State().speed;
         const Vec3 heading0 = heading();
 
-        VehicleInput tap;
+        CarInput tap;
         tap.throttle = 0.3f;
         tap.steer = 0.25f;
         step(tap, 1.0f);
@@ -161,13 +161,13 @@ int RunFlatStabilityTest(IPhysicsWorld& world) {
     // then repeat the tap. This is the regime where a slight steer used to
     // spin the car instantly.
     {
-        VehicleInput accel;
+        CarInput accel;
         accel.throttle = 1.f;
         step(accel, 10.f);
         const float v0 = car.State().speed;
         const Vec3 heading0 = heading();
 
-        VehicleInput tap;
+        CarInput tap;
         tap.throttle = 0.2f;
         tap.steer = 0.25f;
         step(tap, 1.2f);
@@ -618,12 +618,12 @@ int RunAIDifficultyIsolationTest(const char* engine) {
 
     const VehicleParams& aiParams = game.Racers()[1].vehicle.Params();
     const VehicleParams& playerParams = game.Racers()[0].vehicle.Params();
-    check(playerParams.steerLevel == AssistLevel::Off, "diff: player keeps off assists",
-          static_cast<float>(playerParams.steerLevel), 0.f);
-    check(aiParams.steerLevel == AssistLevel::Full, "diff: ai steer assist fixed",
-          static_cast<float>(aiParams.steerLevel), 2.f);
-    check(aiParams.escLevel == AssistLevel::Full, "diff: ai esc assist fixed",
-          static_cast<float>(aiParams.escLevel), 2.f);
+    check(playerParams.controls.steerLevel == AssistLevel::Off, "diff: player keeps off assists",
+          static_cast<float>(playerParams.controls.steerLevel), 0.f);
+    check(aiParams.controls.steerLevel == AssistLevel::Full, "diff: ai steer assist fixed",
+          static_cast<float>(aiParams.controls.steerLevel), 2.f);
+    check(aiParams.assists.escLevel == AssistLevel::Full, "diff: ai esc assist fixed",
+          static_cast<float>(aiParams.assists.escLevel), 2.f);
 
     const Track& track = game.GetTrack();
     const float d0 = track.ProjectDistance(game.Racers()[1].vehicle.State().transform.position);
@@ -735,7 +735,7 @@ int RunWallCrashTest(IPhysicsWorld& world) {
     int contactEvents = 0;
     float maxImpact = 0.f;
     for (int i = 0; i < 480; ++i) {  // 2 s: reach the wall, crash, settle
-        VehicleInput in;
+        CarInput in;
         car.Update(in, dt);
         world.Step(dt);
         const std::vector<ContactEvent> contacts = world.DrainContacts();
@@ -784,12 +784,12 @@ int RunSeasonGateTest(IPhysicsWorld& world) {
         pose.position = {0.f, 0.55f, 0.f};
         car.Spawn(world, pose, params);
         for (int i = 0; i < 60; ++i) {  // settle on the suspension
-            car.Update(VehicleInput{}, dt);
+            car.Update(CarInput{}, dt);
             world.Step(dt);
         }
         return car;
     };
-    auto step = [&](Vehicle& car, const VehicleInput& in, float seconds) {
+    auto step = [&](Vehicle& car, const CarInput& in, float seconds) {
         const int n = static_cast<int>(seconds / dt + 0.5f);
         for (int i = 0; i < n; ++i) {
             car.Update(in, dt);
@@ -802,20 +802,20 @@ int RunSeasonGateTest(IPhysicsWorld& world) {
         VehicleParams params;  // defaults: drs on, aero/override off
         Vehicle car = spawn(params);
 
-        VehicleInput drs;
+        CarInput drs;
         drs.drsZone = true;
         drs.drsRequest = true;
         step(car, drs, 0.05f);
         check(car.State().drsActive, "season: classic DRS works in zone",
               car.State().drsActive ? 1.f : 0.f, 1.f);
 
-        VehicleInput wing;
+        CarInput wing;
         wing.wingToggle = true;
         step(car, wing, 0.05f);
         check(car.State().wingMode == WingMode::ZMode, "season: classic ignores wing toggle",
               static_cast<float>(car.State().wingMode), static_cast<float>(WingMode::ZMode));
 
-        VehicleInput ovt;
+        CarInput ovt;
         ovt.overtake = true;
         ovt.throttle = 1.f;
         step(car, ovt, 0.3f);
@@ -832,20 +832,20 @@ int RunSeasonGateTest(IPhysicsWorld& world) {
         params.overtakeEnabled = true;
         Vehicle car = spawn(params);
 
-        VehicleInput drs;
+        CarInput drs;
         drs.drsZone = true;
         drs.drsRequest = true;
         step(car, drs, 0.05f);
         check(!car.State().drsActive, "season: 2026 ignores DRS",
               car.State().drsActive ? 1.f : 0.f, 0.f);
 
-        VehicleInput wing;
+        CarInput wing;
         wing.wingToggle = true;
         step(car, wing, 0.05f);
         check(car.State().wingMode == WingMode::XMode, "season: 2026 wing toggle works",
               static_cast<float>(car.State().wingMode), static_cast<float>(WingMode::XMode));
 
-        VehicleInput ovt;
+        CarInput ovt;
         ovt.overtake = true;
         ovt.throttle = 1.f;
         step(car, ovt, 0.3f);

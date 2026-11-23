@@ -33,7 +33,7 @@ enum class RacePhase {
 
 struct Racer {
     Vehicle vehicle;
-    VehicleInput input;
+    CarInput input;
     std::string name;
     bool isPlayer = false;
     int lap = 0;
@@ -109,6 +109,9 @@ public:
         float lastLapTime = 0.f;
         float bestLapTime = 0.f;
         float raceTime = 0.f;
+        // Aero part health (owned by AeroKit; mirrored for the snapshot/HUD).
+        std::array<float, 4> partHealth{1.f, 1.f, 1.f, 1.f};
+        float damageTotal = 0.f;
     };
     struct RaceSnapshot {
         std::vector<CarPose> cars;
