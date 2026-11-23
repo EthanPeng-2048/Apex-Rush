@@ -319,6 +319,57 @@ int RunDifferentialTest() {
     return failures;
 }
 
+// TireModel self-aligning moment regression: the caster-trail yaw moment must
+// oppose the body slip (restore a turn), vanish without trail, and scale
+// linearly with trail. Component-level, backend-agnostic.
+int RunTireAlignTest() {
+    int failures = 0;
+    auto check = [&failures](bool ok, const char* what, float got, float want) {
+        std::printf("[%s] align: %s (got %.2f, target %.2f)\n", ok ? "PASS" : "FAIL", what, got,
+                    want);
+        if (!ok) ++failures;
+    };
+
+    const float load = 4000.f;
+    const Vec3 fwd{0.f, 0.f, 1.f};
+    const Vec3 right{1.f, 0.f, 0.f};
+    const float dt = 1.f / 240.f;
+    const float trail = 0.035f;
+
+    // Slip to the geometric left (+right axis): the tire pushes back along
+    // -right (fyLat < 0), so a positive (restoring, up-yaw) align moment.
+    {
+        TireModel tire(TireModel::Params::Front());
+        const auto out = tire.Compute(load, Vec3{0.8f, 0.f, 12.f}, fwd, right, 0.f, 0.f, dt, 0.f,
+                                      false, 0.f, trail);
+        check(out.alignMoment > 0.f, "left slip -> restoring positive yaw", out.alignMoment, 0.f);
+    }
+    {
+        TireModel tire(TireModel::Params::Front());
+        const auto out = tire.Compute(load, Vec3{-0.8f, 0.f, 12.f}, fwd, right, 0.f, 0.f, dt, 0.f,
+                                      false, 0.f, trail);
+        check(out.alignMoment < 0.f, "right slip -> negative yaw", out.alignMoment, 0.f);
+    }
+    {
+        TireModel tire(TireModel::Params::Front());
+        const auto out = tire.Compute(load, Vec3{0.8f, 0.f, 12.f}, fwd, right, 0.f, 0.f, dt, 0.f,
+                                      false, 0.f, 0.f);
+        check(out.alignMoment == 0.f, "no trail -> no moment", out.alignMoment, 0.f);
+    }
+    {
+        TireModel a(TireModel::Params::Front());
+        const auto o1 = a.Compute(load, Vec3{0.8f, 0.f, 12.f}, fwd, right, 0.f, 0.f, dt, 0.f,
+                                  false, 0.f, trail);
+        TireModel b(TireModel::Params::Front());
+        const auto o2 = b.Compute(load, Vec3{0.8f, 0.f, 12.f}, fwd, right, 0.f, 0.f, dt, 0.f,
+                                  false, 0.f, 2.f * trail);
+        check(std::fabs(o2.alignMoment - 2.f * o1.alignMoment) < 1e-3f,
+              "linear in trail", o2.alignMoment, 2.f * o1.alignMoment);
+    }
+
+    return failures;
+}
+
 // Menu/settings flow on the headless backend: boots into the menu (no
 // autostart), opens settings, comes back, starts a race — plus a render
 // smoke pass over the menu screens. Test mode is active (Config::SetTestMode),
@@ -1556,6 +1607,8 @@ int RunDriveTest(Config& config) {
     failures += RunInputTest();
     std::printf("=== differential component ===\n");
     failures += RunDifferentialTest();
+    std::printf("=== tire align moment ===\n");
+    failures += RunTireAlignTest();
     for (const char* engine : {"qu3e", "nudge", "rpc"}) {
         std::printf("=== physics backend: %s ===\n", engine);
         const auto start = std::chrono::steady_clock::now();
