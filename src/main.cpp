@@ -301,6 +301,78 @@ int RunMenuTest() {
     return failures;
 }
 
+// Walk the menu through the REAL recognizer path (NullInputSource feeds raw
+// key states, InputSystem::PumpOnce runs the gesture machines, Game::Consume
+// folds events). This is what a real keyboard does — unlike RunMenuTest which
+// injects Click events directly. Verifies direction mapping isn't broken by
+// the recognizer/context layer.
+int RunMenuRealKeysTest() {
+    NullBackend backend;
+    ScriptedInput testInput;
+    if (!backend.Init(1280, 720, "menu-realkeys")) {
+        std::printf("[FAIL] menu-realkeys backend init\n");
+        return 1;
+    }
+    Config config;
+    config.Load(DataPath("config.rushconf"));
+    Game game(backend, testInput.system, config);
+    if (!game.Init()) {
+        std::printf("[FAIL] menu-realkeys game init\n");
+        return 1;
+    }
+    int failures = 0;
+    auto checkPhase = [&failures](bool ok, const char* what, RacePhase got, RacePhase want) {
+        std::printf("[%s] realkey: %s (got %d, want %d)\n", ok ? "PASS" : "FAIL", what,
+                    static_cast<int>(got), static_cast<int>(want));
+        if (!ok) ++failures;
+    };
+    // Tap a raw key: down for one frame, up next — a real quick keypress.
+    auto tap = [&](KeyCode k) {
+        testInput.source.scripted = RawFrame{};
+        testInput.source.scripted.keys[static_cast<size_t>(k)] = true;
+        backend.BeginFrame();
+        game.Update();
+        backend.EndFrame();
+        testInput.source.scripted = RawFrame{};
+        backend.BeginFrame();
+        game.Update();
+        backend.EndFrame();
+    };
+
+    // Boot into menu.
+    checkPhase(game.Phase() == RacePhase::Menu, "boot into menu", game.Phase(), RacePhase::Menu);
+
+    // cursor0=START RACE. Enter → RaceSetup.
+    tap(KeyCode::Enter);
+    checkPhase(game.Phase() == RacePhase::RaceSetup, "Enter at START → RaceSetup",
+               game.Phase(), RacePhase::RaceSetup);
+    tap(KeyCode::Escape);  // back to menu
+    checkPhase(game.Phase() == RacePhase::Menu, "Escape back to menu", game.Phase(),
+               RacePhase::Menu);
+
+    // Down once → cursor1=SETTINGS. Enter → Settings.
+    tap(KeyCode::Down);
+    tap(KeyCode::Enter);
+    checkPhase(game.Phase() == RacePhase::Settings, "Down then Enter → Settings",
+               game.Phase(), RacePhase::Settings);
+    tap(KeyCode::Escape);
+    checkPhase(game.Phase() == RacePhase::Menu, "Escape from settings", game.Phase(),
+               RacePhase::Menu);
+
+    // Up from menu cursor0 wraps to cursor2=QUIT. Up once from START → QUIT.
+    tap(KeyCode::Up);
+    tap(KeyCode::Enter);
+    checkPhase(game.Phase() == RacePhase::Menu, "Up then Enter → QUIT (phase stays menu)",
+               game.Phase(), RacePhase::Menu);
+    if (!game.WantsQuit()) {
+        std::printf("[FAIL] realkey: Up+Enter at QUIT should want quit\n");
+        ++failures;
+    }
+
+    backend.Shutdown();
+    return failures;
+}
+
 // DRS zone semantics: F only arms inside a map-marked zone (zones.csv),
 // DRS stays open through speed and steering changes while in the zone, and
 // leaving the zone closes it and resets the latch so re-entry starts
@@ -976,6 +1048,8 @@ int RunDriveTestForEngine(Config& config, const char* engine) {
 
     // 6) Menu / settings flow (headless, backend-agnostic).
     failures += RunMenuTest();
+    // 6a) Same flow through the real recognizer path (raw key feed).
+    failures += RunMenuRealKeysTest();
 
     // 6b) DRS zone semantics: map-marked zones, latch reset on exit.
     failures += RunDrsZoneTest(engine);
@@ -1331,6 +1405,26 @@ int RunInputTest() {
     cfg.SetString("input", "throttle.keys", "???");
     ov = reg.ApplyOverrides(cfg, "input");
     check(!ov.has_value(), "overrides: unrecognized key returns Err", ov.has_value() ? 0.f : 1.f, 1.f);
+
+    // --- Prefix-collision regression (menu.back vs menu.down) ----------------
+    // "menu.back.click" must fold only into menuBack, never menuDown — the
+    // shared "menu." head used to let the suffix-only matcher hit menu.down.
+    reg.Register({.name = "menu.down", .gesture = Gesture::Click,
+                  .keys = {{.key = key(KeyCode::Down)}}, .context = "menu"});
+    reg.Register({.name = "menu.back", .gesture = Gesture::Click,
+                  .keys = {{.key = key(KeyCode::Escape)}}, .context = "menu"});
+    InputEvent backEv;
+    backEv.nameId = InternInputName("menu.back.click");
+    backEv.gesture = Gesture::Click;
+    backEv.value = 1.f;
+    backEv.tSec = input.Now();
+    InputBus().Publish(backEv);
+    InputState folded;
+    input.Consume(folded);
+    check(folded.menuBack, "prefix: menu.back folds into menuBack",
+          folded.menuBack ? 1.f : 0.f, 1.f);
+    check(!folded.menuDown, "prefix: menu.back does NOT leak into menuDown",
+          folded.menuDown ? 0.f : 1.f, 1.f);
 
     return failures;
 }
