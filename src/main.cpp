@@ -370,6 +370,61 @@ int RunTireAlignTest() {
     return failures;
 }
 
+// AeroKit directional-stability regression (component-level, no world): body
+// slip must yield a restoring side force and yaw moment, copHeight raises the
+// application point, and the terms vanish at standstill (q ~ v^2).
+int RunAeroTest() {
+    int failures = 0;
+    auto check = [&failures](bool ok, const char* what, float got, float want) {
+        std::printf("[%s] aero: %s (got %.2f, target %.2f)\n", ok ? "PASS" : "FAIL", what, got,
+                    want);
+        if (!ok) ++failures;
+    };
+
+    CarFrame frame;
+    frame.chassis.position = {0.f, 0.5f, 0.f};
+    frame.chassis.rotation = Quat{0.f, 0.f, 0.f, 1.f};
+    frame.forward = {0.f, 0.f, 1.f};
+    frame.right = {1.f, 0.f, 0.f};
+    frame.up = {0.f, 1.f, 0.f};
+
+    AeroKit aero;
+    aero.Init(AeroKitParams{});
+
+    // Left slip: velocity has a +right (+X) component.
+    frame.velocity = {2.f, 0.f, 40.f};
+    frame.forwardSpeed = 40.f;
+    frame.speed = Length(frame.velocity);
+    frame.angularVelocity = {};
+    const AeroKit::Output out = aero.Compute(frame, WingMode::ZMode, false);
+    check(out.sideForce.x < 0.f, "left slip -> restoring rightward force", out.sideForce.x, 0.f);
+    check(out.yawMoment.y < 0.f, "left slip -> restoring (negative) yaw moment",
+          out.yawMoment.y, 0.f);
+    // COP raised by copHeight above the chassis origin.
+    const float copHeight = AeroKitParams{}.copHeight;
+    check(std::fabs(out.cop.y - 0.5f - copHeight) < 1e-3f, "cop raised by copHeight",
+          out.cop.y, 0.5f + copHeight);
+
+    // Right slip mirrors the signs.
+    frame.velocity = {-2.f, 0.f, 40.f};
+    const AeroKit::Output out2 = aero.Compute(frame, WingMode::ZMode, false);
+    check(out2.sideForce.x > 0.f, "right slip -> restoring leftward force", out2.sideForce.x,
+          0.f);
+    check(out2.yawMoment.y > 0.f, "right slip -> restoring (positive) yaw moment",
+          out2.yawMoment.y, 0.f);
+
+    // Standstill: q = 0, the stability terms vanish exactly.
+    frame.velocity = {};
+    frame.forwardSpeed = 0.f;
+    frame.speed = 0.f;
+    const AeroKit::Output out3 = aero.Compute(frame, WingMode::ZMode, false);
+    check(out3.sideForce.x == 0.f && out3.sideForce.y == 0.f && out3.sideForce.z == 0.f &&
+              out3.yawMoment.x == 0.f && out3.yawMoment.y == 0.f && out3.yawMoment.z == 0.f,
+          "standstill -> no aero terms", Length(out3.sideForce), 0.f);
+
+    return failures;
+}
+
 // Menu/settings flow on the headless backend: boots into the menu (no
 // autostart), opens settings, comes back, starts a race — plus a render
 // smoke pass over the menu screens. Test mode is active (Config::SetTestMode),
@@ -1609,6 +1664,8 @@ int RunDriveTest(Config& config) {
     failures += RunDifferentialTest();
     std::printf("=== tire align moment ===\n");
     failures += RunTireAlignTest();
+    std::printf("=== aero stability ===\n");
+    failures += RunAeroTest();
     for (const char* engine : {"qu3e", "nudge", "rpc"}) {
         std::printf("=== physics backend: %s ===\n", engine);
         const auto start = std::chrono::steady_clock::now();
