@@ -16,6 +16,18 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT EMSCRIPTEN)
         add_compile_options(-O3 -flto=thin)
         add_link_options(-flto=thin -fuse-ld=lld)
     endif()
+    # Target x86-64-v3 (AVX2 + FMA) on native desktop builds. Measured effect on
+    # the collision kernel is nil (it is latency bound - see
+    # docs/rpc-optimization.md section 4.3), but vehicle math, render transforms
+    # and the audio mix do use these instructions and enabling them costs
+    # nothing. Turn OFF when shipping to pre-2015 CPUs.
+    # Default OFF: A/B on this machine showed x86-64-v3 is neutral on the
+    # collision kernel and ~10% SLOWER on the suspension ray path (see
+    # docs/rpc-optimization.md §4.3), so it is opt-in rather than default.
+    option(APEX_NATIVE_ARCH "Compile for x86-64-v3 (AVX2/FMA)" OFF)
+    if(APEX_NATIVE_ARCH AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        add_compile_options(-march=x86-64-v3)
+    endif()
 elseif(MSVC)
     add_compile_options(/W3 /permissive-)
 endif()
@@ -59,7 +71,7 @@ add_executable(apex-rush
     src/game/Game.cpp
 )
 
-target_include_directories(apex-rush PRIVATE src third_party/miniaudio)
+target_include_directories(apex-rush PRIVATE src third_party/miniaudio rush-engine/src)  # rush-engine/src: TEMP probe
 target_link_libraries(apex-rush PRIVATE raylib enet rush::engine)
 
 # miniaudio is a ~4 MB single-header TU; the audio mixer needs no -O3 and the
@@ -85,6 +97,21 @@ add_executable(rpc-tests
 )
 target_link_libraries(rpc-tests PRIVATE rush-physics-core)
 add_test(NAME rpc-compute-aabb COMMAND rpc-tests)
+
+# Pile-up stress harness: many multi-box car bodies spawned overlapping.
+add_executable(rpc-pileup-tests
+    rush-engine/third_party/rush-physics-core/tests/test_pileup.cpp
+)
+target_link_libraries(rpc-pileup-tests PRIVATE rush-physics-core)
+add_test(NAME rpc-pileup COMMAND rpc-pileup-tests --cars 40 --seconds 2)
+
+# Ray-index conformance: BVH vs static-grid+sweep vs brute force, plus injected
+# factory (proves the rpcRayIndex seam). Fails on any closest-hit mismatch.
+add_executable(rpc-ray-index-tests
+    rush-engine/third_party/rush-physics-core/tests/test_ray_index.cpp
+)
+target_link_libraries(rpc-ray-index-tests PRIVATE rush-physics-core)
+add_test(NAME rpc-ray-index COMMAND rpc-ray-index-tests)
 
 if(WIN32)
     target_link_libraries(apex-rush PRIVATE winmm)

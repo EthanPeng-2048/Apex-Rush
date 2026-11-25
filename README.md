@@ -87,6 +87,7 @@ Apex Rush Online/
 | [docs/architecture.md](docs/architecture.md) | 现行 | 系统分层、模块、异步运行时、三物理后端 |
 | [docs/input.md](docs/input.md) | 已实施 | 统一输入：input 线程、注册表、纯事件总线（无回调） |
 | [docs/rpc-refactor.md](docs/rpc-refactor.md) | P0+P1 已实施；P2 设计稿 | Rush Physics Core 重构与性能 |
+| [docs/rpc-optimization.md](docs/rpc-optimization.md) | 现行方案 | RPC 内核深度优化：算法 / 硬件 / 现代 C++ 三层清单与路线图 |
 | [docs/perf-async-engine.md](docs/perf-async-engine.md) | 现行报告 | 百车同步 → 全异步引擎对比 |
 | [docs/history/](docs/history/) | 归档 | 原始设计、KVRec 迁移方案（已完成） |
 

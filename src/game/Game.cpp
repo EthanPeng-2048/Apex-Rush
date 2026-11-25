@@ -309,6 +309,32 @@ static std::unique_ptr<IPhysicsWorld> MakePhysicsWorld(const std::string& engine
 
 void Game::SpawnRacers() { SpawnRacersInto(racers_, track_, *world_, MakeRaceBuildConfig()); }
 
+// Bench runs the parallel-island path (bit-identical numerics) and needs the
+// per-stage timers; both are world settings, and the world may be (re)built
+// after SetBench was called, so re-apply them on every build.
+void Game::ApplyWorldTuning() {
+    if (!world_) return;
+    world_->SetParallelIslands(benchOn_);
+    world_->SetDiagnostics(benchOn_);
+}
+
+void Game::StressPileUp(float radius, float speed) {
+    if (!world_ || racers_.empty()) return;
+    const Vec3 origin = track_.PositionAt(track_.TotalLength() * 0.35f) + Vec3{0.f, 1.2f, 0.f};
+    for (size_t i = 0; i < racers_.size(); ++i) {
+        const float a = static_cast<float>(i) * 2.39996323f;  // golden angle
+        const float r = radius * std::sqrt(static_cast<float>(i) / static_cast<float>(racers_.size()));
+        const Vec3 offset{std::cos(a) * r, 0.f, std::sin(a) * r};
+        Transform pose;
+        pose.position = origin + offset;
+        pose.rotation = track_.StartRotation();
+        Racer& racer = racers_[i];
+        racer.vehicle.Reset(pose);
+        const Vec3 inward = r > 1e-3f ? Normalize(Vec3{} - offset) : Vec3{};
+        (void)world_->SetLinearVelocity(racer.vehicle.Chassis(), inward * speed);
+    }
+}
+
 // (Re)build world, track and grid from the current config — used at boot and
 // whenever the player starts a race from the menu (inline / drive-test).
 // Interactive starts go through BeginRaceLoad() instead.

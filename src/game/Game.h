@@ -74,6 +74,11 @@ public:
     RacePhase Phase() const { return phase_; }
     float RaceClock() const { return raceClock_; }
     const Track& GetTrack() const { return track_; }
+    // Physics world (diagnostics / QA hooks). Null before the first race build.
+    const IPhysicsWorld* World() const { return world_.get(); }
+    // QA hook (--stress): drop every car into one small area at speed so the
+    // collision path gets hammered the way a mid-race pile-up does.
+    void StressPileUp(float radius, float speed);
     // True while the player's DRS toggle is latched on (test hook: the
     // latch resets when leaving a DRS zone, which drives re-entry behavior).
     bool PlayerDrsWanted() const { return drsWanted_; }
@@ -97,8 +102,10 @@ public:
     void SetBench(bool on) {
         benchOn_ = on;
         // Bench runs the parallel-island path (bit-identical numerics, only
-        // execution order changes; drive-test never enables it).
-        if (world_) world_->SetParallelIslands(on);
+        // execution order changes; drive-test never enables it) and needs the
+        // physics stage timers. Applied to the current world, and re-applied
+        // whenever a race build replaces it.
+        ApplyWorldTuning();
     }
     void ResetBench() { bench_ = BenchSample{}; }
     const BenchSample& Bench() const { return bench_; }
@@ -175,6 +182,7 @@ private:
     void BuildWorld();
     void LoadSettings();
     void SpawnRacers();
+    void ApplyWorldTuning();
     static void SpawnRacersInto(std::vector<Racer>& out, const Track& track,
                                 IPhysicsWorld& world, const RaceBuildConfig& cfg);
     RaceBuildConfig MakeRaceBuildConfig();

@@ -10,6 +10,7 @@
 #include <thread>
 
 #include <rush/rush.h>
+#include "physics/raycast_probe.h"  // TEMP probe — remove with the perf work
 
 import rush.engine.core;
 import rush.engine.job;
@@ -1821,9 +1822,10 @@ int RunDriveTest(Config& config) {
 // backend. Autopilot grid, fixed assist pins, N seconds of racing after the
 // countdown. Prints per-frame section means so the async-engine refactor can
 // be compared against this baseline byte-for-byte on the same workload.
-int RunBench(Config& config, int cars, const char* engine, double raceSeconds) {
+int RunBench(Config& config, int cars, const char* engine, double raceSeconds, int hz) {
     config.SetString("physics", "engine", engine);
     config.SetString("race", "cars", std::to_string(cars));
+    if (hz > 0) config.SetString("physics", "hz", std::to_string(hz));
     config.SetString("race", "autostart", "true");
     config.SetString("race", "autopilot", "true");
     config.SetString("assists", "steer", "full");
@@ -1901,10 +1903,121 @@ int RunBench(Config& config, int cars, const char* engine, double raceSeconds) {
         steps / wall.count(), n / wall.count());
 
     backend.Shutdown();
+
+    // Per-stage physics breakdown of the final substep (backend-reported; an
+    // all-zero report means the backend does not instrument itself). This is
+    // the number that tells you whether to attack broadphase, narrowphase or
+    // the solver next.
+    IPhysicsWorld::StageStats stage;
+    if (game.World()) game.World()->ReadStageStats(stage);
+    if (stage.steps > 0 || stage.gridCells > 0) {
+        std::printf("  stage ms:      broad=%.4f  narrow=%.4f  build=%.4f  solve=%.4f"
+                    "  (contacts=%d points=%d islands=%d cells=%d)\n",
+                    stage.broadphaseMs, stage.narrowphaseMs, stage.islandBuildMs, stage.solveMs,
+                    stage.contacts, stage.contactPoints, stage.islands, stage.gridCells);
+    }
+
+    // TEMP probe: per-backend raycast cost (remove with the probe).
+    const auto rp = apex::RpcRaycastProbe();
+    if (rp.calls > 0) {
+        std::printf("  raycast[rpc]:  calls=%llu  avg=%.3fus  leaf/ray=%.2f  nodes/ray=%.1f\n",
+                    static_cast<unsigned long long>(rp.calls), rp.micros / rp.calls,
+                    static_cast<double>(rp.leafTests) / rp.calls,
+                    static_cast<double>(rp.nodeVisits) / rp.calls);
+    }
+    const auto qp = apex::Qu3eRaycastProbe();
+    if (qp.calls > 0) {
+        std::printf("  raycast[qu3e]: calls=%llu  avg=%.3fus  leaf/ray=%.2f\n",
+                    static_cast<unsigned long long>(qp.calls), qp.micros / qp.calls,
+                    static_cast<double>(qp.leafTests) / qp.calls);
+    }
     return 0;
 }
 
 }  // namespace
+
+// `apex-rush --stress [cars] [hz] [seconds]`: collision stress run. Collapses
+// the whole grid into one spot at speed (what a mid-pack pile-up does) and
+// reports frame cost plus any body that went non-finite or ran away, so
+// "several cars collide" stays measurable and regression-testable.
+int RunStress(Config& config, int cars, int hz, double seconds, const char* engine) {
+    config.SetString("physics", "engine", engine);
+    config.SetString("physics", "hz", std::to_string(hz));
+    config.SetString("race", "cars", std::to_string(cars));
+    config.SetString("race", "autostart", "true");
+    config.SetString("race", "autopilot", "true");
+    config.SetString("race", "damage", "true");
+    config.SetString("assists", "steer", "full");
+    config.SetString("assists", "esc", "full");
+    config.SetString("assists", "tc", "sport");
+    config.SetString("assists", "abs", "sport");
+
+    NullBackend backend;
+    ScriptedInput testInput;
+    if (!backend.Init(1280, 720, "stress")) {
+        std::printf("[FAIL] stress backend init\n");
+        return 1;
+    }
+    Game game(backend, testInput.system, config);
+    if (!game.Init()) {
+        std::printf("[FAIL] stress game init\n");
+        return 1;
+    }
+    game.SetBench(true);
+
+    auto frame = [&] {
+        testInput.set(InputState{});
+        backend.BeginFrame();
+        game.Update();
+        backend.EndFrame();
+    };
+
+    // Countdown + settle so every car is on its wheels before the pile forms.
+    for (int i = 0; i < 240; ++i) frame();
+
+    game.ResetBench();
+    game.StressPileUp(7.f, 40.f);
+
+    int badStates = 0;
+    float worstSpeed = 0.f;
+    float worstY = 0.f;
+    const int frames = static_cast<int>(seconds / backend.frameDt + 0.5);
+    const auto wall0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < frames; ++i) {
+        frame();
+        for (const Racer& racer : game.Racers()) {
+            const VehicleState& s = racer.vehicle.State();
+            const Vec3 p = s.transform.position;
+            const bool finite = std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z) &&
+                                std::isfinite(s.velocity.x) && std::isfinite(s.velocity.y) &&
+                                std::isfinite(s.velocity.z) && std::isfinite(s.speed);
+            if (!finite || s.speed > 400.f) ++badStates;
+            if (s.speed > worstSpeed) worstSpeed = s.speed;
+            if (std::fabs(p.y) > std::fabs(worstY)) worstY = p.y;
+        }
+    }
+    const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - wall0).count();
+    const Game::BenchSample& s = game.Bench();
+    const double n = s.frames > 0 ? static_cast<double>(s.frames) : 1.0;
+    const double steps = s.physSteps > 0 ? static_cast<double>(s.physSteps) : 1.0;
+    auto frameTimes = s.frameTimesMs;
+    std::sort(frameTimes.begin(), frameTimes.end());
+    const auto pct = [&frameTimes](double p) {
+        if (frameTimes.empty()) return 0.0;
+        const size_t k = std::min(frameTimes.size() - 1,
+                                  static_cast<size_t>(frameTimes.size() * p));
+        return frameTimes[k];
+    };
+
+    std::printf("stress[%s] cars=%d hz=%d frames=%ld physSteps=%ld wall=%.3fs\n", engine, cars, hz,
+                s.frames, s.physSteps, wall);
+    std::printf("  frame ms: mean=%.2f p50=%.2f p99=%.2f max=%.2f   (%.1f fps wall)\n",
+                1e3 * s.updateSec / n, pct(0.50), pct(0.99), pct(1.0), n / wall);
+    std::printf("  step  ms: vehicle=%.4f world=%.4f   badStates=%d  maxSpeed=%.1f m/s  max|y|=%.1f\n",
+                1e3 * s.vehicleSec / steps, 1e3 * s.stepSec / steps, badStates, worstSpeed, worstY);
+    backend.Shutdown();
+    return badStates == 0 ? 0 : 1;
+}
 
 int main(int argc, char** argv) {
     using namespace apex;
@@ -1919,9 +2032,29 @@ int main(int argc, char** argv) {
     bool settingsShot = false;
     bool bench = false;
     int benchCars = 16;
+    int benchHz = 0;  // 0 = use the configured rate
+    const char* benchEngine = nullptr;  // null = all backends
+    bool stress = false;
+    int stressCars = 120;
+    int stressHz = 480;
+    double stressSeconds = 20.0;
+    const char* stressEngine = "rpc";
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--drive-test") == 0) {
             driveTest = true;
+        } else if (std::strcmp(argv[i], "--stress") == 0) {
+            stress = true;
+            if (i + 2 < argc && argv[i + 1][0] != '-' && argv[i + 2][0] != '-') {
+                stressCars = std::clamp(std::atoi(argv[i + 1]), 1, 120);
+                stressHz = std::max(60, std::atoi(argv[i + 2]));
+                i += 2;
+            }
+            if (i + 1 < argc && argv[i + 1][0] != '-' && std::atof(argv[i + 1]) > 0.0) {
+                stressSeconds = std::atof(argv[++i]);
+            }
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                stressEngine = argv[++i];
+            }
         } else if (std::strcmp(argv[i], "--shot") == 0 && i + 1 < argc) {
             shotPath = argv[++i];
         } else if (std::strcmp(argv[i], "--menu") == 0) {
@@ -1937,6 +2070,12 @@ int main(int argc, char** argv) {
                 if (benchCars < 1) benchCars = 1;
                 if (benchCars > 120) benchCars = 120;
             }
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                benchHz = std::max(60, std::atoi(argv[++i]));
+            }
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                benchEngine = argv[++i];
+            }
         }
     }
 
@@ -1944,7 +2083,7 @@ int main(int argc, char** argv) {
     // their environment in memory; the user's settings must survive untouched
     // (a settings/race-setup Save from a test would leak automation overrides
     // like race.autostart=true into the user's config).
-    if (driveTest || bench || dumpPath || shotPath || menuShot || settingsShot) {
+    if (driveTest || bench || dumpPath || shotPath || menuShot || settingsShot || stress) {
         Config::SetTestMode(true);
     }
 
@@ -1953,7 +2092,7 @@ int main(int argc, char** argv) {
     // Prove the rush-engine link is live (static libs drop unreferenced TUs).
     std::printf("rush-engine %s\n", rush::VersionString());
     // All CLI automation paths (tests, screenshots, scene dumps) skip the menu.
-    if ((driveTest || dumpPath || shotPath || bench) && !menuShot && !settingsShot) {
+    if ((driveTest || dumpPath || shotPath || bench || stress) && !menuShot && !settingsShot) {
         config.SetString("race", "autostart", "true");
     }
     if (settingsShot) config.SetString("race", "settings_qa", "true");
@@ -1978,10 +2117,18 @@ int main(int argc, char** argv) {
     if (bench) {
         // Local config only — never Save, same rule as the test paths.
         int rc = 0;
-        for (const char* engine : {"qu3e", "nudge", "rpc"}) {
-            rc |= RunBench(config, benchCars, engine, 10.0);
+        if (benchEngine) {
+            rc |= RunBench(config, benchCars, benchEngine, 10.0, benchHz);
+        } else {
+            for (const char* engine : {"qu3e", "nudge", "rpc"}) {
+                rc |= RunBench(config, benchCars, engine, 10.0, benchHz);
+            }
         }
         return rc;
+    }
+
+    if (stress) {
+        return RunStress(config, stressCars, stressHz, stressSeconds, stressEngine);
     }
 
     if (dumpPath) {
