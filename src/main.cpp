@@ -1911,10 +1911,11 @@ int RunBench(Config& config, int cars, const char* engine, double raceSeconds, i
     IPhysicsWorld::StageStats stage;
     if (game.World()) game.World()->ReadStageStats(stage);
     if (stage.steps > 0 || stage.gridCells > 0) {
-        std::printf("  stage ms:      broad=%.4f  narrow=%.4f  build=%.4f  solve=%.4f"
-                    "  (contacts=%d points=%d islands=%d cells=%d)\n",
-                    stage.broadphaseMs, stage.narrowphaseMs, stage.islandBuildMs, stage.solveMs,
-                    stage.contacts, stage.contactPoints, stage.islands, stage.gridCells);
+        std::printf("  stage ms:      proxy=%.4f  pairs=%.4f  narrow=%.4f  build=%.4f  solve=%.4f  sync=%.4f"
+                    "  (peak contacts=%d points=%d islands=%d cells=%d, steps=%ld)\n",
+                    stage.proxyMs, stage.pairMs, stage.narrowphaseMs, stage.islandBuildMs,
+                    stage.solveMs, stage.syncMs, stage.contacts, stage.contactPoints,
+                    stage.islands, stage.gridCells, stage.steps);
     }
 
     // TEMP probe: per-backend raycast cost (remove with the probe).
