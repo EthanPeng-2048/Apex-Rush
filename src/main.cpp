@@ -1925,6 +1925,10 @@ int RunBench(Config& config, int cars, const char* engine, double raceSeconds, i
         std::printf("  closure ms:    step=%.4f  segs=%.4f  unaccounted=%+.4f  wrap=%.4f"
                     "  force=%.4f\n",
                     stage.stepMs, segs, segs - stage.stepMs, stage.wrapMs, stage.forceMs);
+        std::printf("  pairs ms:      query=%.4f  sort+queue=%.4f   (peak per step: moved=%d"
+                    "  produced=%d  unique=%d)\n",
+                    stage.pairQueryMs, stage.sortMs, stage.movedProxies,
+                    stage.pairsProduced, stage.pairsUnique);
     }
 
     // TEMP probe: per-backend raycast cost (remove with the probe).
