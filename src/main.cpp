@@ -1916,6 +1916,15 @@ int RunBench(Config& config, int cars, const char* engine, double raceSeconds, i
                     stage.proxyMs, stage.pairMs, stage.narrowphaseMs, stage.islandBuildMs,
                     stage.solveMs, stage.syncMs, stage.contacts, stage.contactPoints,
                     stage.islands, stage.gridCells, stage.steps);
+        // Closure: the instrumented segments are a partition of Step(), so their
+        // excess over stepMs is what the timers miss (clock reads, call
+        // overhead); wrapMs is the adapter work outside Step() (force push +
+        // contact events) — the part a per-stage report can never show.
+        const double segs = stage.broadphaseMs + stage.proxyMs + stage.pairMs + stage.forceMs +
+                            stage.narrowphaseMs + stage.islandBuildMs + stage.solveMs;
+        std::printf("  closure ms:    step=%.4f  segs=%.4f  unaccounted=%+.4f  wrap=%.4f"
+                    "  force=%.4f\n",
+                    stage.stepMs, segs, segs - stage.stepMs, stage.wrapMs, stage.forceMs);
     }
 
     // TEMP probe: per-backend raycast cost (remove with the probe).

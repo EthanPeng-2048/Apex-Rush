@@ -107,7 +107,13 @@ public:
         // whenever a race build replaces it.
         ApplyWorldTuning();
     }
-    void ResetBench() { bench_ = BenchSample{}; }
+    void ResetBench() {
+        bench_ = BenchSample{};
+        // Stage means live in the physics world and would otherwise keep the
+        // countdown/settle warm-up steps, which have almost no contacts and
+        // would drag every stage down against the measured window.
+        if (world_) world_->ResetStageStats();
+    }
     const BenchSample& Bench() const { return bench_; }
 
     // Async runtime: when enabled, race phases run on a worker thread and
