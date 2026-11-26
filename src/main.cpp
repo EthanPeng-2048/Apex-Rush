@@ -1925,10 +1925,14 @@ int RunBench(Config& config, int cars, const char* engine, double raceSeconds, i
         std::printf("  closure ms:    step=%.4f  segs=%.4f  unaccounted=%+.4f  wrap=%.4f"
                     "  force=%.4f\n",
                     stage.stepMs, segs, segs - stage.stepMs, stage.wrapMs, stage.forceMs);
-        std::printf("  pairs ms:      query=%.4f  sort+queue=%.4f   (peak per step: moved=%d"
-                    "  produced=%d  unique=%d)\n",
-                    stage.pairQueryMs, stage.sortMs, stage.movedProxies,
-                    stage.pairsProduced, stage.pairsUnique);
+        std::printf("  peak step ms:  step=%.3f  proxy=%.3f  pairs=%.3f  narrow=%.3f  build=%.3f"
+                    "  solve=%.3f  force=%.3f  sync=%.3f\n",
+                    stage.peak.stepMs, stage.peak.proxyMs, stage.peak.pairMs,
+                    stage.peak.narrowphaseMs, stage.peak.islandBuildMs, stage.peak.solveMs,
+                    stage.peak.forceMs, stage.peak.syncMs);
+        std::printf("  worst step:    contacts=%d  produced=%d  moved=%d  new=%d  deferred=%d\n",
+                    stage.peak.contacts, stage.peak.pairsProduced, stage.peak.movedProxies,
+                    stage.peak.newContacts, stage.peak.deferredPairs);
     }
 
     // TEMP probe: per-backend raycast cost (remove with the probe).
@@ -2029,6 +2033,25 @@ int RunStress(Config& config, int cars, int hz, double seconds, const char* engi
                 1e3 * s.updateSec / n, pct(0.50), pct(0.99), pct(1.0), n / wall);
     std::printf("  step  ms: vehicle=%.4f world=%.4f   badStates=%d  maxSpeed=%.1f m/s  max|y|=%.1f\n",
                 1e3 * s.vehicleSec / steps, 1e3 * s.stepSec / steps, badStates, worstSpeed, worstY);
+    // Worst single step: a pile-up is a burst, so the peak says what the hitch
+    // is made of while the mean above only says what the average is.
+    IPhysicsWorld::StageStats stage;
+    if (game.World()) game.World()->ReadStageStats(stage);
+    if (stage.steps > 0) {
+        std::printf("  peak step ms:  step=%.3f  proxy=%.3f  pairs=%.3f  narrow=%.3f  build=%.3f"
+                    "  solve=%.3f  force=%.3f  sync=%.3f\n",
+                    stage.peak.stepMs, stage.peak.proxyMs, stage.peak.pairMs,
+                    stage.peak.narrowphaseMs, stage.peak.islandBuildMs, stage.peak.solveMs,
+                    stage.peak.forceMs, stage.peak.syncMs);
+        std::printf("  worst step:    contacts=%d  produced=%d  moved=%d  new=%d  deferred=%d\n",
+                    stage.peak.contacts, stage.peak.pairsProduced, stage.peak.movedProxies,
+                    stage.peak.newContacts, stage.peak.deferredPairs);
+        std::printf("  mean step ms:  step=%.4f  proxy=%.4f  pairs=%.4f  narrow=%.4f  build=%.4f"
+                    "  solve=%.4f  (mean contacts=%d produced=%d moved=%d)\n",
+                    stage.stepMs, stage.proxyMs, stage.pairMs, stage.narrowphaseMs,
+                    stage.islandBuildMs, stage.solveMs, stage.contacts, stage.pairsProduced,
+                    stage.movedProxies);
+    }
     backend.Shutdown();
     return badStates == 0 ? 0 : 1;
 }
