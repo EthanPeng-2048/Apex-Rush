@@ -17,6 +17,7 @@ import rush.engine.job;
 
 #include "audio/MiniaudioAudio.h"
 #include "game/Game.h"
+#include "net/net_selftest.h"
 import rush.engine.physics;
 import rush.engine.render;
 import rush.engine.input;
@@ -2076,8 +2077,27 @@ int main(int argc, char** argv) {
     int stressHz = 480;
     double stressSeconds = 20.0;
     const char* stressEngine = "rpc";
+    bool netSelfTest = false;
+    bool netAuto = false;
+    int netSeconds = 0;
+    int netHostCode = -1;
+    int netJoinCode = -1;
+    const char* netJoinIp = nullptr;
     for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--drive-test") == 0) {
+        if (std::strcmp(argv[i], "--net-selftest") == 0) {
+            netSelfTest = true;
+        } else if (std::strcmp(argv[i], "--net-auto") == 0) {
+            netAuto = true;
+        } else if (std::strcmp(argv[i], "--net-seconds") == 0 && i + 1 < argc) {
+            netSeconds = std::max(1, std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--net-host") == 0) {
+            netHostCode = 0;
+            if (i + 1 < argc && argv[i + 1][0] != '-') netHostCode = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--net-join") == 0) {
+            netJoinCode = 0;
+            if (i + 1 < argc && argv[i + 1][0] != '-') netJoinCode = std::atoi(argv[++i]);
+            if (i + 1 < argc && argv[i + 1][0] != '-') netJoinIp = argv[++i];
+        } else if (std::strcmp(argv[i], "--drive-test") == 0) {
             driveTest = true;
         } else if (std::strcmp(argv[i], "--stress") == 0) {
             stress = true;
@@ -2129,14 +2149,19 @@ int main(int argc, char** argv) {
     // Prove the rush-engine link is live (static libs drop unreferenced TUs).
     std::printf("rush-engine %s\n", rush::VersionString());
     // All CLI automation paths (tests, screenshots, scene dumps) skip the menu.
-    if ((driveTest || dumpPath || shotPath || bench || stress) && !menuShot && !settingsShot) {
+    if ((driveTest || dumpPath || shotPath || bench || stress || netHostCode >= 0 ||
+         netJoinCode >= 0) && !menuShot && !settingsShot) {
         config.SetString("race", "autostart", "true");
     }
     if (settingsShot) config.SetString("race", "settings_qa", "true");
+    if (netAuto) config.SetString("net", "autostart_race", "true");
 
     // JobSystem width: deterministic serial for drive-test; native parallel
     // pool for bench (async performance) and interactive play. Emscripten
     // has no pthreads in our build (no COOP/COEP) — always serial there.
+    if (netSelfTest) {
+        return RunNetSelfTest();
+    }
     if (driveTest) {
         rush::JobSystem::Get().Configure(0);
         return RunDriveTest(config);
@@ -2188,6 +2213,47 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // Headless LAN run (no window): used by the automated two-process check and
+    // on machines where a second window cannot be opened.
+    if ((netHostCode >= 0 || netJoinCode >= 0) && netSelfTest == false &&
+        std::getenv("APEX_NET_HEADLESS") != nullptr) {
+        NullBackend backend;
+        ScriptedInput testInput;
+        backend.Init(1280, 720, "lan-headless");
+        Game game(backend, testInput.system, config);
+        game.SetThreadedSim(false);
+        if (!game.Init()) return 1;
+        if (netHostCode >= 0) {
+            if (!game.AutoHost(static_cast<std::uint16_t>(netHostCode))) return 1;
+        } else if (!game.AutoJoin(static_cast<std::uint16_t>(netJoinCode),
+                                  netJoinIp ? netJoinIp : "")) {
+            return 1;
+        }
+        const int frames = (netSeconds > 0 ? netSeconds : 10) * 60;
+        auto nextFrame = std::chrono::steady_clock::now();
+        for (int i = 0; i < frames; ++i) {
+            backend.BeginFrame();
+            game.Update();
+            backend.BeginScene();
+            game.Render3D();
+            backend.EndScene();
+            game.RenderHUD();
+            backend.EndFrame();
+            // Pace to 60 Hz: a handshake needs wall-clock time to complete.
+            nextFrame += std::chrono::milliseconds(16);
+            const auto now = std::chrono::steady_clock::now();
+            if (nextFrame > now) {
+                std::this_thread::sleep_until(nextFrame);
+            } else {
+                nextFrame = now;
+            }
+        }
+        std::printf("[net] headless done frames=%d role=%d\n", frames,
+                    static_cast<int>(game.Role()));
+        backend.Shutdown();
+        return 0;
+    }
+
     RaylibBackend backend;
     // Default to a size that fits small laptop work areas (e.g. 1366x768).
     const int width = config.GetInt("video", "width", 1280);
@@ -2220,6 +2286,20 @@ int main(int argc, char** argv) {
     if (!game.Init()) {
         backend.Shutdown();
         return 1;
+    }
+    // Headless LAN automation: --net-host <code> / --net-join <code> [ip].
+    if (netHostCode >= 0) {
+        if (!game.AutoHost(static_cast<std::uint16_t>(netHostCode))) {
+            std::fprintf(stderr, "net-host: failed to open room %d\n", netHostCode);
+            backend.Shutdown();
+            return 1;
+        }
+    } else if (netJoinCode >= 0) {
+        if (!game.AutoJoin(static_cast<std::uint16_t>(netJoinCode), netJoinIp ? netJoinIp : "")) {
+            std::fprintf(stderr, "net-join: failed to connect to room %d\n", netJoinCode);
+            backend.Shutdown();
+            return 1;
+        }
     }
 
     int frame = 0;
