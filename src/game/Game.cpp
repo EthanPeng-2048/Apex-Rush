@@ -106,6 +106,13 @@ std::string Pad(const std::string& s, size_t width) {
     return s.size() >= width ? s.substr(0, width) : s + std::string(width - s.size(), ' ');
 }
 
+// This machine's car inside a published snapshot. The sim worker fills
+// RaceSnapshot::localIndex because racers_[0] is not necessarily ours.
+const Game::CarPose& SnapshotLocalCar(const Game::RaceSnapshot& snap) {
+    const std::size_t index = static_cast<std::size_t>(std::max(0, snap.localIndex));
+    return snap.cars[index < snap.cars.size() ? index : 0];
+}
+
 }  // namespace
 
 // Game-side input registration: declare the events the game consumes, their
@@ -234,10 +241,13 @@ void Game::LoadSettings() {
     }
 
     // Season feature gates: classic (DRS) vs 2026 (active aero + override).
-    // Defaults = classic 2025 preset (DRS on, the 2026 systems off).
+    // Defaults = classic 2025 preset (DRS on, the 2026 systems off). ERS is a
+    // power-unit feature: it follows the overtake gate unless [season] ers
+    // says otherwise, so a server can run a hybrid without the shift boost.
     seasonDrs_ = config_.GetBool("season", "drs", true);
     seasonAero_ = config_.GetBool("season", "active_aero", false);
     seasonOverride_ = config_.GetBool("season", "overtake", false);
+    seasonErs_ = config_.GetBool("season", "ers", seasonOverride_);
 }
 
 // Fill a fresh racer list from a config snapshot. Static so the async build
@@ -248,11 +258,32 @@ void Game::SpawnRacersInto(std::vector<Racer>& out, const Track& track, IPhysics
     // Large grids (up to 120) so the async bench can stress the sim; the
     // settings CARS row cycles the same range.
     const int carCount = std::clamp(cfg.carCount, 1, 120);
-    out.resize(static_cast<size_t>(carCount));
-    for (int i = 0; i < carCount; ++i) {
+    const int rosterCount = cfg.roster.count;
+    // LAN grid: one car per seat, built from the frozen roster. A client spawns
+    // only its own car (the far side simulates the rest), and its grid box comes
+    // from its seat — never from "I am car 0".
+    const int spawnCount = rosterCount > 0 ? (cfg.lanClient ? 1 : rosterCount) : carCount;
+    out.resize(static_cast<size_t>(spawnCount));
+    for (int i = 0; i < spawnCount; ++i) {
         Racer& racer = out[static_cast<size_t>(i)];
-        racer.name = (i == 0) ? "YOU" : ("AI " + std::to_string(i));
-        racer.isPlayer = (i == 0);
+        const net::RosterEntry* seatEntry = nullptr;
+        for (int s = 0; s < rosterCount; ++s) {
+            const net::RosterEntry& entry = cfg.roster.entries[static_cast<size_t>(s)];
+            const bool mine = cfg.lanClient ? entry.seat == cfg.localSeat : entry.seat == i;
+            if (mine) {
+                seatEntry = &entry;
+                break;
+            }
+        }
+        racer.seat = seatEntry ? static_cast<int>(seatEntry->seat) : i;
+        if (seatEntry) {
+            racer.name = seatEntry->name;
+            racer.playerId = seatEntry->playerId;
+        } else {
+            racer.name = (i == 0) ? "YOU" : ("AI " + std::to_string(i));
+            racer.playerId = (i == 0) ? cfg.localPlayerId : kInvalidPlayerId;
+        }
+        racer.isPlayer = (racer.seat == cfg.localSeat);
 
         VehicleParams params;
         if (racer.isPlayer) {
@@ -271,16 +302,66 @@ void Game::SpawnRacersInto(std::vector<Racer>& out, const Track& track, IPhysics
             params.controls.steerLevel = AssistLevel::Full;
         }
         params.damageEnabled = cfg.damage;
-        // Season rules apply to every car (player and AI alike).
-        params.drsEnabled = cfg.seasonDrs;
-        params.activeAeroEnabled = cfg.seasonAero;
-        params.overtakeEnabled = cfg.seasonOverride;
+        // Fitted features are a build property of the car (see
+        // VehicleCapability): the vehicle gates activation itself, so a stale
+        // input can never leak a system that is not on the car.
+        params.capabilities = 0u;
+        if (cfg.seasonDrs) params.capabilities |= VehicleCapability::Drs;
+        if (cfg.seasonAero) params.capabilities |= VehicleCapability::ActiveAero;
+        if (cfg.seasonOverride) params.capabilities |= VehicleCapability::Overtake;
+        if (cfg.seasonErs) params.capabilities |= VehicleCapability::Ers;
 
-        Transform pose;
-        pose.position = track.StartPosition(i + cfg.gridOffset);
-        pose.rotation = track.StartRotation();
-        racer.vehicle.Spawn(world, pose, params, &racer);
+        racer.vehicle.Spawn(world, apex::GridPose(track, racer), params, &racer);
     }
+}
+
+Transform GridPose(const Track& track, const Racer& racer) {
+    Transform pose;
+    pose.position = track.StartPosition(racer.seat);
+    pose.rotation = track.StartRotation();
+    return pose;
+}
+
+Transform Game::GridPose(const Racer& racer) const { return apex::GridPose(track_, racer); }
+
+Racer& Game::LocalRacer() {
+    for (Racer& racer : racers_) {
+        if (racer.seat == LocalSeat()) return racer;
+    }
+    return racers_.front();
+}
+
+const Racer& Game::LocalRacer() const {
+    for (const Racer& racer : racers_) {
+        if (racer.seat == LocalSeat()) return racer;
+    }
+    return racers_.front();
+}
+
+Racer* Game::RacerBySlot(std::uint8_t seat) {
+    for (Racer& racer : racers_) {
+        if (racer.seat == static_cast<int>(seat)) return &racer;
+    }
+    return nullptr;
+}
+
+void Game::ResetRacerForStart(Racer& racer) {
+    racer.input = CarInput{};
+    racer.vehicle.Reset(GridPose(racer));
+    racer.lap = 0;
+    racer.lapDistance = 0.f;
+    racer.lastLapTime = 0.f;
+    racer.bestLapTime = 0.f;
+    racer.currentLapStart = 0.f;
+    racer.raceTime = 0.f;
+    racer.position = 1;
+    racer.progress = 0.f;
+    racer.stuckTimer = 0.f;
+    racer.finished = false;
+}
+
+void Game::ResetGridForStart() {
+    for (Racer& racer : racers_) ResetRacerForStart(racer);
 }
 
 Game::RaceBuildConfig Game::MakeRaceBuildConfig() {
@@ -289,13 +370,19 @@ Game::RaceBuildConfig Game::MakeRaceBuildConfig() {
     cfg.fixedDt = fixedDt_;
     cfg.engine = config_.GetString("physics", "engine", "qu3e");
     cfg.carCount = std::clamp(config_.GetInt("race", "cars", 4), 1, 120);
-    // LAN roles override the grid: the host drives every joined car, the client
-    // only its own (spawned on its authoritative slot).
+    // LAN roles override the grid: the host drives every seated car, the client
+    // only its own (on its own seat).
     if (netRole_ == NetRole::Host) {
-        cfg.carCount = std::clamp<int>(netCarCount_, 1, net::kMaxCars);
+        cfg.carCount = std::clamp<int>(netRoster_.count, 1, net::kMaxCars);
+        cfg.roster = netRoster_;
+        cfg.localSeat = LocalSeat();
+        cfg.localPlayerId = localPlayerId_;
     } else if (netRole_ == NetRole::Client) {
         cfg.carCount = 1;
-        cfg.gridOffset = netConfig_.rules.carCount > 1 ? netLocalSlot_ : 0;
+        cfg.roster = netRoster_;
+        cfg.lanClient = true;
+        cfg.localSeat = LocalSeat();
+        cfg.localPlayerId = localPlayerId_;
     }
     cfg.damage = config_.GetBool("race", "damage", true);
     cfg.absLevel = ParseAssistLevel(config_, "abs", DefaultAssistLevel("abs"));
@@ -305,7 +392,43 @@ Game::RaceBuildConfig Game::MakeRaceBuildConfig() {
     cfg.seasonDrs = seasonDrs_;
     cfg.seasonAero = seasonAero_;
     cfg.seasonOverride = seasonOverride_;
+    cfg.seasonErs = seasonErs_;
+    // A LAN client runs the host's rules: season gates decide which systems the
+    // car has, the assist levels decide how it handles. Its own config would
+    // otherwise put two different simulations on the same grid.
+    if (netRole_ == NetRole::Client && netRulesLocked_) {
+        cfg.damage = netRules_.damage != 0;
+        cfg.absLevel = static_cast<AssistLevel>(netRules_.absLevel);
+        cfg.tcLevel = static_cast<AssistLevel>(netRules_.tcLevel);
+        cfg.escLevel = static_cast<AssistLevel>(netRules_.escLevel);
+        cfg.steerLevel = static_cast<AssistLevel>(netRules_.steerLevel);
+        cfg.seasonDrs = (netRules_.seasonBits & net::kSeasonDrs) != 0;
+        cfg.seasonAero = (netRules_.seasonBits & net::kSeasonActiveAero) != 0;
+        cfg.seasonOverride = (netRules_.seasonBits & net::kSeasonOvertake) != 0;
+        cfg.seasonErs = (netRules_.seasonBits & net::kSeasonErs) != 0;
+    }
     return cfg;
+}
+
+// Host-side rule set: the single place that turns the local config + season
+// gates into the rules every client must run. The client applies them back in
+// MakeRaceBuildConfig, so both ends build the same car.
+void Game::FillHostRules(net::RulesPacket& rules) const {
+    rules.laps = static_cast<std::uint8_t>(std::clamp(totalLaps_, 1, 99));
+    rules.damage = config_.GetBool("race", "damage", true) ? 1 : 0;
+    rules.seasonBits = static_cast<std::uint8_t>(
+        (seasonDrs_ ? net::kSeasonDrs : 0) | (seasonAero_ ? net::kSeasonActiveAero : 0) |
+        (seasonOverride_ ? net::kSeasonOvertake : 0) | (seasonErs_ ? net::kSeasonErs : 0));
+    rules.absLevel =
+        static_cast<std::uint8_t>(ParseAssistLevel(config_, "abs", DefaultAssistLevel("abs")));
+    rules.tcLevel =
+        static_cast<std::uint8_t>(ParseAssistLevel(config_, "tc", DefaultAssistLevel("tc")));
+    rules.escLevel =
+        static_cast<std::uint8_t>(ParseAssistLevel(config_, "esc", DefaultAssistLevel("esc")));
+    rules.steerLevel = static_cast<std::uint8_t>(
+        ParseAssistLevel(config_, "steer", DefaultAssistLevel("steer")));
+    rules.snapshotHz = static_cast<std::uint8_t>(
+        std::clamp(config_.GetInt("net", "snapshot_hz", 30), 10, 60));
 }
 
 // Build the selected collision backend: qu3e | nudge | rpc (Rush Physics Core).
@@ -456,6 +579,12 @@ void Game::Update() {
     // keeps flowing while the room browser is open.
     if (netRole_ != NetRole::Offline) LanTick();
 
+    // A phase change opens its screen — the engine owns focus, so "reset the
+    // cursor" is a screen open. Done before dispatch so this frame's keys land
+    // on the screen we are about to draw, and again after it because a handler
+    // may have switched phase for the frame that is about to be drawn.
+    SyncUiPhase();
+
     // Single load: phase_ is written by both threads (pause vs. race rules),
     // so read it once per frame for consistent dispatch.
     const RacePhase ph = phase_;
@@ -489,16 +618,18 @@ void Game::Update() {
         UpdateSim(frameDt);
     }
 
+    SyncUiPhase();
+
     if (threadedSim_ && !menuPhase && simWorker_.Running()) {
         // Main-thread half of the race frame: camera + audio from the frame
         // snapshot (never touches racers_ while the worker owns them).
         // statusTimer_ is sim-owned and decremented in UpdateSim.
         if (frameSnap_ && frameSnap_->valid && !frameSnap_->cars.empty()) {
-            const VehicleState& s = frameSnap_->cars[0].state;
+            const VehicleState& s = SnapshotLocalCar(*frameSnap_).state;
             UpdateCameraFrom(s, frameDt);
         }
         if (audio_ && frameSnap_ && frameSnap_->valid && !frameSnap_->cars.empty()) {
-            const VehicleState& s = frameSnap_->cars[0].state;
+            const VehicleState& s = SnapshotLocalCar(*frameSnap_).state;
             AudioState audioState;
             audioState.engineRpm = s.rpm;
             audioState.engineLoad = s.throttle;
@@ -515,7 +646,7 @@ void Game::Update() {
         UpdateCamera(frameDt);
 
         if (audio_ && !racers_.empty()) {
-            const VehicleState& s = racers_.front().vehicle.State();
+            const VehicleState& s = LocalRacer().vehicle.State();
             AudioState audioState;
             audioState.engineRpm = s.rpm;
             audioState.engineLoad = s.throttle;
@@ -627,6 +758,7 @@ void Game::PublishSnapshot() {
         pose.raceTime = racer.raceTime;
         pose.partHealth = racer.vehicle.Aero().StateRef().partHealth;
         pose.damageTotal = racer.vehicle.Aero().DamageTotal();
+        if (racer.seat == LocalSeat()) snap.localIndex = static_cast<int>(i);
     }
     snap.valid = true;
     snap.publishTime = std::chrono::duration<double>(
@@ -707,18 +839,17 @@ void Game::Render3D() {
                                     std::chrono::steady_clock::now().time_since_epoch())
                                     .count() * 1000.0;
             const double renderMs = now2 - netInterp_->DelayMs();
-            for (int slot = 0; slot < netCarCount_; ++slot) {
-                if (slot == static_cast<int>(netLocalSlot_)) continue;
+            for (int s = 0; s < netRoster_.count; ++s) {
+                const std::uint8_t seat = netRoster_.entries[static_cast<std::size_t>(s)].seat;
+                if (seat == netLocalSeat_.load(std::memory_order_relaxed)) continue;
                 Transform chassis;
                 VehicleState state;
-                if (!netInterp_->Sample(static_cast<std::uint8_t>(slot), renderMs, chassis, state)) {
-                    continue;
-                }
+                if (!netInterp_->Sample(seat, renderMs, chassis, state)) continue;
                 Color tint{1.0f, 0.86f, 0.74f, 1.f};
-                tint.r = 0.55f + 0.12f * static_cast<float>(slot % 3);
+                tint.r = 0.55f + 0.12f * static_cast<float>(seat % 3);
                 tint.g = 0.75f;
-                tint.b = 0.95f - 0.10f * static_cast<float>(slot % 3);
-                Vehicle::RenderPose(renderer_, chassis, state, racers_.front().vehicle.Params(), tint);
+                tint.b = 0.95f - 0.10f * static_cast<float>(seat % 3);
+                Vehicle::RenderPose(renderer_, chassis, state, LocalRacer().vehicle.Params(), tint);
             }
         }
         return;
@@ -766,7 +897,6 @@ void Game::UpdatePlayerInput() {
             return;
         }
         phase_ = RacePhase::Menu;
-        menuCursor_ = 0;
         std::lock_guard lock(intentMutex_);
         intent_ = PlayerIntent{};
         return;
@@ -796,7 +926,7 @@ void Game::ApplyPlayerIntent() {
     }
 
     if (racers_.empty()) return;
-    Racer& player = racers_.front();
+    Racer& player = LocalRacer();
 
     // --- Input mapping (phase as of this sim tick).
     if (phase_ == RacePhase::Racing && !player.finished) {
@@ -832,17 +962,10 @@ void Game::ApplyPlayerIntent() {
         player.input.brake = 0.8f;
     }
 
-    // ENTER restarts: reset the whole grid back to the countdown.
+    // ENTER restarts: reset the whole grid back to the countdown, every car on
+    // its own grid box (the AI used to be piled onto one slot here).
     if (it.restart) {
-        for (Racer& racer : racers_) {
-            const Transform pose{track_.StartPosition(racer.isPlayer ? 0 : 1),
-                                 track_.StartRotation()};
-            racer.vehicle.Reset(pose);
-            racer.lap = 0;
-            racer.finished = false;
-            racer.lapDistance = 0.f;
-            racer.currentLapStart = 0.f;
-        }
+        ResetGridForStart();
         phase_ = RacePhase::Countdown;
         phaseTimer_ = 3.5f;
         raceClock_ = 0.f;
@@ -1009,7 +1132,7 @@ void Game::ProcessCollisionEvents(float dt) {
 
     // Collision thump for the player's car.
     if (audio_ && !racers_.empty()) {
-        const BodyHandle playerBody = racers_.front().vehicle.Chassis();
+        const BodyHandle playerBody = LocalRacer().vehicle.Chassis();
         for (const ContactEvent& event : contacts) {
             if (event.bodyA != playerBody && event.bodyB != playerBody) continue;
             if (event.impactSpeed > 1.5f) {
@@ -1051,7 +1174,7 @@ void Game::UpdateRace(float dt) {
                 racer.currentLapStart = raceClock_;
                 if (netRole_ == NetRole::Host && netSession_) {
                     net::LapCompletePacket lapEvent;
-                    lapEvent.slot = static_cast<std::uint8_t>(&racer - racers_.data());
+                    lapEvent.slot = static_cast<std::uint8_t>(racer.seat);
                     lapEvent.lap = static_cast<std::uint8_t>(std::min(racer.lap, 255));
                     lapEvent.lapTimeMs = static_cast<std::uint32_t>(lapTime * 1000.f);
                     lapEvent.bestLapMs = static_cast<std::uint32_t>(racer.bestLapTime * 1000.f);
@@ -1063,7 +1186,7 @@ void Game::UpdateRace(float dt) {
                 racer.raceTime = raceClock_;
                 if (netRole_ == NetRole::Host && netSession_) {
                     net::PlayerFinishedPacket fin;
-                    fin.slot = static_cast<std::uint8_t>(&racer - racers_.data());
+                    fin.slot = static_cast<std::uint8_t>(racer.seat);
                     fin.position = static_cast<std::uint8_t>(std::clamp(racer.position, 1, 255));
                     fin.raceTimeMs = static_cast<std::uint32_t>(racer.raceTime * 1000.f);
                     fin.bestLapMs = static_cast<std::uint32_t>(racer.bestLapTime * 1000.f);
@@ -1112,15 +1235,14 @@ void Game::UpdateRace(float dt) {
     // every car is home (or ends it manually).
     bool allDone = true;
     for (const Racer& r : racers_) allDone = allDone && r.finished;
-    if ((netRole_ == NetRole::Host) ? allDone : racers_.front().finished) {
+    if ((netRole_ == NetRole::Host) ? allDone : LocalRacer().finished) {
         phase_ = RacePhase::Finished;
         if (netRole_ == NetRole::Host && netSession_ && !netEndSent_) {
             netEndSent_ = true;
             std::vector<net::RaceEndEntry> results;
-            for (std::size_t i = 0; i < racers_.size(); ++i) {
-                const Racer& r = racers_[i];
+            for (const Racer& r : racers_) {
                 net::RaceEndEntry entry;
-                entry.slot = static_cast<std::uint8_t>(i);
+                entry.slot = static_cast<std::uint8_t>(r.seat);
                 entry.position = static_cast<std::uint8_t>(std::clamp(r.position, 1, 255));
                 entry.finished = r.finished ? 1 : 0;
                 entry.raceTimeMs = static_cast<std::uint32_t>(std::max(0.f, r.raceTime) * 1000.f);
@@ -1134,7 +1256,7 @@ void Game::UpdateRace(float dt) {
 
 void Game::UpdateCamera(float dt) {
     if (racers_.empty()) return;
-    UpdateCameraFrom(racers_.front().vehicle.State(), dt);
+    UpdateCameraFrom(LocalRacer().vehicle.State(), dt);
 }
 
 void Game::UpdateCameraFrom(const VehicleState& state, float dt) {
@@ -1229,22 +1351,23 @@ void Game::RenderHUD() {
     // members on this same thread.
     const bool snapHud = threadedSim_ && simWorker_.Running() && frameSnap_ &&
                          frameSnap_->valid && !frameSnap_->cars.empty();
-    const VehicleState& state =
-        snapHud ? frameSnap_->cars[0].state : racers_.front().vehicle.State();
+    const CarPose* own = snapHud ? &SnapshotLocalCar(*frameSnap_) : nullptr;
+    const VehicleState& state = own ? own->state : LocalRacer().vehicle.State();
     const std::array<float, 4>& partHealth =
-        snapHud ? frameSnap_->cars[0].partHealth
-                : racers_.front().vehicle.Aero().StateRef().partHealth;
+        own ? own->partHealth : LocalRacer().vehicle.Aero().StateRef().partHealth;
+    // Fitted features come from the car, not from the season globals: a car
+    // without a system shows no readout for it (see VehicleCapability).
+    const std::uint8_t capabilities =
+        own ? own->params.capabilities : LocalRacer().vehicle.Params().capabilities;
     const int position = (netRole_ == NetRole::Client && netReadout_.valid)
                              ? static_cast<int>(netReadout_.position)
-                             : (snapHud ? frameSnap_->cars[0].position : racers_.front().position);
+                             : (own ? own->position : LocalRacer().position);
     const int lap = (netRole_ == NetRole::Client && netReadout_.valid)
                         ? static_cast<int>(netReadout_.lap)
-                        : (snapHud ? frameSnap_->cars[0].lap : racers_.front().lap);
-    const float lastLapTime =
-        snapHud ? frameSnap_->cars[0].lastLapTime : racers_.front().lastLapTime;
-    const float bestLapTime =
-        snapHud ? frameSnap_->cars[0].bestLapTime : racers_.front().bestLapTime;
-    const float raceTime = snapHud ? frameSnap_->cars[0].raceTime : racers_.front().raceTime;
+                        : (own ? own->lap : LocalRacer().lap);
+    const float lastLapTime = own ? own->lastLapTime : LocalRacer().lastLapTime;
+    const float bestLapTime = own ? own->bestLapTime : LocalRacer().bestLapTime;
+    const float raceTime = own ? own->raceTime : LocalRacer().raceTime;
     const float raceClock = snapHud ? frameSnap_->raceClock : raceClock_;
     const float phaseTimer = snapHud ? frameSnap_->phaseTimer : phaseTimer_;
     const float statusTimer = snapHud ? frameSnap_->statusTimer : statusTimer_;
@@ -1301,10 +1424,12 @@ void Game::RenderHUD() {
     }
 
     // ERS bar + DRS/wing indicators.
-    renderer_.DrawText2D("ERS", 20.f, baseY + 118.f, 16, Color::Gray());
-    renderer_.DrawRect2D(60.f, baseY + 118.f, 140.f, 12.f, Color{0.15f, 0.15f, 0.18f, 0.9f});
-    renderer_.DrawRect2D(62.f, baseY + 120.f, 136.f * state.ersCharge, 8.f,
-                         state.ersDeploying ? Color::Yellow() : Color::Blue());
+    if (HasCapability(capabilities, VehicleCapability::Ers)) {
+        renderer_.DrawText2D("ERS", 20.f, baseY + 118.f, 16, Color::Gray());
+        renderer_.DrawRect2D(60.f, baseY + 118.f, 140.f, 12.f, Color{0.15f, 0.15f, 0.18f, 0.9f});
+        renderer_.DrawRect2D(62.f, baseY + 120.f, 136.f * state.ersCharge, 8.f,
+                             state.ersDeploying ? Color::Yellow() : Color::Blue());
+    }
 
     // DRS / wing indicators — only for the features this season enables
     // (classic shows DRS, 2026 shows the X/Z modes; never both).
@@ -1346,394 +1471,518 @@ void Game::RenderHUD() {
         renderer_.DrawText2D(statusText, w * 0.5f - 80.f, h - 200.f, 22, Color::Orange());
     }
 
-    // Help line lists only the keys this season actually wires up.
+    // Help line lists only the keys the car actually wires up.
     std::string help = "W/S THROTTLE-BRAKE   A/D STEER";
-    if (seasonDrs_) help += "   F DRS";
-    if (seasonAero_) help += "   V WING";
-    if (seasonOverride_) help += "   SHIFT OVERTAKE";
+    if (HasCapability(capabilities, VehicleCapability::Drs)) help += "   F DRS";
+    if (HasCapability(capabilities, VehicleCapability::ActiveAero)) help += "   V WING";
+    if (HasCapability(capabilities, VehicleCapability::Overtake)) help += "   SHIFT OVERTAKE";
     help += "   C CAMERA   ESC MENU";
     renderer_.DrawText2D(help, 12.f, h - 22.f, 15, Color::DarkGray());
 }
 
+// ---------------------------------------------------------------- screens ---
+//
+// Every menu below is data for rush.engine.ui: the game names the rows and
+// their ids, the engine owns focus, digit/text editing and drawing, and the
+// dispatchers react to the UiAction that comes back (by id, never by row
+// index — a dynamic list makes indices move).
+
+namespace {
+
+// The engine keeps cursor in range, but a discovered list can shrink under it.
+const UiWidget* FocusedRow(const UiScreen& screen) {
+    const int c = screen.cursor;
+    if (c < 0 || c >= static_cast<int>(screen.widgets.size())) return nullptr;
+    return &screen.widgets[static_cast<std::size_t>(c)];
+}
+
+}  // namespace
+
+void Game::SyncUiPhase() {
+    const RacePhase ph = phase_;
+    if (ph == uiPhase_) return;
+    uiPhase_ = ph;
+    OpenPhaseScreen(ph);
+}
+
+void Game::OpenPhaseScreen(RacePhase phase) {
+    switch (phase) {
+        case RacePhase::Menu:
+            BuildMenuScreen();
+            UiController::ResetFocus(screens_.menu);
+            break;
+        case RacePhase::Settings:
+            BuildSettingsScreen();
+            UiController::ResetFocus(screens_.settings);
+            break;
+        case RacePhase::RaceSetup:
+            BuildRaceSetupScreen();
+            UiController::ResetFocus(screens_.raceSetup);
+            break;
+        case RacePhase::Lan:
+            BuildLanScreens();
+            lanScreensStale_ = true;
+            break;
+        default:
+            break;   // race phases draw the HUD, not a control screen
+    }
+}
+
+// ------------------------------------------------------------ main menu -----
+
+void Game::BuildMenuScreen() {
+    if (!screens_.menu.widgets.empty()) return;
+    const float w = static_cast<float>(renderer_.ScreenWidth());
+    const float h = static_cast<float>(renderer_.ScreenHeight());
+    UiScreen& s = screens_.menu;
+    s.title = "APEX RUSH";
+    s.titleSize = 68;
+    s.x = w * 0.5f - 165.f;
+    s.y = h * 0.24f;
+    s.rowStartY = h * 0.40f;
+    s.rowHeight = 54.f;
+    s.hint = "W/S SELECT    ENTER CONFIRM";
+    // Row order is asserted by --drive-test: 0 race, 1 settings, quit last.
+    s.widgets = {
+        {.kind = UiKind::Label, .label = "OPEN F1 SIM", .size = 20},
+        {.kind = UiKind::Button, .id = "start", .label = "START RACE", .size = 28},
+        {.kind = UiKind::Button, .id = "settings", .label = "SETTINGS", .size = 28},
+        {.kind = UiKind::Button, .id = "lan", .label = "LAN RACE", .size = 28},
+        {.kind = UiKind::Button, .id = "quit", .label = "QUIT", .size = 28},
+    };
+}
+
 void Game::UpdateMenu() {
-    const InputState& in = rawInput_;
-    if (audio_ && (in.menuUp || in.menuDown || in.menuSelect)) audio_->PlayUIClick();
-    if (in.menuUp) menuCursor_ = (menuCursor_ + 3) % 4;
-    if (in.menuDown) menuCursor_ = (menuCursor_ + 1) % 4;
-    if (in.menuSelect) {
-        switch (menuCursor_) {
-            case 0:
-                // START RACE opens the pre-race setup, not the race itself.
-                phase_ = RacePhase::RaceSetup;
-                raceSetupCursor_ = 0;
-                break;
-            case 1:
-                phase_ = RacePhase::Settings;
-                settingsCursor_ = 0;
-                break;
-            case 2:
-                EnterLan();
-                break;
-            default:
-                wantsQuit_ = true;
-                break;
-        }
+    if (audio_ && (rawInput_.menuUp || rawInput_.menuDown || rawInput_.menuSelect)) {
+        audio_->PlayUIClick();
+    }
+    BuildMenuScreen();
+    const UiAction action = ui_.Update(screens_.menu, rawInput_);
+    if (action.kind != UiActionKind::Activate) return;
+    if (action.id == "start") {
+        // START RACE opens the pre-race setup, not the race itself.
+        phase_ = RacePhase::RaceSetup;
+    } else if (action.id == "settings") {
+        phase_ = RacePhase::Settings;
+    } else if (action.id == "lan") {
+        EnterLan();
+    } else if (action.id == "quit") {
+        wantsQuit_ = true;
     }
     // ESC is inert here on purpose: quitting must go through the QUIT item
     // only. Acting on menuBack also ate the same keypress that just brought
     // the player back from a race ("ESC exits the app instead of the menu").
 }
 
-void Game::UpdateSettings() {
-    constexpr int kRows = kSettingsRowCount;
-    const InputState& in = rawInput_;
-    if (audio_ && (in.menuUp || in.menuDown || in.menuLeft || in.menuRight || in.menuSelect)) {
-        audio_->PlayUIClick();
-    }
-    if (in.menuUp) settingsCursor_ = (settingsCursor_ + kRows - 1) % kRows;
-    if (in.menuDown) settingsCursor_ = (settingsCursor_ + 1) % kRows;
+void Game::RenderMenu() {
+    BuildMenuScreen();
+    ui_.Draw(screens_.menu, renderer_);
+}
 
-    auto backToMenu = [this]() {
-        config_.Save(DataPath("config.rushconf"));
-        phase_ = RacePhase::Menu;
-        menuCursor_ = 0;
+// -------------------------------------------------------------- settings ----
+
+void Game::BuildSettingsScreen() {
+    if (!screens_.settings.widgets.empty()) return;
+    const float w = static_cast<float>(renderer_.ScreenWidth());
+    const float h = static_cast<float>(renderer_.ScreenHeight());
+    UiScreen& s = screens_.settings;
+    // The row height shrinks so the list fits 720p.
+    const float top = h * 0.17f;
+    const float rowH = std::clamp((h - top - 90.f) / kSettingsRowCount, 26.f, 46.f);
+    const int fontSize = rowH > 38.f ? 22 : 17;
+    s.title = "SETTINGS";
+    s.titleSize = 42;
+    s.x = w * 0.5f - 280.f;   // one column for the title and the rows
+    s.y = h * 0.08f;
+    s.rowStartY = top;
+    s.rowHeight = rowH;
+    s.valueColumnX = 560.f;
+    s.hint = "A/D CHANGE    W/S SELECT    ENTER/ESC BACK";
+
+    struct RowDef {
+        const char* id;
+        const char* label;
     };
-
-    if (settingsCursor_ == kRows - 1) {
-        if (in.menuSelect || in.menuBack) backToMenu();
-        return;
-    }
-    if (in.menuBack) {
-        backToMenu();
-        return;
-    }
-
-    const int dir = (in.menuRight ? 1 : 0) - (in.menuLeft ? 1 : 0);
-    if (dir == 0 && !in.menuSelect) return;
-
-    switch (settingsCursor_) {
-        case 0: {
-            // SEASON preset: classic (DRS) <-> 2026 (aero + override).
-            // Writing a preset rewrites the three feature toggles with it.
-            const std::string preset = config_.GetString("season", "preset", "2025");
-            int idx = (preset == "2026") ? 1 : 0;  // custom -> classic
-            idx = CyclePreset(idx, 2, dir);
-            const bool is2026 = (idx == 1);
-            config_.SetString("season", "preset", is2026 ? "2026" : "2025");
-            config_.SetString("season", "drs", is2026 ? "0" : "1");
-            config_.SetString("season", "active_aero", is2026 ? "1" : "0");
-            config_.SetString("season", "overtake", is2026 ? "1" : "0");
-            seasonDrs_ = !is2026;
-            seasonAero_ = is2026;
-            seasonOverride_ = is2026;
-            break;
-        }
-        case 1:
-        case 2:
-        case 3: {
-            // Per-feature toggles. Flipping one marks the preset CUSTOM —
-            // the three systems may then mix, but only deliberately.
-            static const char* kSeasonKeys[3] = {"drs", "active_aero", "overtake"};
-            bool* gates[3] = {&seasonDrs_, &seasonAero_, &seasonOverride_};
-            const int i = settingsCursor_ - 1;
-            bool value = (dir != 0) ? (dir > 0) : !*gates[i];
-            *gates[i] = value;
-            config_.SetString("season", kSeasonKeys[i], value ? "1" : "0");
-            config_.SetString("season", "preset", "custom");
-            break;
-        }
-        case 4:
-        case 5:
-        case 6:
-        case 7: {
-            static const char* kAssistKeys[4] = {"abs", "tc", "esc", "steer"};
-            const char* key = kAssistKeys[settingsCursor_ - 4];
-            int level = static_cast<int>(ParseAssistLevel(config_, key, DefaultAssistLevel(key)));
-            level = CyclePreset(level, 3, dir);
-            SaveAssistLevel(config_, key, static_cast<AssistLevel>(level));
-            break;
-        }
-        case 8: {
-            video_.borderlessFullscreen =
-                (dir != 0) ? (dir > 0) : !video_.borderlessFullscreen;
-            config_.SetString("video", "mode",
-                              video_.borderlessFullscreen ? "borderless" : "windowed");
-            renderer_.ApplyVideo(video_);
-            break;
-        }
-        case 9: {
-            int idx = 0;
-            for (int i = 0; i < kResPresetCount; ++i) {
-                if (kResPresets[i].width == video_.width && kResPresets[i].height == video_.height) {
-                    idx = i;
-                }
-            }
-            idx = CyclePreset(idx, kResPresetCount, dir);
-            video_.width = kResPresets[idx].width;
-            video_.height = kResPresets[idx].height;
-            config_.SetString("video", "width", std::to_string(video_.width));
-            config_.SetString("video", "height", std::to_string(video_.height));
-            renderer_.ApplyVideo(video_);
-            break;
-        }
-        case 10: {
-            video_.shadows = (dir != 0) ? (dir > 0) : !video_.shadows;
-            config_.SetString("video", "quality", video_.shadows ? "high" : "low");
-            renderer_.ApplyVideo(video_);
-            break;
-        }
-        case 11: {
-            int idx = 0;
-            for (int i = 0; i < kFpsPresetCount; ++i) {
-                if (kFpsPresets[i] == video_.fpsLimit) idx = i;
-            }
-            idx = CyclePreset(idx, kFpsPresetCount, dir);
-            video_.fpsLimit = kFpsPresets[idx];
-            config_.SetString("video", "fps_limit", std::to_string(video_.fpsLimit));
-            renderer_.ApplyVideo(video_);
-            break;
-        }
-        case 12: {
-            const int hz = static_cast<int>(1.f / fixedDt_ + 0.5f);
-            int idx = 1;
-            for (int i = 0; i < kPhysicsPresetCount; ++i) {
-                if (kPhysicsPresets[i] == hz) idx = i;
-            }
-            idx = CyclePreset(idx, kPhysicsPresetCount, dir);
-            fixedDt_ = 1.f / static_cast<float>(kPhysicsPresets[idx]);
-            config_.SetString("physics", "hz", std::to_string(kPhysicsPresets[idx]));
-            break;
-        }
-        case 13: {
-            // Collision backend swap (qu3e | nudge | rpc) — rebuilt on next race.
-            static const char* kEngines[3] = {"qu3e", "nudge", "rpc"};
-            const std::string cur = config_.GetString("physics", "engine", "qu3e");
-            int idx = 0;
-            for (int i = 0; i < 3; ++i) {
-                if (cur == kEngines[i]) idx = i;
-            }
-            if (dir != 0) {
-                idx = (idx + (dir > 0 ? 1 : 2)) % 3;
-            } else {
-                idx = (idx + 1) % 3;
-            }
-            config_.SetString("physics", "engine", kEngines[idx]);
-            break;
-        }
-        case 14: {
-            const int volume =
-                std::clamp(config_.GetInt("audio", "volume", 80) + (dir != 0 ? (dir > 0 ? 20 : -20) : 20),
-                           0, 100);
-            config_.SetString("audio", "volume", std::to_string(volume));
-            if (audio_) audio_->SetMasterVolume(volume / 100.f);
-            break;
-        }
-        default: {
-            static const char* kAudioBackends[4] = {"auto", "wasapi", "directsound", "winmm"};
-            const std::string current = config_.GetString("audio", "backend", "auto");
-            int idx = 0;
-            for (int i = 0; i < 4; ++i) {
-                if (current == kAudioBackends[i]) idx = i;
-            }
-            idx = CyclePreset(idx, 4, dir);
-            config_.SetString("audio", "backend", kAudioBackends[idx]);
-            if (audio_) audio_->SetBackend(kAudioBackends[idx]);
-            break;
-        }
+    static constexpr RowDef kDefs[kSettingsRowCount] = {
+        {"season", "SEASON"},
+        {"drs", "DRS"},
+        {"aero", "ACTIVE AERO"},
+        {"overtake", "OVERTAKE"},
+        {"abs", "ABS"},
+        {"tc", "TRACTION CTRL"},
+        {"esc", "STABILITY CTRL"},
+        {"steer", "STEER ASSIST"},
+        {"display", "DISPLAY MODE"},
+        {"resolution", "RESOLUTION"},
+        {"quality", "QUALITY"},
+        {"fps", "FPS LIMIT"},
+        {"physics_hz", "PHYSICS RATE"},
+        {"physics_engine", "PHYSICS ENGINE"},
+        {"volume", "SOUND VOLUME"},
+        {"audio_backend", "AUDIO BACKEND"},
+        {"back", "BACK"},
+    };
+    s.widgets.reserve(kSettingsRowCount);
+    for (int i = 0; i < kSettingsRowCount; ++i) {
+        UiWidget& row = s.widgets.emplace_back();
+        row.size = fontSize;
+        row.id = kDefs[i].id;
+        row.label = kDefs[i].label;
+        row.kind = (i == kSettingsRowCount - 1) ? UiKind::Button : UiKind::Value;
     }
 }
 
-void Game::UpdateRaceSetup() {
-    constexpr int kRows = kRaceSetupRowCount;
-    const InputState& in = rawInput_;
+void Game::RefreshSettingsValues() {
+    const int physicsHz = static_cast<int>(1.f / fixedDt_ + 0.5f);
+    char resBuffer[32];
+    std::snprintf(resBuffer, sizeof(resBuffer), "%dx%d", video_.width, video_.height);
+    // Season preset display: named presets, or CUSTOM once a feature gate was
+    // flipped individually.
+    const std::string preset = config_.GetString("season", "preset", "2025");
+    const std::string seasonName = preset == "2026"   ? "2026"
+                                   : preset == "2025" ? "2025"
+                                                      : "CUSTOM";
+    const std::string values[kSettingsRowCount] = {
+        seasonName,
+        seasonDrs_ ? "ON" : "OFF",
+        seasonAero_ ? "ON" : "OFF",
+        seasonOverride_ ? "ON" : "OFF",
+        AssistLevelName(ParseAssistLevel(config_, "abs", DefaultAssistLevel("abs"))),
+        AssistLevelName(ParseAssistLevel(config_, "tc", DefaultAssistLevel("tc"))),
+        AssistLevelName(ParseAssistLevel(config_, "esc", DefaultAssistLevel("esc"))),
+        AssistLevelName(ParseAssistLevel(config_, "steer", DefaultAssistLevel("steer"))),
+        video_.borderlessFullscreen ? "BORDERLESS" : "WINDOWED",
+        resBuffer,
+        video_.shadows ? "HIGH" : "LOW",
+        video_.fpsLimit > 0 ? std::to_string(video_.fpsLimit) : "UNCAPPED",
+        std::to_string(physicsHz) + " HZ",
+        MapDisplayName(config_.GetString("physics", "engine", "qu3e")),
+        std::to_string(config_.GetInt("audio", "volume", 80)),
+        MapDisplayName(config_.GetString("audio", "backend", "auto")),
+        "",
+    };
+    for (int i = 0; i < kSettingsRowCount; ++i) {
+        screens_.settings.widgets[static_cast<std::size_t>(i)].value = values[i];
+    }
+}
 
-    // Async build in flight: freeze the screen (RenderRaceSetup shows
-    // LOADING); only BACK cancels — the join waits out the build stages.
+void Game::UpdateSettings() {
+    if (audio_ && (rawInput_.menuUp || rawInput_.menuDown || rawInput_.menuLeft ||
+                   rawInput_.menuRight || rawInput_.menuSelect)) {
+        audio_->PlayUIClick();
+    }
+    BuildSettingsScreen();
+    const UiAction action = ui_.Update(screens_.settings, rawInput_);
+
+    const auto backToMenu = [this]() {
+        config_.Save(DataPath("config.rushconf"));
+        phase_ = RacePhase::Menu;
+    };
+    if (action.kind == UiActionKind::Back) {
+        backToMenu();
+        return;
+    }
+    if (action.kind == UiActionKind::Activate) {
+        if (action.id == "back") backToMenu();
+        return;
+    }
+
+    std::string id = action.id;
+    int step = 0;
+    if (action.kind == UiActionKind::AdjustLeft) {
+        step = -1;
+    } else if (action.kind == UiActionKind::AdjustRight) {
+        step = 1;
+    } else if (action.kind == UiActionKind::None && rawInput_.menuSelect) {
+        // Enter has always flipped the focused row in place. The engine only
+        // reports Left/Right on Value rows, so an unused Enter is passed on as
+        // a zero step, which the row handlers read as "toggle".
+        const UiWidget* row = FocusedRow(screens_.settings);
+        if (row == nullptr || row->kind != UiKind::Value) return;
+        id = row->id;
+    } else {
+        return;
+    }
+    ApplySettingStep(id, step);
+    RefreshSettingsValues();
+}
+
+void Game::ApplySettingStep(const std::string& id, int step) {
+    if (id == "season") {
+        // SEASON preset: classic (DRS) <-> 2026 (aero + override).
+        // Writing a preset rewrites the three feature toggles with it.
+        const std::string preset = config_.GetString("season", "preset", "2025");
+        int idx = (preset == "2026") ? 1 : 0;  // custom -> classic
+        idx = CyclePreset(idx, 2, step);
+        const bool is2026 = (idx == 1);
+        config_.SetString("season", "preset", is2026 ? "2026" : "2025");
+        config_.SetString("season", "drs", is2026 ? "0" : "1");
+        config_.SetString("season", "active_aero", is2026 ? "1" : "0");
+        config_.SetString("season", "overtake", is2026 ? "1" : "0");
+        seasonDrs_ = !is2026;
+        seasonAero_ = is2026;
+        seasonOverride_ = is2026;
+        return;
+    }
+    if (id == "drs" || id == "aero" || id == "overtake") {
+        // Per-feature toggles. Flipping one marks the preset CUSTOM — the
+        // three systems may then mix, but only deliberately.
+        static const char* kSeasonKeys[3] = {"drs", "active_aero", "overtake"};
+        bool* gates[3] = {&seasonDrs_, &seasonAero_, &seasonOverride_};
+        const int i = (id == "drs") ? 0 : (id == "aero" ? 1 : 2);
+        const bool value = (step != 0) ? (step > 0) : !*gates[i];
+        *gates[i] = value;
+        config_.SetString("season", kSeasonKeys[i], value ? "1" : "0");
+        config_.SetString("season", "preset", "custom");
+        return;
+    }
+    if (id == "abs" || id == "tc" || id == "esc" || id == "steer") {
+        const char* key = id.c_str();
+        int level = static_cast<int>(ParseAssistLevel(config_, key, DefaultAssistLevel(key)));
+        level = CyclePreset(level, 3, step);
+        SaveAssistLevel(config_, key, static_cast<AssistLevel>(level));
+        return;
+    }
+    if (id == "display") {
+        video_.borderlessFullscreen = (step != 0) ? (step > 0) : !video_.borderlessFullscreen;
+        config_.SetString("video", "mode", video_.borderlessFullscreen ? "borderless" : "windowed");
+        renderer_.ApplyVideo(video_);
+        return;
+    }
+    if (id == "resolution") {
+        int idx = 0;
+        for (int i = 0; i < kResPresetCount; ++i) {
+            if (kResPresets[i].width == video_.width && kResPresets[i].height == video_.height) {
+                idx = i;
+            }
+        }
+        idx = CyclePreset(idx, kResPresetCount, step);
+        video_.width = kResPresets[idx].width;
+        video_.height = kResPresets[idx].height;
+        config_.SetString("video", "width", std::to_string(video_.width));
+        config_.SetString("video", "height", std::to_string(video_.height));
+        renderer_.ApplyVideo(video_);
+        return;
+    }
+    if (id == "quality") {
+        video_.shadows = (step != 0) ? (step > 0) : !video_.shadows;
+        config_.SetString("video", "quality", video_.shadows ? "high" : "low");
+        renderer_.ApplyVideo(video_);
+        return;
+    }
+    if (id == "fps") {
+        int idx = 0;
+        for (int i = 0; i < kFpsPresetCount; ++i) {
+            if (kFpsPresets[i] == video_.fpsLimit) idx = i;
+        }
+        idx = CyclePreset(idx, kFpsPresetCount, step);
+        video_.fpsLimit = kFpsPresets[idx];
+        config_.SetString("video", "fps_limit", std::to_string(video_.fpsLimit));
+        renderer_.ApplyVideo(video_);
+        return;
+    }
+    if (id == "physics_hz") {
+        const int hz = static_cast<int>(1.f / fixedDt_ + 0.5f);
+        int idx = 1;
+        for (int i = 0; i < kPhysicsPresetCount; ++i) {
+            if (kPhysicsPresets[i] == hz) idx = i;
+        }
+        idx = CyclePreset(idx, kPhysicsPresetCount, step);
+        fixedDt_ = 1.f / static_cast<float>(kPhysicsPresets[idx]);
+        config_.SetString("physics", "hz", std::to_string(kPhysicsPresets[idx]));
+        return;
+    }
+    if (id == "physics_engine") {
+        // Collision backend swap (qu3e | nudge | rpc) — rebuilt on next race.
+        static const char* kEngines[3] = {"qu3e", "nudge", "rpc"};
+        const std::string cur = config_.GetString("physics", "engine", "qu3e");
+        int idx = 0;
+        for (int i = 0; i < 3; ++i) {
+            if (cur == kEngines[i]) idx = i;
+        }
+        if (step != 0) {
+            idx = (idx + (step > 0 ? 1 : 2)) % 3;
+        } else {
+            idx = (idx + 1) % 3;
+        }
+        config_.SetString("physics", "engine", kEngines[idx]);
+        return;
+    }
+    if (id == "volume") {
+        const int delta = (step != 0) ? (step > 0 ? 20 : -20) : 20;
+        const int volume = std::clamp(config_.GetInt("audio", "volume", 80) + delta, 0, 100);
+        config_.SetString("audio", "volume", std::to_string(volume));
+        if (audio_) audio_->SetMasterVolume(volume / 100.f);
+        return;
+    }
+    if (id == "audio_backend") {
+        static const char* kAudioBackends[4] = {"auto", "wasapi", "directsound", "winmm"};
+        const std::string current = config_.GetString("audio", "backend", "auto");
+        int idx = 0;
+        for (int i = 0; i < 4; ++i) {
+            if (current == kAudioBackends[i]) idx = i;
+        }
+        idx = CyclePreset(idx, 4, step);
+        config_.SetString("audio", "backend", kAudioBackends[idx]);
+        if (audio_) audio_->SetBackend(kAudioBackends[idx]);
+    }
+}
+
+void Game::RenderSettings() {
+    BuildSettingsScreen();
+    RefreshSettingsValues();
+    ui_.Draw(screens_.settings, renderer_);
+}
+
+// ------------------------------------------------------------ race setup ----
+
+void Game::BuildRaceSetupScreen() {
+    if (!screens_.raceSetup.widgets.empty()) return;
+    const float w = static_cast<float>(renderer_.ScreenWidth());
+    const float h = static_cast<float>(renderer_.ScreenHeight());
+    UiScreen& s = screens_.raceSetup;
+    const float top = h * 0.32f;
+    const float rowH = std::clamp((h - top - 110.f) / kRaceSetupRowCount, 34.f, 52.f);
+    const int fontSize = rowH > 42.f ? 24 : 20;
+    s.title = "RACE SETUP";
+    s.titleSize = 42;
+    s.x = w * 0.5f - 280.f;
+    s.y = h * 0.18f;
+    s.rowStartY = top;
+    s.rowHeight = rowH;
+    s.valueColumnX = 560.f;
+    s.hint = "A/D CHANGE    W/S SELECT    ENTER CONFIRM    ESC BACK";
+
+    struct RowDef {
+        const char* id;
+        const char* label;
+        UiKind kind;
+    };
+    static constexpr RowDef kDefs[kRaceSetupRowCount] = {
+        {"circuit", "CIRCUIT", UiKind::Value},
+        {"laps", "LAPS", UiKind::Value},
+        {"cars", "CARS", UiKind::Value},
+        {"damage", "DAMAGE", UiKind::Value},
+        {"start", "START RACE", UiKind::Button},
+        {"back", "BACK", UiKind::Button},
+    };
+    s.widgets.reserve(kRaceSetupRowCount);
+    for (int i = 0; i < kRaceSetupRowCount; ++i) {
+        UiWidget& row = s.widgets.emplace_back();
+        row.size = fontSize;
+        row.id = kDefs[i].id;
+        row.label = kDefs[i].label;
+        row.kind = kDefs[i].kind;
+    }
+}
+
+void Game::RefreshRaceSetupValues() {
+    if (screens_.raceSetup.widgets.empty()) return;
+    std::vector<UiWidget>& rows = screens_.raceSetup.widgets;
+    rows[0].value = MapDisplayName(mapName_);
+    rows[1].value = std::to_string(totalLaps_);
+    rows[2].value = std::to_string(config_.GetInt("race", "cars", 4));
+    rows[3].value = config_.GetBool("race", "damage", true) ? "ON" : "OFF";
+}
+
+void Game::UpdateRaceSetup() {
+    // Async build in flight: freeze the screen (RenderRaceSetup shows LOADING);
+    // only BACK cancels — the join waits out the build stages.
     if (loadThread_.joinable()) {
-        if (in.menuBack) {
+        if (rawInput_.menuBack) {
             CancelRaceLoad();
             config_.Save(DataPath("config.rushconf"));
             phase_ = RacePhase::Menu;
-            menuCursor_ = 0;
         }
         return;
     }
 
-    if (audio_ && (in.menuUp || in.menuDown || in.menuLeft || in.menuRight || in.menuSelect)) {
+    if (audio_ && (rawInput_.menuUp || rawInput_.menuDown || rawInput_.menuLeft ||
+                   rawInput_.menuRight || rawInput_.menuSelect)) {
         audio_->PlayUIClick();
     }
-    if (in.menuUp) raceSetupCursor_ = (raceSetupCursor_ + kRows - 1) % kRows;
-    if (in.menuDown) raceSetupCursor_ = (raceSetupCursor_ + 1) % kRows;
+    BuildRaceSetupScreen();
+    const UiAction action = ui_.Update(screens_.raceSetup, rawInput_);
 
-    if (in.menuBack) {
+    const auto backToMenu = [this]() {
         config_.Save(DataPath("config.rushconf"));
         phase_ = RacePhase::Menu;
-        menuCursor_ = 0;
+    };
+    if (action.kind == UiActionKind::Back) {
+        backToMenu();
         return;
     }
-
-    const int dir = (in.menuRight ? 1 : 0) - (in.menuLeft ? 1 : 0);
-    if (dir == 0 && !in.menuSelect) return;
-
-    switch (raceSetupCursor_) {
-        case 0: {
-            const int count = static_cast<int>(mapList_.size());
-            int idx = 0;
-            for (int i = 0; i < count; ++i) {
-                if (mapList_[static_cast<size_t>(i)] == mapName_) idx = i;
-            }
-            idx = CyclePreset(idx, count, dir);
-            mapName_ = mapList_[static_cast<size_t>(idx)];
-            config_.SetString("race", "map", mapName_);
-            break;
-        }
-        case 1: {
-            totalLaps_ = std::clamp(totalLaps_ + (dir != 0 ? dir : 1), 1, 20);
-            config_.SetString("race", "laps", std::to_string(totalLaps_));
-            break;
-        }
-        case 2: {
-            const int cars = std::clamp(config_.GetInt("race", "cars", 4) + (dir != 0 ? dir : 1),
-                                        1, 120);
-            config_.SetString("race", "cars", std::to_string(cars));
-            break;
-        }
-        case 3: {
-            bool value = config_.GetBool("race", "damage", true);
-            value = (dir != 0) ? (dir > 0) : !value;
-            config_.SetString("race", "damage", value ? "true" : "false");
-            break;
-        }
-        case 4: {
-            // START
+    if (action.kind == UiActionKind::Activate) {
+        if (action.id == "start") {
             config_.Save(DataPath("config.rushconf"));
             if (threadedSim_) {
                 BeginRaceLoad();  // menu keeps rendering; PollRaceLoad swaps in
             } else {
                 StartRace();  // inline / drive-test / WASM: deterministic
             }
-            break;
+        } else if (action.id == "back") {
+            backToMenu();
         }
-        default: {
-            // BACK
-            config_.Save(DataPath("config.rushconf"));
-            phase_ = RacePhase::Menu;
-            menuCursor_ = 0;
-            break;
-        }
+        return;
     }
+
+    std::string id = action.id;
+    int step = 0;
+    if (action.kind == UiActionKind::AdjustLeft) {
+        step = -1;
+    } else if (action.kind == UiActionKind::AdjustRight) {
+        step = 1;
+    } else if (action.kind == UiActionKind::None && rawInput_.menuSelect) {
+        // Enter on a value row steps it forward (the rows did this before the
+        // engine owned the input); a zero step keeps that meaning.
+        const UiWidget* row = FocusedRow(screens_.raceSetup);
+        if (row == nullptr || row->kind != UiKind::Value) return;
+        id = row->id;
+    } else {
+        return;
+    }
+    ApplyRaceSetupStep(id, step);
+    RefreshRaceSetupValues();
 }
 
-void Game::RenderMenu() {
-    const float w = static_cast<float>(renderer_.ScreenWidth());
-    const float h = static_cast<float>(renderer_.ScreenHeight());
-
-    renderer_.DrawRect2D(0.f, 0.f, w, h, Color{0.f, 0.f, 0.f, 0.35f});
-    renderer_.DrawText2D("APEX RUSH", w * 0.5f - 165.f, h * 0.24f, 68, Color::White());
-    renderer_.DrawText2D("OPEN F1 SIM", w * 0.5f - 92.f, h * 0.24f + 78.f, 20, Color::Gray());
-
-    // Index order is asserted by --drive-test: 0 race, 1 settings, quit last.
-    const char* items[4] = {"START RACE", "SETTINGS", "LAN RACE", "QUIT"};
-    float y = h * 0.46f;
-    for (int i = 0; i < 4; ++i) {
-        const bool selected = (i == menuCursor_);
-        const Vec2f size = renderer_.MeasureText2D(items[i], 28);
-        const float x = w * 0.5f - size.x * 0.5f;
-        if (selected) {
-            renderer_.DrawRect2D(x - 28.f, y - 8.f, size.x + 56.f, 42.f,
-                                 Color{1.f, 0.55f, 0.15f, 0.22f});
+void Game::ApplyRaceSetupStep(const std::string& id, int step) {
+    if (id == "circuit") {
+        const int count = static_cast<int>(mapList_.size());
+        int idx = 0;
+        for (int i = 0; i < count; ++i) {
+            if (mapList_[static_cast<std::size_t>(i)] == mapName_) idx = i;
         }
-        renderer_.DrawText2D(items[i], x, y, 28, selected ? Color::Orange() : Color::White());
-        y += 54.f;
+        idx = CyclePreset(idx, count, step);
+        mapName_ = mapList_[static_cast<std::size_t>(idx)];
+        config_.SetString("race", "map", mapName_);
+        return;
     }
-
-    const std::string hint = "W/S SELECT    ENTER CONFIRM";
-    const Vec2f hintSize = renderer_.MeasureText2D(hint, 18);
-    renderer_.DrawText2D(hint, w * 0.5f - hintSize.x * 0.5f, h - 52.f, 18, Color::Gray());
-}
-
-void Game::RenderSettings() {
-    const float w = static_cast<float>(renderer_.ScreenWidth());
-    const float h = static_cast<float>(renderer_.ScreenHeight());
-
-    renderer_.DrawRect2D(0.f, 0.f, w, h, Color{0.f, 0.f, 0.f, 0.45f});
-
-    const std::string title = "SETTINGS";
-    const Vec2f titleSize = renderer_.MeasureText2D(title, 42);
-    renderer_.DrawText2D(title, w * 0.5f - titleSize.x * 0.5f, h * 0.08f, 42, Color::White());
-
-    struct Row {
-        const char* label;
-        std::string value;
-    };
-    const int physicsHz = static_cast<int>(1.f / fixedDt_ + 0.5f);
-    char resBuffer[32];
-    std::snprintf(resBuffer, sizeof(resBuffer), "%dx%d", video_.width, video_.height);
-    // Season preset display: named presets or CUSTOM once a feature gate
-    // was flipped individually.
-    const std::string preset = config_.GetString("season", "preset", "2025");
-    const std::string seasonName = preset == "2026"   ? "2026"
-                                   : preset == "2025" ? "2025"
-                                                      : "CUSTOM";
-    const Row rows[kSettingsRowCount] = {
-        {"SEASON", seasonName},
-        {"DRS", seasonDrs_ ? "ON" : "OFF"},
-        {"ACTIVE AERO", seasonAero_ ? "ON" : "OFF"},
-        {"OVERTAKE", seasonOverride_ ? "ON" : "OFF"},
-        {"ABS", AssistLevelName(ParseAssistLevel(config_, "abs", DefaultAssistLevel("abs")))},
-        {"TRACTION CTRL", AssistLevelName(ParseAssistLevel(config_, "tc", DefaultAssistLevel("tc")))},
-        {"STABILITY CTRL", AssistLevelName(ParseAssistLevel(config_, "esc", DefaultAssistLevel("esc")))},
-        {"STEER ASSIST", AssistLevelName(ParseAssistLevel(config_, "steer", DefaultAssistLevel("steer")))},
-        {"DISPLAY MODE", video_.borderlessFullscreen ? "BORDERLESS" : "WINDOWED"},
-        {"RESOLUTION", resBuffer},
-        {"QUALITY", video_.shadows ? "HIGH" : "LOW"},
-        {"FPS LIMIT", video_.fpsLimit > 0 ? std::to_string(video_.fpsLimit) : "UNCAPPED"},
-        {"PHYSICS RATE", std::to_string(physicsHz) + " HZ"},
-        {"PHYSICS ENGINE", MapDisplayName(config_.GetString("physics", "engine", "qu3e"))},
-        {"SOUND VOLUME", std::to_string(config_.GetInt("audio", "volume", 80))},
-        {"AUDIO BACKEND", MapDisplayName(config_.GetString("audio", "backend", "auto"))},
-        {"BACK", ""},
-    };
-
-    // The row height shrinks so the list fits 720p.
-    const float top = h * 0.17f;
-    const float rowH = std::clamp((h - top - 90.f) / kSettingsRowCount, 26.f, 46.f);
-    const int fontSize = rowH > 38.f ? 22 : 17;
-    float y = top;
-    for (int i = 0; i < kSettingsRowCount; ++i) {
-        const bool selected = (i == settingsCursor_);
-        renderer_.DrawRect2D(w * 0.5f - 300.f, y - 2.f, 600.f, rowH - 4.f,
-                             selected ? Color{1.f, 0.55f, 0.15f, 0.22f}
-                                      : Color{0.f, 0.f, 0.f, 0.25f});
-        renderer_.DrawText2D(rows[i].label, w * 0.5f - 280.f, y + (rowH - 4.f - fontSize) * 0.5f,
-                             fontSize, selected ? Color::Orange() : Color::White());
-        if (!rows[i].value.empty()) {
-            const Vec2f valueSize = renderer_.MeasureText2D(rows[i].value, fontSize);
-            renderer_.DrawText2D(rows[i].value, w * 0.5f + 280.f - valueSize.x,
-                                 y + (rowH - 4.f - fontSize) * 0.5f, fontSize,
-                                 selected ? Color::Yellow() : Color::Gray());
-        }
-        y += rowH;
+    if (id == "laps") {
+        totalLaps_ = std::clamp(totalLaps_ + (step != 0 ? step : 1), 1, 20);
+        config_.SetString("race", "laps", std::to_string(totalLaps_));
+        return;
     }
-
-    const std::string hint = "A/D CHANGE    W/S SELECT    ENTER/ESC BACK";
-    const Vec2f hintSize = renderer_.MeasureText2D(hint, 18);
-    renderer_.DrawText2D(hint, w * 0.5f - hintSize.x * 0.5f, h - 52.f, 18, Color::Gray());
+    if (id == "cars") {
+        const int cars = std::clamp(config_.GetInt("race", "cars", 4) + (step != 0 ? step : 1), 1, 120);
+        config_.SetString("race", "cars", std::to_string(cars));
+        return;
+    }
+    if (id == "damage") {
+        const bool value =
+            (step != 0) ? (step > 0) : !config_.GetBool("race", "damage", true);
+        config_.SetString("race", "damage", value ? "true" : "false");
+    }
 }
 
 void Game::RenderRaceSetup() {
     const float w = static_cast<float>(renderer_.ScreenWidth());
     const float h = static_cast<float>(renderer_.ScreenHeight());
-
     renderer_.DrawRect2D(0.f, 0.f, w, h, Color{0.f, 0.f, 0.f, 0.45f});
 
-    const std::string title = "RACE SETUP";
-    const Vec2f titleSize = renderer_.MeasureText2D(title, 42);
-    renderer_.DrawText2D(title, w * 0.5f - titleSize.x * 0.5f, h * 0.18f, 42, Color::White());
-
-    // Async build in flight: the rows are frozen (input is gated in
-    // UpdateRaceSetup) — show progress instead of a dead-looking menu.
+    // Async build in flight: the rows are gated in UpdateRaceSetup, so show
+    // progress instead of a dead-looking menu.
     if (loadThread_.joinable()) {
+        renderer_.DrawText2D("RACE SETUP", w * 0.5f - 120.f, h * 0.18f, 42, Color::White());
         const std::string loading = "LOADING...";
         const Vec2f loadSize = renderer_.MeasureText2D(loading, 36);
         renderer_.DrawText2D(loading, w * 0.5f - loadSize.x * 0.5f, h * 0.48f, 36,
@@ -1745,46 +1994,8 @@ void Game::RenderRaceSetup() {
         return;
     }
 
-    struct Row {
-        const char* label;
-        std::string value;
-    };
-    const Row rows[kRaceSetupRowCount] = {
-        {"CIRCUIT", MapDisplayName(mapName_)},
-        {"LAPS", std::to_string(totalLaps_)},
-        {"CARS", std::to_string(config_.GetInt("race", "cars", 4))},
-        {"DAMAGE", config_.GetBool("race", "damage", true) ? "ON" : "OFF"},
-        {"START RACE", ""},
-        {"BACK", ""},
-    };
-
-    const float top = h * 0.32f;
-    const float rowH = std::clamp((h - top - 110.f) / kRaceSetupRowCount, 34.f, 52.f);
-    const int fontSize = rowH > 42.f ? 24 : 20;
-    float y = top;
-    for (int i = 0; i < kRaceSetupRowCount; ++i) {
-        const bool selected = (i == raceSetupCursor_);
-        const bool action = (i >= 4);  // START / BACK rows
-        renderer_.DrawRect2D(w * 0.5f - 300.f, y - 2.f, 600.f, rowH - 4.f,
-                             selected ? Color{1.f, 0.55f, 0.15f, 0.22f}
-                                      : Color{0.f, 0.f, 0.f, 0.25f});
-        renderer_.DrawText2D(rows[i].label,
-                             action ? w * 0.5f - renderer_.MeasureText2D(rows[i].label, fontSize).x * 0.5f
-                                    : w * 0.5f - 280.f,
-                             y + (rowH - 4.f - fontSize) * 0.5f, fontSize,
-                             selected ? Color::Orange() : Color::White());
-        if (!rows[i].value.empty()) {
-            const Vec2f valueSize = renderer_.MeasureText2D(rows[i].value, fontSize);
-            renderer_.DrawText2D(rows[i].value, w * 0.5f + 280.f - valueSize.x,
-                                 y + (rowH - 4.f - fontSize) * 0.5f, fontSize,
-                                 selected ? Color::Yellow() : Color::Gray());
-        }
-        y += rowH;
-    }
-
-    const std::string hint = "A/D CHANGE    W/S SELECT    ENTER CONFIRM    ESC BACK";
-    const Vec2f hintSize = renderer_.MeasureText2D(hint, 18);
-    renderer_.DrawText2D(hint, w * 0.5f - hintSize.x * 0.5f, h - 52.f, 18, Color::Gray());
+    BuildRaceSetupScreen();
+    RefreshRaceSetupValues();
+    ui_.Draw(screens_.raceSetup, renderer_);
 }
-
 }  // namespace apex

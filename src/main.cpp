@@ -21,6 +21,7 @@ import rush.engine.job;
 import rush.engine.physics;
 import rush.engine.render;
 import rush.engine.input;
+import rush.engine.ui;
 
 namespace {
 
@@ -66,6 +67,13 @@ struct ScriptedInput {
         f.keys[static_cast<size_t>(KeyCode::R)] = s.reverse;
         f.keys[static_cast<size_t>(KeyCode::LShift)] = s.overtake;
         f.keys[static_cast<size_t>(KeyCode::B)] = s.lookBack;
+        // Typed text reaches the recognizers as device codepoints, same path a
+        // real keyboard takes into the text channel (name entry).
+        f.textCount = static_cast<std::uint8_t>(std::min<std::size_t>(s.textLen, 32u));
+        for (std::uint8_t i = 0; i < f.textCount; ++i) {
+            f.text[i] = static_cast<std::uint32_t>(static_cast<unsigned char>(s.text[i]));
+        }
+        f.keys[static_cast<size_t>(KeyCode::Backspace)] = s.textBackspace;
         source.scripted = f;
 
         // Edge-triggered actions: one event per set() call (old IsKeyPressed
@@ -1139,10 +1147,10 @@ int RunSeasonGateTest(IPhysicsWorld& world) {
     };
 
     const float dt = 1.f / 240.f;
-    auto spawn = [&](const VehicleParams& params) {
+    auto spawn = [&](const VehicleParams& params, float x = 0.f) {
         Vehicle car;
         Transform pose;
-        pose.position = {0.f, 0.55f, 0.f};
+        pose.position = {x, 0.55f, 0.f};
         car.Spawn(world, pose, params);
         for (int i = 0; i < 60; ++i) {  // settle on the suspension
             car.Update(CarInput{}, dt);
@@ -1188,9 +1196,9 @@ int RunSeasonGateTest(IPhysicsWorld& world) {
     // a DRS zone with a stale request.
     {
         VehicleParams params;
-        params.drsEnabled = false;
-        params.activeAeroEnabled = true;
-        params.overtakeEnabled = true;
+        params.capabilities = CapabilityBit(VehicleCapability::ActiveAero) |
+                              CapabilityBit(VehicleCapability::Overtake) |
+                              CapabilityBit(VehicleCapability::Ers);
         Vehicle car = spawn(params);
 
         CarInput drs;
@@ -1214,14 +1222,254 @@ int RunSeasonGateTest(IPhysicsWorld& world) {
               car.State().ersDeploying ? 1.f : 0.f, 1.f);
     }
 
+    // ERS is a fitted part, not a rule flag: a car without the Ers bit has no
+    // store at all, so braking must leave it empty. A classic-season car used
+    // to regrow charge (and a HUD bar) it had no hardware for.
+    {
+        auto chargeAfterBraking = [&](std::uint8_t caps, float x) {
+            VehicleParams params;
+            params.capabilities = caps;
+            // Clear of the cars spawned above: this world keeps them alive, and
+            // a car wedged against another never gets moving (the regen window
+            // needs speed).
+            Vehicle car = spawn(params, x);
+            CarInput gas;
+            gas.throttle = 1.f;
+            step(car, gas, 4.f);
+            const float speed = car.State().speed;
+            CarInput brake;
+            brake.brake = 0.6f;
+            const float before = car.State().ersCharge;
+            // Short brake window: regen needs speed > 8 m/s, so a full stop
+            // would hide it rather than measure it.
+            step(car, brake, 0.4f);
+            return std::array<float, 3>{before, car.State().ersCharge, speed};
+        };
+        const auto bare = chargeAfterBraking(CapabilityBit(VehicleCapability::Drs), 120.f);
+        check(bare[0] == 0.f, "ers: car without the Ers part starts empty", bare[0], 0.f);
+        check(bare[1] == 0.f, "ers: car without the Ers part never regenerates", bare[1], 0.f);
+
+        const auto fitted = chargeAfterBraking(CapabilityBit(VehicleCapability::Drs) |
+                                               CapabilityBit(VehicleCapability::Ers), 160.f);
+        check(fitted[2] > 8.f, "ers: regen case reaches the regen speed window", fitted[2], 8.f);
+        check(fitted[1] > fitted[0], "ers: fitted car regenerates under braking", fitted[1],
+              fitted[0]);
+    }
+
     return failures;
 }
 
-// `apex-rush --drive-test`: headless physics/controls verification. Drives the
+// Suspension travel limit (the 300 km/h corner/brake sink-through). Two
+// properties, because the bug was a chain: a force clamp at the travel limit
+// (so load could out-run support and the body sank), and a buried hardpoint
+// reported as airborne (so the sunken car free-fell instead of being pushed
+// back out).
+int RunSuspensionLimitTest(IPhysicsWorld& world) {
+    world.SetGravity({0.f, -9.81f, 0.f});
+
+    BodyDesc ground;
+    ground.transform.position = {0.f, -1.f, 0.f};
+    ground.halfExtents = {2000.f, 1.f, 2000.f};
+    ground.friction = 0.9f;
+    ground.userData = SurfaceTag(SurfaceType::Road);
+    (void)world.CreateBody(ground);
+
+    int failures = 0;
+    auto check = [&failures](bool ok, const char* what, float got, float want) {
+        std::printf("[%s] %s (got %.2f, target %.2f)\n", ok ? "PASS" : "FAIL", what, got, want);
+        if (!ok) ++failures;
+    };
+
+    // (a) The spring law itself: force must keep growing past the travel limit
+    // and stay continuous where the bump stop takes over. A clamp here is the
+    // whole bug, so it is cheaper to pin the curve than to reproduce the sink.
+    {
+        SuspensionParams sp;
+        const float k = 38000.f;
+        const float atLimit = sp.SpringForce(sp.suspensionMaxTravel, k);
+        const float halfway = sp.SpringForce(sp.suspensionMaxTravel + sp.bumpStopTravel * 0.5f, k);
+        const float atStop = sp.SpringForce(sp.CompressionLimit(), k);
+        check(atLimit > k * sp.suspensionMaxTravel - 1.f, "suspension: force at the travel limit",
+              atLimit, k * sp.suspensionMaxTravel);
+        check(halfway > atLimit * 1.2f, "suspension: force keeps rising into the bump stop",
+              halfway, atLimit * 1.2f);
+        check(atStop > atLimit * 1.4f, "suspension: force at the end of the bump stop", atStop,
+              atLimit * 1.4f);
+        const float justBefore = sp.SpringForce(sp.suspensionMaxTravel - 1e-6f, k);
+        check(std::fabs(justBefore - atLimit) < 1.f, "suspension: force is continuous at the limit",
+              justBefore, atLimit);
+        check(sp.RayLength(0.33f) > sp.suspensionRestLength + sp.CompressionLimit() + 0.32f,
+              "suspension: ray covers the whole strut travel", sp.RayLength(0.33f),
+              sp.suspensionRestLength + sp.CompressionLimit() + 0.33f);
+    }
+
+    // (b) The reported failure, modelled directly: hold the aerodynamic load a
+    // 300 km/h car carries (~30 kN against 7.4 kN of weight) and the body must
+    // stay on its struts. With the old force clamp the corners saturated and
+    // the body sank until the chassis was inside the road.
+    {
+        const float dt = 1.f / 240.f;
+        VehicleParams params;
+        Vehicle car;
+        Transform pose;
+        pose.position = {0.f, 0.55f, 0.f};
+        car.Spawn(world, pose, params);
+        for (int i = 0; i < 60; ++i) {   // settle on the suspension
+            car.Update(CarInput{}, dt);
+            world.Step(dt);
+        }
+        const float settledY = car.State().transform.position.y;
+
+        float minY = settledY;
+        int minGrounded = 4;
+        for (int i = 0; i < 480; ++i) {   // 2 s under load
+            (void)world.ApplyForce(car.Chassis(), Vec3{0.f, -30000.f, 0.f},
+                                   car.State().transform.position);
+            car.Update(CarInput{}, dt);
+            world.Step(dt);
+            const VehicleState& s = car.State();
+            minY = std::min(minY, s.transform.position.y);
+            int grounded = 0;
+            for (int k = 0; k < 4; ++k) {
+                if (s.wheels[k].grounded) ++grounded;
+            }
+            minGrounded = std::min(minGrounded, grounded);
+        }
+        // Travel limit 0.22 m below the 0.44 m static height: a body that stays
+        // above 0.20 m never pushed its chassis into the road (without the bump
+        // stop the same load keeps sinking it to road level).
+        check(minY > 0.20f, "suspension: body does not sink under 300 km/h downforce", minY, 0.20f);
+        check(minGrounded == 4, "suspension: all four wheels stay grounded under load",
+              static_cast<float>(minGrounded), 4.f);
+    }
+
+    // (c) Ray contract: a hardpoint that starts inside the road is a bottomed
+    // out strut, not a wheel in the air. Reported as a miss, all four corners
+    // go airborne at once and the car falls through the slab.
+    {
+        const float dt = 1.f / 240.f;
+        VehicleParams params;
+        Vehicle car;
+        Transform pose;
+        pose.position = {0.f, 0.55f, 0.f};
+        car.Spawn(world, pose, params);
+        for (int i = 0; i < 60; ++i) {
+            car.Update(CarInput{}, dt);
+            world.Step(dt);
+        }
+
+        Transform buried = pose;
+        buried.position = {200.f, 0.55f, 0.f};   // clear of the car above
+        Vehicle carB;
+        carB.Spawn(world, buried, params);
+        for (int i = 0; i < 60; ++i) {
+            carB.Update(CarInput{}, dt);
+            world.Step(dt);
+        }
+
+        buried.position = {200.f, -0.12f, 0.f};   // hardpoints inside the road box
+        (void)world.SetTransform(carB.Chassis(), buried);
+        (void)world.SetLinearVelocity(carB.Chassis(), Vec3{});
+        carB.Update(CarInput{}, dt);
+        world.Step(dt);
+
+        int grounded = 0;
+        for (int i = 0; i < 4; ++i) {
+            if (carB.State().wheels[i].grounded) ++grounded;
+        }
+        check(grounded == 4, "suspension: buried hardpoints still report ground contact",
+              static_cast<float>(grounded), 4.f);
+    }
+
+    return failures;
+}
+
 // player car with scripted input and asserts acceleration, braking, steering
 // and reverse. Exits 0 on success, 1 on failure. No window is created, so it
 // runs on locked sessions and in CI. The full suite runs once per physics
 // backend (qu3e, nudge and rush-physics-core must all pass it).
+// Grid identity: every car must stand on its own grid box, before and after the
+// Enter restart (the restart used to send the whole AI field to slot 1), and the
+// boxes must stay far enough apart that the field does not spawn overlapping.
+int RunGridResetTest(Config& base) {
+    Config config = base;
+    config.SetString("race", "cars", "6");
+    config.SetString("race", "autopilot", "false");
+    // Fitted-feature plumbing: the HUD gates its ERS / DRS / aero readouts on
+    // the local car's capability bits, so those bits must actually reach the
+    // car built for the player (config season gates -> VehicleParams).
+    config.SetString("season", "ers", "1");
+
+    NullBackend backend;
+    ScriptedInput testInput;
+    if (!backend.Init(1280, 720, "grid-reset")) {
+        std::printf("[FAIL] grid-reset backend init\n");
+        return 1;
+    }
+    Game game(backend, testInput.system, config);
+    if (!game.Init()) {
+        std::printf("[FAIL] grid-reset game init\n");
+        return 1;
+    }
+
+    int failures = 0;
+    auto check = [&failures](bool ok, const char* what, float got, float want) {
+        std::printf("[%s] grid: %s (got %.2f, target %.2f)\n", ok ? "PASS" : "FAIL", what, got,
+                    want);
+        if (!ok) ++failures;
+    };
+    auto run = [&](float seconds, InputState input) {
+        testInput.set(input);
+        const int frames = static_cast<int>(seconds / backend.frameDt + 0.5f);
+        for (int i = 0; i < frames; ++i) {
+            backend.BeginFrame();
+            game.Update();
+            game.RenderHUD();   // exercises the HUD (capability-gated readouts)
+            backend.EndFrame();
+        }
+    };
+
+    run(4.0f, InputState{});   // countdown -> racing
+    InputState restart;
+    restart.restart = true;
+    run(0.05f, restart);       // ENTER: back to the grid
+    run(1.2f, InputState{});   // let every suspension settle
+
+    const std::vector<Racer>& racers = game.Racers();
+    check(racers.size() == 6, "six cars on the grid", static_cast<float>(racers.size()), 6.f);
+
+    float worstPose = 0.f;
+    for (const Racer& racer : racers) {
+        const Transform expected = game.GridPose(racer);
+        const Vec3 delta = racer.vehicle.State().transform.position - expected.position;
+        const float horizontal = std::sqrt(delta.x * delta.x + delta.z * delta.z);
+        worstPose = std::max(worstPose, horizontal);
+    }
+    check(worstPose < 1.0f, "every car on its GridPose box", worstPose, 0.f);
+
+    float closest = 1e9f;
+    for (std::size_t i = 0; i < racers.size(); ++i) {
+        for (std::size_t j = i + 1; j < racers.size(); ++j) {
+            const Vec3 a = racers[i].vehicle.State().transform.position;
+            const Vec3 b = racers[j].vehicle.State().transform.position;
+            const Vec3 d = a - b;
+            closest = std::min(closest, std::sqrt(d.x * d.x + d.z * d.z));
+        }
+    }
+    check(closest > 3.f, "grid boxes at least 3 m apart", closest, 3.f);
+
+    // The player's car carries exactly the season it was built for: ERS on,
+    // aero / overtake off. This is the same bitmask the HUD reads.
+    const std::uint8_t caps = game.LocalRacer().vehicle.Params().capabilities;
+    check(HasCapability(caps, VehicleCapability::Ers), "player car has ERS",
+          HasCapability(caps, VehicleCapability::Ers) ? 1.f : 0.f, 1.f);
+    check(!HasCapability(caps, VehicleCapability::ActiveAero), "player car has no active aero",
+          HasCapability(caps, VehicleCapability::ActiveAero) ? 1.f : 0.f, 0.f);
+
+    backend.Shutdown();
+    return failures;
+}
+
 int RunDriveTestForEngine(Config& config, const char* engine) {
     config.SetString("physics", "engine", engine);
     // Pin the simulation environment: user config (assists / hz / season)
@@ -1413,6 +1661,12 @@ int RunDriveTestForEngine(Config& config, const char* engine) {
         failures += RunFrictionRaycastTest(*frictionWorld);
     }
 
+    // 5e) Suspension travel limit + buried-ray contract.
+    {
+        std::unique_ptr<IPhysicsWorld> limitWorld = MakeWorld(engine);
+        failures += RunSuspensionLimitTest(*limitWorld);
+    }
+
     // 6) Menu / settings flow (headless, backend-agnostic).
     failures += RunMenuTest();
     // 6a) Same flow through the real recognizer path (raw key feed).
@@ -1426,6 +1680,9 @@ int RunDriveTestForEngine(Config& config, const char* engine) {
 
     // 8) AI cars ignore player difficulty assists (never spin at assists-off).
     failures += RunAIDifficultyIsolationTest(engine);
+
+    // 9) Grid identity: one box per seat, restart included.
+    failures += RunGridResetTest(config);
 
     std::printf("drive-test[%s]: %s (%d failures)\n", engine,
                 failures == 0 ? "OK" : "FAILED", failures);
@@ -1796,6 +2053,73 @@ int RunInputTest() {
     return failures;
 }
 
+// Login screen golden path: the LAN entry point asks for a name before it opens
+// the room browser, the engine text field receives typed bytes, and confirming
+// the name is what lets HOST RACE actually open a session.
+int RunLanNameEntryTest(Config& base) {
+    Config config = base;
+    // Start at the main menu: the login screen is reached from the LAN entry.
+    config.SetString("race", "autostart", "false");
+    // test mode: Load/Save are no-ops, so the typed name never reaches the
+    // user's config file.
+    config.SetString("net", "player_name", "");
+    config.SetString("net", "game_port", "51330");
+    config.SetString("net", "discovery_port", "51331");
+
+    NullBackend backend;
+    ScriptedInput testInput;
+    if (!backend.Init(1280, 720, "lan-name")) {
+        std::printf("[FAIL] lan-name backend init\n");
+        return 1;
+    }
+    Game game(backend, testInput.system, config);
+    if (!game.Init()) {
+        std::printf("[FAIL] lan-name game init\n");
+        return 1;
+    }
+
+    int failures = 0;
+    auto check = [&failures](bool ok, const char* what) {
+        std::printf("[%s] lan-name: %s\n", ok ? "PASS" : "FAIL", what);
+        if (!ok) ++failures;
+    };
+    auto tap = [&](const InputState& input) {
+        testInput.set(input);
+        backend.BeginFrame();
+        game.Update();
+        game.RenderHUD();
+        backend.EndFrame();
+    };
+
+    InputState down;
+    down.menuDown = true;
+    tap(down);
+    tap(down);   // main menu cursor: START RACE -> SETTINGS -> LAN RACE
+    InputState select;
+    select.menuSelect = true;
+    tap(select);  // LAN RACE with no name -> login screen, no session yet
+    check(game.Phase() == RacePhase::Lan, "LAN entry opens the login screen");
+    check(game.Role() == Game::NetRole::Offline, "no session before a name is set");
+
+    InputState typing;
+    std::strcpy(typing.text, "Pilot7");
+    typing.textLen = 6;
+    tap(typing);
+    InputState backspace;
+    backspace.textBackspace = true;
+    tap(backspace);   // "Pilot" — the field owns the buffer, the engine edited it
+    tap(select);      // ENTER confirms the name -> LAN root
+    check(game.Role() == Game::NetRole::Offline, "confirming the name does not start a room");
+
+    tap(select);      // HOST RACE: reachable only with a name -> room-code wheel
+    check(game.Role() == Game::NetRole::Offline, "hosting still asks for a room code");
+    tap(select);      // ENTER confirms the code and opens the room
+    check(game.Role() == Game::NetRole::Host, "named player can host");
+
+    backend.Shutdown();
+    return failures;
+}
+
 int RunDriveTest(Config& config) {
     int failures = 0;
     std::printf("=== input recognizers ===\n");
@@ -1815,6 +2139,8 @@ int RunDriveTest(Config& config) {
     }
     std::printf("=== threaded sim smoke ===\n");
     failures += RunThreadedSmokeTest(config);
+    std::printf("=== LAN name entry ===\n");
+    failures += RunLanNameEntryTest(config);
     std::printf("drive-test: %s (%d failures)\n", failures == 0 ? "OK" : "FAILED", failures);
     return failures == 0 ? 0 : 1;
 }
@@ -1955,6 +2281,138 @@ int RunBench(Config& config, int cars, const char* engine, double raceSeconds, i
 
 }  // namespace
 
+// `apex-rush --ui-selftest`: windowless verification of the engine control
+// layer (rush.engine.ui). Covers focus movement over static rows, activation,
+// value/digit editing, text entry, Back, and drawing through the null backend.
+// This is the gate for "controls live in the engine" — the game only builds
+// screens and reacts to UiAction, so the resolution rules are testable here.
+int RunUiSelfTest() {
+    int failures = 0;
+    auto check = [&](bool ok, const char* what) {
+        std::printf("  %s %s\n", ok ? "ok  " : "FAIL", what);
+        if (!ok) ++failures;
+    };
+
+    UiController ui;
+    UiScreen screen;
+    screen.title = "SELFTEST";
+    screen.widgets = {
+        {.kind = UiKind::Header, .label = "HEADER"},
+        {.kind = UiKind::Button, .id = "start", .label = "START"},
+        {.kind = UiKind::Value, .id = "laps", .label = "LAPS", .value = "3"},
+        {.kind = UiKind::Digits, .id = "code", .label = "CODE", .value = "0042", .digits = 4},
+    };
+
+    UiController::ResetFocus(screen);
+    check(screen.cursor == 1, "focus skips non-focusable rows");
+
+    InputState down;
+    down.menuDown = true;
+    ui.Update(screen, down);
+    check(screen.cursor == 2, "down moves to the value row");
+
+    InputState left;
+    left.menuLeft = true;
+    UiAction action = ui.Update(screen, left);
+    check(action.kind == UiActionKind::AdjustLeft && action.id == "laps" && action.delta == -1,
+          "value row reports AdjustLeft with its id");
+
+    InputState ontoDigits;
+    ontoDigits.menuDown = true;
+    ui.Update(screen, ontoDigits);
+    check(screen.cursor == 3, "down moves onto the digit wheel");
+
+    InputState pickDigit;
+    pickDigit.menuRight = true;
+    ui.Update(screen, pickDigit);
+    InputState bumpDigit;
+    bumpDigit.menuUp = true;
+    action = ui.Update(screen, bumpDigit);
+    check(screen.widgets[3].subCursor == 1 && screen.widgets[3].value == "0142" &&
+              action.kind == UiActionKind::AdjustRight && action.delta == 1,
+          "digit wheel: right picks a digit, up changes it");
+
+    InputState select;
+    select.menuSelect = true;
+    action = ui.Update(screen, select);
+    check(action.kind == UiActionKind::Activate && action.id == "code", "enter activates the row");
+
+    // Focus wrapping: menus cycle (the old hand-written screens did), and a
+    // screen that wants hard ends clears the flag. Buttons only — Up/Down on a
+    // digit wheel is a value edit, not a focus move.
+    UiScreen wrapScreen;
+    wrapScreen.widgets = {
+        {.kind = UiKind::Button, .id = "a", .label = "A"},
+        {.kind = UiKind::Button, .id = "b", .label = "B"},
+        {.kind = UiKind::Button, .id = "c", .label = "C"},
+    };
+    wrapScreen.cursor = 2;
+    InputState upWrap;
+    upWrap.menuUp = true;
+    ui.Update(wrapScreen, upWrap);
+    check(wrapScreen.cursor == 1, "wrap screen: up steps to the previous row");
+
+    wrapScreen.cursor = 0;
+    InputState upToEnd;
+    upToEnd.menuUp = true;
+    ui.Update(wrapScreen, upToEnd);
+    check(wrapScreen.cursor == 2, "wrap screen: up from the first row lands on the last row");
+
+    UiScreen clamped = wrapScreen;
+    clamped.wrapFocus = false;
+    clamped.cursor = 2;
+    InputState downClamp;
+    downClamp.menuDown = true;
+    ui.Update(clamped, downClamp);
+    check(clamped.cursor == 2, "non-wrapping screen keeps focus at the last row");
+
+    // Text field: typing, backspace, Enter, Escape.
+    UiScreen nameScreen;
+    nameScreen.title = "NAME";
+    nameScreen.widgets = {{.kind = UiKind::TextField, .id = "name", .label = "NAME", .digits = 8}};
+    UiController::ResetFocus(nameScreen);
+
+    InputState typing;
+    std::strcpy(typing.text, "Pilot");
+    typing.textLen = 5;
+    action = ui.Update(nameScreen, typing);
+    check(action.kind == UiActionKind::TextChanged && nameScreen.widgets[0].value == "Pilot",
+          "text field appends typed text");
+
+    InputState backspace;
+    backspace.textBackspace = true;
+    ui.Update(nameScreen, backspace);
+    check(nameScreen.widgets[0].value == "Pilo", "backspace deletes the last byte");
+
+    InputState tooLong;
+    std::strcpy(tooLong.text, "ABCDEFGH");
+    tooLong.textLen = 8;
+    ui.Update(nameScreen, tooLong);
+    check(nameScreen.widgets[0].value.size() == 8, "text field honours its byte cap");
+
+    InputState enter;
+    enter.menuSelect = true;
+    action = ui.Update(nameScreen, enter);
+    check(action.kind == UiActionKind::Activate && action.id == "name",
+          "enter activates the text field");
+
+    InputState escape;
+    escape.menuBack = true;
+    action = ui.Update(nameScreen, escape);
+    check(action.kind == UiActionKind::Back, "escape reports Back");
+
+    // Drawing must not crash without a window.
+    NullBackend renderer;
+    if (renderer.Init(1280, 720, "ui-selftest")) {
+        ui.Draw(screen, renderer);
+        ui.Draw(nameScreen, renderer);
+        check(true, "draw runs on the null backend");
+    }
+
+    std::printf("ui-selftest: %s (%d failures)\n", failures == 0 ? "OK" : "FAILED", failures);
+    return failures == 0 ? 0 : 1;
+}
+
 // `apex-rush --stress [cars] [hz] [seconds]`: collision stress run. Collapses
 // the whole grid into one spot at speed (what a mid-pack pile-up does) and
 // reports frame cost plus any body that went non-finite or ran away, so
@@ -2078,14 +2536,22 @@ int main(int argc, char** argv) {
     double stressSeconds = 20.0;
     const char* stressEngine = "rpc";
     bool netSelfTest = false;
+    bool uiSelfTest = false;
     bool netAuto = false;
     int netSeconds = 0;
     int netHostCode = -1;
     int netJoinCode = -1;
     const char* netJoinIp = nullptr;
+    // --player <name>: explicit identity for LAN play and automation. Highest
+    // priority name source (see Game::ChosenPlayerName).
+    const char* playerName = nullptr;
     for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--net-selftest") == 0) {
+        if (std::strcmp(argv[i], "--player") == 0 && i + 1 < argc) {
+            playerName = argv[++i];
+        } else if (std::strcmp(argv[i], "--net-selftest") == 0) {
             netSelfTest = true;
+        } else if (std::strcmp(argv[i], "--ui-selftest") == 0) {
+            uiSelfTest = true;
         } else if (std::strcmp(argv[i], "--net-auto") == 0) {
             netAuto = true;
         } else if (std::strcmp(argv[i], "--net-seconds") == 0 && i + 1 < argc) {
@@ -2162,6 +2628,9 @@ int main(int argc, char** argv) {
     if (netSelfTest) {
         return RunNetSelfTest();
     }
+    if (uiSelfTest) {
+        return RunUiSelfTest();
+    }
     if (driveTest) {
         rush::JobSystem::Get().Configure(0);
         return RunDriveTest(config);
@@ -2221,6 +2690,7 @@ int main(int argc, char** argv) {
         ScriptedInput testInput;
         backend.Init(1280, 720, "lan-headless");
         Game game(backend, testInput.system, config);
+        if (playerName) game.SetPlayerName(playerName);
         game.SetThreadedSim(false);
         if (!game.Init()) return 1;
         if (netHostCode >= 0) {
@@ -2278,6 +2748,7 @@ int main(int argc, char** argv) {
     }
 
     Game game(backend, inputSystem, config, &audio);
+    if (playerName) game.SetPlayerName(playerName);
     // Native play: race stages run on the sim worker; menus stay on main.
     // Headless tests / --bench keep inline (deterministic pump).
     #if !defined(__EMSCRIPTEN__)

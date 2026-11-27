@@ -5,6 +5,8 @@
 
 #include "game/Game.h"
 
+#include "net/roster.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -77,15 +79,79 @@ const char* RejectText(net::RejectReason reason) {
 
 void Game::EnterLan() {
     if (netRole_ != NetRole::Offline) return;
+    // Identity comes first: the seat layout is derived from player ids, so a
+    // player who has not said who they are cannot be put on a grid.
+    if (ChosenPlayerName().empty()) {
+        EnterLanNameEntry();
+        return;
+    }
     const std::uint16_t discoPort = static_cast<std::uint16_t>(
         std::clamp(config_.GetInt("net", "discovery_port", net::kDiscoveryPortDefault), 1, 65535));
     if (!netDiscovery_) netDiscovery_ = net::MakeUdpDiscovery(discoPort);
     (void)netDiscovery_->BeginSearch();
     lanUi_ = LanUi::Root;
-    lanCursor_ = 0;
+    lanScreensStale_ = true;   // reopening LAN refocuses the room browser
     lanMessage_.clear();
     lanMessageTimer_ = 0.f;
     phase_ = RacePhase::Lan;
+}
+
+// Name resolution, highest priority first:
+//   1. `--player <name>`: an explicit one-off override for automation and QA.
+//   2. `[net] player_name`: the persisted choice (written by the login screen,
+//      or edited in the config by hand).
+//   3. the name typed on this session's login screen.
+// Empty means nobody has chosen: the login screen asks, and unattended roles
+// fall back to a default (see EffectivePlayerName).
+std::string Game::ChosenPlayerName() const {
+    if (!playerNameCli_.empty()) return TrimPlayerName(playerNameCli_);
+    const std::string configured = config_.GetString("net", "player_name", "");
+    if (!configured.empty()) return TrimPlayerName(configured);
+    return TrimPlayerName(lanPlayerName_);
+}
+
+std::string Game::EffectivePlayerName(bool host) const {
+    const std::string chosen = ChosenPlayerName();
+    if (!chosen.empty()) return chosen;
+    // --drive-test / --net-host / --net-join never open the login screen, so
+    // they need a seatable name without asking. The role decides the default:
+    // netRole_ is still Offline while the session is being created.
+    if (host) return "HOST";
+    return "PLAYER-" + std::to_string(std::max(1, lanJoinOrdinal_));
+}
+
+void Game::EnterLanNameEntry() {
+    // The screen itself is built with the other LAN screens (BuildLanScreens);
+    // this only routes to it. SyncLanScreen sees the sub-state change and
+    // refocuses, exactly like every other LAN screen.
+    lanUi_ = LanUi::NameEntry;
+    lanMessage_.clear();
+    lanMessageTimer_ = 0.f;
+    phase_ = RacePhase::Lan;
+}
+
+void Game::UpdateLanNameEntry() {
+    // Called from UpdateLan after the engine resolved the text field: the buffer
+    // is already edited, this only decides what the action means.
+    UiScreen& screen = screens_.lanName;
+    const UiAction action = ui_.Update(screen, rawInput_);
+    if (action.kind == UiActionKind::Back) {
+        phase_ = RacePhase::Menu;
+        return;
+    }
+    if (action.kind != UiActionKind::Activate) return;
+    if (screen.widgets.empty()) return;
+    const std::string typed = TrimPlayerName(screen.widgets.front().value);
+    if (typed.empty()) {
+        lanMessage_ = "NAME CANNOT BE EMPTY";
+        lanMessageTimer_ = 2.f;
+        return;
+    }
+    lanPlayerName_ = typed;
+    // Persisted so the next launch starts from the same identity (the config is
+    // only written on a clean exit, as everywhere else).
+    config_.SetString("net", "player_name", typed);
+    EnterLan();
 }
 
 bool Game::AutoHost(std::uint16_t roomCode) {
@@ -112,9 +178,11 @@ bool Game::AutoJoin(std::uint16_t roomCode, const std::string& hostIp) {
 }
 
 void Game::LanStartHost(std::uint16_t roomCode) {
-    const std::string name = config_.GetString("net", "player_name", "HOST");
+    const std::string name = EffectivePlayerName(true);
+    localPlayerId_ = MakePlayerId(name);
     netConfig_ = net::NetConfig{};
-    netConfig_.playerName = name.substr(0, net::kNameBytes - 1);
+    netConfig_.playerName = name;
+    netConfig_.playerId = localPlayerId_;
     netConfig_.roomCode = roomCode;
     netConfig_.gamePort = static_cast<std::uint16_t>(
         std::clamp(config_.GetInt("net", "game_port", net::kGamePortDefault), 1, 65535));
@@ -126,12 +194,7 @@ void Game::LanStartHost(std::uint16_t roomCode) {
     netConfig_.buildSig = BuildSignature();
     netConfig_.mapHash = HashMapFile(mapName_);
     netConfig_.mapName = mapName_;
-    netConfig_.rules.laps = static_cast<std::uint8_t>(std::clamp(totalLaps_, 1, 99));
-    netConfig_.rules.damage = config_.GetBool("race", "damage", true) ? 1 : 0;
-    netConfig_.rules.seasonBits = static_cast<std::uint8_t>((seasonDrs_ ? 1 : 0) |
-                                                            (seasonAero_ ? 2 : 0) |
-                                                            (seasonOverride_ ? 4 : 0));
-    netConfig_.rules.snapshotHz = static_cast<std::uint8_t>(netConfig_.snapshotHz);
+    FillHostRules(netConfig_.rules);
     netConfig_.rules.carCount = 1;
 
     netTransport_ = net::MakeEnetTransport();
@@ -142,22 +205,27 @@ void Game::LanStartHost(std::uint16_t roomCode) {
     if (!netDiscovery_) netDiscovery_ = net::MakeUdpDiscovery(netConfig_.discoveryPort);
     netSession_ = net::CreateHostSession(netConfig_, *netTransport_, *netDiscovery_);
     netRole_ = NetRole::Host;
-    std::printf("[net] hosting room %04u on udp %u (discovery %u)\n",
+    std::printf("[net] hosting room %04u on udp %u (discovery %u) as %s\n",
                 static_cast<unsigned>(netConfig_.roomCode),
                 static_cast<unsigned>(netConfig_.gamePort),
-                static_cast<unsigned>(netConfig_.discoveryPort));
+                static_cast<unsigned>(netConfig_.discoveryPort),
+                netConfig_.playerName.c_str());
     netCarCount_ = 1;
     netLobbyCount_ = 0;
+    netRoster_ = net::Roster{};
+    netLocalSeat_.store(0, std::memory_order_relaxed);
     lanUi_ = LanUi::Lobby;
-    lanCursor_ = 0;
     phase_ = RacePhase::Lan;
 }
 
 void Game::LanStartClient(std::uint16_t roomCode, const net::Endpoint& host) {
     if (netRole_ != NetRole::Offline) return;
+    ++lanJoinOrdinal_;
+    const std::string name = EffectivePlayerName(false);
+    localPlayerId_ = MakePlayerId(name);
     netConfig_ = net::NetConfig{};
-    netConfig_.playerName =
-        config_.GetString("net", "player_name", "PLAYER").substr(0, net::kNameBytes - 1);
+    netConfig_.playerName = name;
+    netConfig_.playerId = localPlayerId_;
     netConfig_.roomCode = roomCode;
     netConfig_.gamePort = static_cast<std::uint16_t>(
         std::clamp(config_.GetInt("net", "game_port", net::kGamePortDefault), 1, 65535));
@@ -175,12 +243,11 @@ void Game::LanStartClient(std::uint16_t roomCode, const net::Endpoint& host) {
     if (!netDiscovery_) netDiscovery_ = net::MakeUdpDiscovery(netConfig_.discoveryPort);
     netSession_ = net::CreateClientSession(netConfig_, *netTransport_, *netDiscovery_, host);
     netRole_ = NetRole::Client;
-    std::printf("[net] joining room %04u at %u.%u.%u.%u:%u\n",
+    std::printf("[net] joining room %04u at %u.%u.%u.%u:%u as %s\n",
                 static_cast<unsigned>(netConfig_.roomCode), (host.ipv4 >> 24) & 0xFF,
                 (host.ipv4 >> 16) & 0xFF, (host.ipv4 >> 8) & 0xFF, host.ipv4 & 0xFF,
-                static_cast<unsigned>(host.port));
+                static_cast<unsigned>(host.port), netConfig_.playerName.c_str());
     lanUi_ = LanUi::Lobby;
-    lanCursor_ = 0;
     lanJoinStartMs_ = NowMs();
     phase_ = RacePhase::Lan;
 }
@@ -195,6 +262,9 @@ void Game::LanStop(const std::string& message) {
     netTransport_.reset();
     netRole_ = NetRole::Offline;
     netCarCount_ = 1;
+    netRoster_ = net::Roster{};
+    netRulesLocked_ = false;
+    netLocalSeat_.store(0, std::memory_order_relaxed);
     netReadout_ = NetRaceReadout{};
     {
         std::lock_guard lock(netInputMutex_);
@@ -220,9 +290,12 @@ void Game::LanTick() {
 
     if (netRole_ == NetRole::Host) {
         {
-            // Remote input mailbox: main thread fills, sim thread consumes.
+            // Remote input mailbox: main thread fills, sim thread consumes. It
+            // is keyed by seat (a peer's slot is its seat once the roster is
+            // frozen), so a hole in the numbering simply leaves a slot cold
+            // instead of shifting everyone's input onto the wrong car.
             std::lock_guard lock(netInputMutex_);
-            for (int slot = 1; slot < net::kMaxCars; ++slot) {
+            for (int slot = 0; slot < net::kMaxCars; ++slot) {
                 netRemoteInput_[static_cast<std::size_t>(slot)] = netSession_->LatestInput(
                     static_cast<std::uint8_t>(slot));
                 netRemoteFresh_[static_cast<std::size_t>(slot)] = netSession_->HasFreshInput(
@@ -237,16 +310,27 @@ void Game::LanTick() {
         if (now - netLogMs_ >= 1000) {
             netLogMs_ = now;
             const net::PeerStats st = netSession_->LocalStats();
-            std::printf("[net] host t=%.0fs phase=%d cars=%d\n", static_cast<double>(now) / 1000.0,
-                        static_cast<int>(static_cast<RacePhase>(phase_)), static_cast<int>(netCarCount_));
+            std::printf("[net] host t=%.0fs phase=%d cars=%d session=%d lobby=%u\n",
+                        static_cast<double>(now) / 1000.0,
+                        static_cast<int>(static_cast<RacePhase>(phase_)),
+                        static_cast<int>(netCarCount_), static_cast<int>(netSession_->State()),
+                        static_cast<unsigned>(netLobbyCount_));
             (void)st;
+            for (const Racer& racer : racers_) {
+                const Vec3& p = racer.vehicle.State().transform.position;
+                std::printf("[net] host car seat=%d name=%s pos=(%.1f,%.1f,%.1f)\n", racer.seat,
+                            racer.name.c_str(), static_cast<double>(p.x),
+                            static_cast<double>(p.y), static_cast<double>(p.z));
+            }
             std::fflush(stdout);
         }
         return;
     }
 
     // Client: publish the sample, feed the interpolator, mirror the authority.
-    netLocalSlot_ = netSession_->LocalSlot();
+    // The handshake events already synced the seat; re-reading it here covers
+    // the case where the session moved on without an event.
+    netLocalSeat_.store(netSession_->LocalSlot(), std::memory_order_relaxed);
     if (phase_ == RacePhase::Racing || phase_ == RacePhase::Countdown) {
         const net::InputSample sample = LanSampleLocalInput();
         {
@@ -264,21 +348,28 @@ void Game::LanTick() {
         if (now - netLogMs_ >= 1000) {
             netLogMs_ = now;
             const net::PeerStats st = netSession_->LocalStats();
-            const VehicleState& own = racers_.empty() ? VehicleState{} : racers_.front().vehicle.State();
-            std::printf("[net] client t=%.0fs rtt=%ums cars=%u lap=%u pos=%u/%u speed=%.0fkm/h\n",
+            const VehicleState& own =
+                racers_.empty() ? VehicleState{} : LocalRacer().vehicle.State();
+            std::printf("[net] client t=%.0fs rtt=%ums cars=%u lap=%u pos=%u/%u seat=%d "
+                        "pos3=(%.1f,%.1f,%.1f) speed=%.0fkm/h\n",
                         static_cast<double>(now) / 1000.0, st.rttMs,
                         static_cast<unsigned>(snap->carCount), static_cast<unsigned>(netReadout_.lap),
                         static_cast<unsigned>(netReadout_.position),
-                        static_cast<unsigned>(netReadout_.carCount), static_cast<double>(own.speedKmh));
+                        static_cast<unsigned>(netReadout_.carCount), LocalSeat(),
+                        static_cast<double>(own.transform.position.x),
+                        static_cast<double>(own.transform.position.y),
+                        static_cast<double>(own.transform.position.z),
+                        static_cast<double>(own.speedKmh));
             std::fflush(stdout);
         }
         netReadout_.valid = true;
         netReadout_.phase = snap->phase;
         netReadout_.raceClockMs = snap->raceClockMs;
         netReadout_.carCount = snap->carCount;
+        const std::uint8_t localSeat = netLocalSeat_.load(std::memory_order_relaxed);
         for (int i = 0; i < snap->carCount; ++i) {
             const net::CarNetState& car = snap->cars[static_cast<std::size_t>(i)];
-            if (car.slot != netLocalSlot_) continue;
+            if (car.slot != localSeat) continue;
             netReadout_.lap = car.lap;
             netReadout_.position = car.position;
             break;
@@ -303,7 +394,13 @@ void Game::LanHandleEvents() {
                 break;
             }
             case net::SessionEventKind::RulesReceived: {
-                std::printf("[net] joined as slot %u\n", static_cast<unsigned>(ev.slot));
+                // Sync the seat inside the event: the same frame's RaceStarted
+                // must not read the previous (arrival-order) slot.
+                netLocalSeat_.store(ev.slot, std::memory_order_relaxed);
+                netConfig_.rules = ev.rules;
+                ApplyHostRules(ev.rules);
+                std::printf("[net] joined as slot %u (%s)\n", static_cast<unsigned>(ev.slot),
+                            netConfig_.playerName.c_str());
                 break;
             }
             case net::SessionEventKind::JoinRejected: {
@@ -311,11 +408,16 @@ void Game::LanHandleEvents() {
                 return;
             }
             case net::SessionEventKind::RaceStarted: {
-                std::printf("[net] race starting (laps=%u cars=%u)\n",
+                std::printf("[net] race starting (laps=%u cars=%u seat=%u)\n",
                             static_cast<unsigned>(ev.rules.laps),
-                            static_cast<unsigned>(ev.rules.carCount));
+                            static_cast<unsigned>(ev.rules.carCount),
+                            static_cast<unsigned>(ev.slot));
                 if (netRole_ == NetRole::Client) {
+                    // The roster travels with the rules: our seat is our rank in
+                    // it, known before a single snapshot arrives.
+                    netLocalSeat_.store(ev.slot, std::memory_order_relaxed);
                     netConfig_.rules = ev.rules;
+                    ApplyHostRules(ev.rules);
                     LanBeginClientRace();
                 }
                 break;
@@ -325,13 +427,8 @@ void Game::LanHandleEvents() {
                     if (racers_.empty()) {
                         LanBeginClientRace();
                     } else {
-                        Racer& player = racers_.front();
-                        const Transform pose{track_.StartPosition(netConfig_.rules.carCount ? 0 : 0),
-                                             track_.StartRotation()};
-                        player.vehicle.Reset(pose);
-                        player.lap = 0;
-                        player.finished = false;
-                        player.lapDistance = 0.f;
+                        // Same grid formula as the spawn: our own box, not box 0.
+                        ResetGridForStart();
                         localTick_ = 0;
                         if (netPredict_) netPredict_->Reset(0);
                         phase_ = RacePhase::Countdown;
@@ -370,242 +467,343 @@ void Game::LanHandleEvents() {
     }
 }
 
-// ------------------------------------------------------------------- UI -----
+UiScreen& Game::ActiveLanScreen() {
+    switch (lanUi_) {
+        case LanUi::RoomCode:
+            return screens_.lanCode;
+        case LanUi::RoomList:
+            return screens_.lanRooms;
+        case LanUi::Lobby:
+            return screens_.lanLobby;
+        case LanUi::Message:
+            return screens_.lanMessage;
+        case LanUi::NameEntry:
+            return screens_.lanName;
+        case LanUi::Root:
+        default:
+            return screens_.lanRoot;
+    }
+}
+
+void Game::BuildLanScreens() {
+    const auto skeleton = [](UiScreen& s, const char* hint, float rowStartY) {
+        s.title = "LAN RACE";
+        s.titleSize = 42;
+        s.x = 96.f;
+        s.y = 70.f;
+        s.rowStartY = rowStartY;
+        s.rowHeight = 44.f;
+        s.dimBackground = false;   // RenderLan paints the opaque LAN backdrop
+        s.hint = hint;
+    };
+
+    if (screens_.lanRoot.widgets.empty()) {
+        UiScreen& s = screens_.lanRoot;
+        skeleton(s, "W/S SELECT    ENTER CONFIRM    ESC BACK", 170.f);
+        s.widgets = {
+            {.kind = UiKind::Button, .id = "host", .label = "HOST RACE", .size = 26},
+            {.kind = UiKind::Button, .id = "join", .label = "JOIN RACE", .size = 26},
+            {.kind = UiKind::Button, .id = "back", .label = "BACK", .size = 26},
+        };
+    }
+    if (screens_.lanCode.widgets.empty()) {
+        // The room code is one shared parameter: HOST and JOIN both edit this
+        // wheel, and the role only decides what a confirmed code does.
+        UiScreen& s = screens_.lanCode;
+        skeleton(s, "LEFT/RIGHT PICK DIGIT   UP/DOWN CHANGE   ENTER CONFIRM   ESC BACK", 150.f);
+        s.widgets = {{.kind = UiKind::Digits, .id = "code", .label = "ROOM CODE",
+                      .value = "0000", .size = 26, .digits = 4}};
+    }
+    if (screens_.lanRooms.widgets.empty()) {
+        skeleton(screens_.lanRooms, "ENTER JOIN    ESC BACK", 170.f);
+    }
+    if (screens_.lanName.widgets.empty()) {
+        // Login: one text field, nothing else. The field swallows the
+        // navigation keys while focused, so a second row would be unreachable.
+        UiScreen& s = screens_.lanName;
+        skeleton(s, "A-Z 0-9   ENTER CONFIRM   ESC BACK", 260.f);
+        s.y = 170.f;   // below the "LAN RACE" heading RenderLan already drew
+        s.widgets = {{.kind = UiKind::TextField, .id = "player_name", .label = "NAME",
+                      .value = "", .size = 26, .digits = 15}};
+    }
+    if (screens_.lanMessage.widgets.empty()) {
+        UiScreen& s = screens_.lanMessage;
+        skeleton(s, "", 180.f);
+        s.rowHeight = 60.f;
+        s.widgets = {
+            {.kind = UiKind::Label, .label = "", .size = 26},
+            {.kind = UiKind::Button, .id = "continue", .label = "ENTER TO CONTINUE", .size = 20},
+        };
+    }
+    // Only the host can start the race, so the lobby skeleton is per role.
+    UiScreen& lobby = screens_.lanLobby;
+    if (lobby.widgets.empty() || lanLobbyRole_ != netRole_) {
+        lanLobbyRole_ = netRole_;
+        skeleton(lobby, "W/S SELECT    ENTER CONFIRM    ESC BACK", 150.f);
+        lobby.widgets.clear();
+        lobby.widgets.push_back({.kind = UiKind::Header, .label = "LOBBY", .size = 24});
+        if (netRole_ == NetRole::Host) {
+            lobby.widgets.push_back(
+                {.kind = UiKind::Button, .id = "start", .label = "START RACE", .size = 26});
+        } else {
+            lobby.widgets.push_back(
+                {.kind = UiKind::Label, .label = "WAITING FOR HOST...", .size = 26});
+        }
+        lobby.widgets.push_back({.kind = UiKind::Button, .id = "leave", .label = "LEAVE", .size = 26});
+    }
+}
+
+void Game::SyncLanScreen() {
+    BuildLanScreens();
+    const bool reopened = lanScreensStale_ || lanUi_ != lanScreenState_;
+    lanScreensStale_ = false;
+    lanScreenState_ = lanUi_;
+
+    // Dynamic text is refreshed in place: rebuilding the screen would drop the
+    // focus index, the digit sub-cursor and the row focus flags.
+    if (lanUi_ == LanUi::Root) {
+        char hint[96];
+        std::snprintf(hint, sizeof(hint),
+                      "ROOM CODE %04u    W/S SELECT    ENTER CONFIRM    ESC BACK",
+                      static_cast<unsigned>(LanRoomCode()));
+        screens_.lanRoot.hint = hint;
+    } else if (lanUi_ == LanUi::RoomList) {
+        UiScreen& s = screens_.lanRooms;
+        const int keep = s.cursor;
+        s.widgets.clear();
+        for (const net::RoomInfo& room : lanRooms_) {
+            char entry[128];
+            std::snprintf(entry, sizeof(entry), "%04u  %s  %s  %u/%u", room.announce.roomCode,
+                          room.announce.hostName.c_str(), room.announce.mapName.c_str(),
+                          static_cast<unsigned>(room.announce.players),
+                          static_cast<unsigned>(room.announce.maxPlayers));
+            s.widgets.push_back({.kind = UiKind::Button, .id = "room", .label = entry, .size = 26});
+        }
+        if (s.widgets.empty()) {
+            s.widgets.push_back({.kind = UiKind::Label,
+                                 .label = "NO ROOMS FOUND (check the code / firewall)", .size = 22});
+        }
+        // The list is discovered, so its length moves under the focus: keep the
+        // cursor inside it instead of trusting last frame's index.
+        s.cursor = std::clamp(keep, 0, static_cast<int>(s.widgets.size()) - 1);
+    } else if (lanUi_ == LanUi::Lobby) {
+        UiScreen& s = screens_.lanLobby;
+        // Player rows go after the buttons (the first rows never move), so a
+        // player joining or leaving cannot shift a focusable index.
+        s.widgets.resize(2);
+        for (int i = 0; i < netLobbyCount_; ++i) {
+            const net::LobbyPlayer& player = netLobby_[static_cast<std::size_t>(i)];
+            char entry[96];
+            std::snprintf(entry, sizeof(entry), "P%d  %s", player.slot + 1, player.name.c_str());
+            s.widgets.push_back({.kind = UiKind::Label, .label = entry, .size = 22});
+        }
+    } else if (lanUi_ == LanUi::Message) {
+        screens_.lanMessage.widgets[0].label = lanMessage_;
+    }
+
+    if (reopened) UiController::ResetFocus(ActiveLanScreen());
+}
+
+std::uint16_t Game::LanRoomCode() {
+    BuildLanScreens();
+    const std::string& digits = screens_.lanCode.widgets[0].value;
+    std::uint16_t code = 0;
+    for (int i = 0; i < 4; ++i) {
+        const char d = i < static_cast<int>(digits.size()) ? digits[static_cast<std::size_t>(i)] : '0';
+        code = static_cast<std::uint16_t>(code * 10 + ((d >= '0' && d <= '9') ? d - '0' : 0));
+    }
+    return code;
+}
+
+void Game::LanOpenRoomCode(LanRole role) {
+    BuildLanScreens();
+    lanPendingRole_ = role;
+    lanUi_ = LanUi::RoomCode;
+    lanScreenState_ = LanUi::RoomCode;
+    UiController::ResetFocus(screens_.lanCode);
+}
+
+void Game::LanConfirmRoomCode() {
+    const std::uint16_t code = LanRoomCode();
+    if (lanPendingRole_ == LanRole::Host) {
+        LanStartHost(code);
+        return;
+    }
+    if (netDiscovery_) netDiscovery_->SendQuery(code);
+    lanRooms_.clear();
+    lanUi_ = LanUi::RoomList;
+}
+
+void Game::LanLeaveToMenu() {
+    if (netDiscovery_) netDiscovery_->StopAdvertising();
+    LanStop("");
+    lanUi_ = LanUi::Root;
+    phase_ = RacePhase::Menu;
+}
 
 void Game::UpdateLan() {
-    const InputState raw = rawInput_;
     if (lanMessageTimer_ > 0.f) lanMessageTimer_ -= renderer_.FrameTime();
+
+    // Discovery polling and room filtering are state work, not screen work.
+    if (lanUi_ == LanUi::RoomList) {
+        if (netDiscovery_) netDiscovery_->Poll(NowMs());
+        const std::span<const net::RoomInfo> rooms =
+            netDiscovery_ ? netDiscovery_->Rooms() : std::span<const net::RoomInfo>{};
+        const std::uint16_t code = LanRoomCode();
+        lanRooms_.clear();
+        for (const net::RoomInfo& room : rooms) {
+            if (room.announce.protocolVersion != net::kProtocolVersion) continue;
+            if (code != 0 && room.announce.roomCode != code) continue;
+            lanRooms_.push_back(room);
+        }
+    }
+    // Automation: --net-auto starts as soon as a second player is in.
+    if (lanUi_ == LanUi::Lobby && netRole_ == NetRole::Host &&
+        config_.GetBool("net", "autostart_race", false) && netLobbyCount_ >= 2) {
+        LanRequestRaceLoad();
+        return;
+    }
+
+    SyncLanScreen();
+    if (lanUi_ == LanUi::NameEntry) {
+        UpdateLanNameEntry();
+        return;
+    }
+    UiScreen& screen = ActiveLanScreen();
+    const UiAction action = ui_.Update(screen, rawInput_);
 
     switch (lanUi_) {
         case LanUi::Root: {
-            const int rows = kLanRootRows;
-            if (raw.menuDown) lanCursor_ = (lanCursor_ + 1) % rows;
-            if (raw.menuUp) lanCursor_ = (lanCursor_ + rows - 1) % rows;
-            if (raw.menuBack) {
-                LanStop("");
-                lanUi_ = LanUi::Root;
-                lanMessage_.clear();
-                phase_ = RacePhase::Menu;
-                menuCursor_ = 0;
+            // ESC on the root screen has always left the LAN mode entirely.
+            if (action.kind == UiActionKind::Back) {
+                LanLeaveToMenu();
                 return;
             }
-            if (raw.menuSelect) {
-                if (lanCursor_ == 0) {
-                    LanStartHost(static_cast<std::uint16_t>(lanCode_[0] * 1000 + lanCode_[1] * 100 +
-                                                            lanCode_[2] * 10 + lanCode_[3]));
-                } else if (lanCursor_ == 1) {
-                    lanUi_ = LanUi::JoinCode;
-                    lanDigitCursor_ = 0;
-                } else {
-                    if (netDiscovery_) netDiscovery_->StopAdvertising();
-                    LanStop("");
-                    lanUi_ = LanUi::Root;
-                    phase_ = RacePhase::Menu;
-                    menuCursor_ = 0;
-                }
+            if (action.kind != UiActionKind::Activate) break;
+            if (action.id == "host") {
+                LanOpenRoomCode(LanRole::Host);
+            } else if (action.id == "join") {
+                LanOpenRoomCode(LanRole::Join);
+            } else {
+                LanLeaveToMenu();
             }
             break;
         }
-        case LanUi::JoinCode: {
-            if (raw.menuLeft && lanDigitCursor_ > 0) --lanDigitCursor_;
-            if (raw.menuRight && lanDigitCursor_ < 3) ++lanDigitCursor_;
-            if (raw.menuUp) lanCode_[lanDigitCursor_] = (lanCode_[lanDigitCursor_] + 1) % 10;
-            if (raw.menuDown) lanCode_[lanDigitCursor_] = (lanCode_[lanDigitCursor_] + 9) % 10;
-            if (raw.menuBack) {
+        case LanUi::RoomCode: {
+            if (action.kind == UiActionKind::Back) {
                 lanUi_ = LanUi::Root;
-                return;
+                break;
             }
-            if (raw.menuSelect) {
-                if (netDiscovery_) {
-                    netDiscovery_->SendQuery(static_cast<std::uint16_t>(
-                        lanCode_[0] * 1000 + lanCode_[1] * 100 + lanCode_[2] * 10 + lanCode_[3]));
-                }
-                lanUi_ = LanUi::RoomList;
-                lanCursor_ = 0;
-            }
+            // Enter confirms the code: HOST opens the room with it, JOIN
+            // searches for it. The wheel itself was edited by the engine.
+            if (action.kind == UiActionKind::Activate) LanConfirmRoomCode();
             break;
         }
         case LanUi::RoomList: {
-            if (netDiscovery_) netDiscovery_->Poll(NowMs());
-            const std::span<const net::RoomInfo> rooms =
-                netDiscovery_ ? netDiscovery_->Rooms() : std::span<const net::RoomInfo>{};
-            const std::uint16_t code = static_cast<std::uint16_t>(
-                lanCode_[0] * 1000 + lanCode_[1] * 100 + lanCode_[2] * 10 + lanCode_[3]);
-            std::vector<const net::RoomInfo*> matches;
-            for (const net::RoomInfo& room : rooms) {
-                if (room.announce.protocolVersion != net::kProtocolVersion) continue;
-                if (code != 0 && room.announce.roomCode != code) continue;
-                matches.push_back(&room);
+            if (action.kind == UiActionKind::Back) {
+                lanUi_ = LanUi::RoomCode;
+                break;
             }
-            if (matches.empty()) lanCursor_ = 0;
-            if (raw.menuDown && !matches.empty()) {
-                lanCursor_ = (lanCursor_ + 1) % static_cast<int>(matches.size());
-            }
-            if (raw.menuUp && !matches.empty()) {
-                lanCursor_ = (lanCursor_ + static_cast<int>(matches.size()) - 1) %
-                             static_cast<int>(matches.size());
-            }
-            if (raw.menuBack) {
-                lanUi_ = LanUi::JoinCode;
-                return;
-            }
-            if (raw.menuSelect && !matches.empty()) {
-                const net::RoomInfo* room = matches[static_cast<std::size_t>(lanCursor_)];
-                LanStartClient(code, room->host);
-            }
+            if (action.kind != UiActionKind::Activate) break;
+            const int row = screen.cursor;
+            if (row < 0 || row >= static_cast<int>(lanRooms_.size())) break;  // "no rooms" row
+            LanStartClient(LanRoomCode(), lanRooms_[static_cast<std::size_t>(row)].host);
             break;
         }
         case LanUi::Lobby: {
-            const bool isHost = netRole_ == NetRole::Host;
-            const int rows = kLanLobbyRows;
-            // Automation: --net-auto starts as soon as a second player is in.
-            if (isHost && config_.GetBool("net", "autostart_race", false) && netLobbyCount_ >= 2) {
-                LanRequestRaceLoad();
-                return;
-            }
-            if (raw.menuDown) lanCursor_ = (lanCursor_ + 1) % rows;
-            if (raw.menuUp) lanCursor_ = (lanCursor_ + rows - 1) % rows;
-            if (raw.menuBack) {
+            if (action.kind == UiActionKind::Back) {
                 LanStop("LEFT ROOM");
                 return;
             }
-            if (raw.menuSelect) {
-                if (isHost && lanCursor_ == 0) {
-                    if (netLobbyCount_ < 2) {
-                        lanMessage_ = "WAITING FOR PLAYERS";
-                        lanMessageTimer_ = 2.f;
-                    } else {
-                        LanRequestRaceLoad();
-                    }
+            if (action.kind != UiActionKind::Activate) break;
+            if (action.id == "start") {
+                if (netLobbyCount_ < 2) {
+                    lanMessage_ = "WAITING FOR PLAYERS";
+                    lanMessageTimer_ = 2.f;
                 } else {
-                    LanStop("LEFT ROOM");
-                    return;
+                    LanRequestRaceLoad();
                 }
+            } else {
+                LanStop("LEFT ROOM");
+                return;
             }
             break;
         }
         case LanUi::Message: {
-            if (raw.menuSelect || raw.menuBack) {
+            if (action.kind == UiActionKind::Activate || action.kind == UiActionKind::Back) {
                 if (netRole_ != NetRole::Offline) LanStop("");
                 lanUi_ = LanUi::Root;
-                lanCursor_ = 0;
             }
             break;
         }
     }
+
+    // A handler may have switched sub-state: rebuild now so this frame draws
+    // the screen the player is actually on.
+    if (lanUi_ != lanScreenState_) SyncLanScreen();
 }
 
 void Game::RenderLan() {
     const float w = static_cast<float>(renderer_.ScreenWidth());
     const float h = static_cast<float>(renderer_.ScreenHeight());
     renderer_.DrawRect2D(0.f, 0.f, w, h, Color{0.05f, 0.06f, 0.08f, 1.f});
-    renderer_.DrawText2D("LAN RACE", 80.f, 70.f, 42, Color::White());
+    ui_.Draw(ActiveLanScreen(), renderer_);
 
-    const auto line = [&](const std::string& text, int i, bool selected) {
-        const Color c = selected ? Color{0.55f, 0.85f, 1.f, 1.f} : Color::Gray();
-        renderer_.DrawText2D((selected ? "> " : "  ") + text, 96.f, 170.f + 44.f * i, 26, c);
-    };
-
-    switch (lanUi_) {
-        case LanUi::Root: {
-            line("HOST RACE", 0, lanCursor_ == 0);
-            line("JOIN RACE", 1, lanCursor_ == 1);
-            line("BACK", 2, lanCursor_ == 2);
-            renderer_.DrawText2D("ROOM CODE", 96.f, 330.f, 20, Color::Gray());
-            char code[8];
-            std::snprintf(code, sizeof(code), "%d%d%d%d", lanCode_[0], lanCode_[1], lanCode_[2],
-                          lanCode_[3]);
-            renderer_.DrawText2D(code, 96.f, 356.f, 32, Color::White());
-            break;
-        }
-        case LanUi::JoinCode: {
-            renderer_.DrawText2D("ENTER ROOM CODE", 96.f, 150.f, 24, Color::Gray());
-            for (int i = 0; i < 4; ++i) {
-                const bool sel = i == lanDigitCursor_;
-                char digit[2] = {static_cast<char>('0' + lanCode_[i]), '\0'};
-                renderer_.DrawRect2D(96.f + 64.f * i, 190.f, 52.f, 60.f,
-                                     sel ? Color{0.25f, 0.45f, 0.6f, 1.f}
-                                         : Color{0.14f, 0.15f, 0.18f, 1.f});
-                renderer_.DrawText2D(digit, 112.f + 64.f * i, 200.f, 34, Color::White());
-            }
-            renderer_.DrawText2D("LEFT/RIGHT PICK DIGIT   UP/DOWN CHANGE   ENTER SEARCH", 96.f, 280.f,
-                                 18, Color::Gray());
-            break;
-        }
-        case LanUi::RoomList: {
-            renderer_.DrawText2D("ROOMS ON THE LAN", 96.f, 140.f, 24, Color::Gray());
-            const std::span<const net::RoomInfo> rooms =
-                netDiscovery_ ? netDiscovery_->Rooms() : std::span<const net::RoomInfo>{};
-            const std::uint16_t code = static_cast<std::uint16_t>(
-                lanCode_[0] * 1000 + lanCode_[1] * 100 + lanCode_[2] * 10 + lanCode_[3]);
-            int row = 0;
-            for (const net::RoomInfo& room : rooms) {
-                if (room.announce.protocolVersion != net::kProtocolVersion) continue;
-                if (code != 0 && room.announce.roomCode != code) continue;
-                char entry[128];
-                std::snprintf(entry, sizeof(entry), "%04u  %s  %s  %u/%u", room.announce.roomCode,
-                              room.announce.hostName.c_str(), room.announce.mapName.c_str(),
-                              static_cast<unsigned>(room.announce.players),
-                              static_cast<unsigned>(room.announce.maxPlayers));
-                line(entry, row, row == lanCursor_);
-                ++row;
-            }
-            if (row == 0) {
-                renderer_.DrawText2D("NO ROOMS FOUND (check the code / firewall)", 96.f, 220.f, 22,
-                                     Color{0.9f, 0.6f, 0.4f, 1.f});
-            }
-            break;
-        }
-        case LanUi::Lobby: {
-            renderer_.DrawText2D("LOBBY", 96.f, 140.f, 24, Color::Gray());
-            for (int i = 0; i < netLobbyCount_; ++i) {
-                char entry[96];
-                std::snprintf(entry, sizeof(entry), "P%d  %s", netLobby_[i].slot + 1,
-                              netLobby_[i].name.c_str());
-                renderer_.DrawText2D(entry, 96.f + 220.f * (i / 4), 180.f + 34.f * (i % 4), 22,
-                                     Color::White());
-            }
-            if (netRole_ == NetRole::Host) {
-                line("START RACE", 0, lanCursor_ == 0);
-            } else {
-                line("WAITING FOR HOST...", 0, false);
-            }
-            line("LEAVE", 1, lanCursor_ == 1);
-            if (netSession_) {
-                const net::PeerStats stats = netSession_->LocalStats();
-                char info[96];
-                std::snprintf(info, sizeof(info), "RTT %ums", stats.rttMs);
-                renderer_.DrawText2D(info, w - 220.f, h - 60.f, 18, Color::Gray());
-            }
-            break;
-        }
-        case LanUi::Message: {
-            renderer_.DrawText2D(lanMessage_, 96.f, 180.f, 26, Color{0.95f, 0.7f, 0.5f, 1.f});
-            renderer_.DrawText2D("ENTER TO CONTINUE", 96.f, 240.f, 20, Color::Gray());
-            break;
-        }
+    if (lanUi_ == LanUi::Lobby && netSession_) {
+        const net::PeerStats stats = netSession_->LocalStats();
+        char info[96];
+        std::snprintf(info, sizeof(info), "RTT %ums", stats.rttMs);
+        renderer_.DrawText2D(info, w - 220.f, h - 60.f, 18, Color::Gray());
     }
     if (lanMessageTimer_ > 0.f && !lanMessage_.empty() && lanUi_ != LanUi::Message) {
-        renderer_.DrawText2D(lanMessage_, 96.f, h - 90.f, 22, Color{0.95f, 0.7f, 0.5f, 1.f});
+        renderer_.DrawText2D(lanMessage_, 96.f, h - 100.f, 22, Color{0.95f, 0.7f, 0.5f, 1.f});
     }
 }
 
 // ------------------------------------------------------------- race start ---
 
 void Game::LanRequestRaceLoad() {
-    // Host: grid = host slot 0 + one car per remote player.
-    netCarCount_ = static_cast<std::uint8_t>(std::clamp<int>(netLobbyCount_, 2, net::kMaxCars));
+    // Host: freeze the seat layout first (rank of playerId, see net/roster.h),
+    // then build the grid from it. The same roster goes out with the rules, so
+    // every client puts itself on the box the host gave it.
     netEndSent_ = false;
-    netConfig_.rules.carCount = netCarCount_;
-    netConfig_.rules.laps = static_cast<std::uint8_t>(std::clamp(totalLaps_, 1, 99));
-    // The session holds its own copy of the rules (it built Welcome from it).
+    FillHostRules(netConfig_.rules);
     netSession_->SetRules(netConfig_.rules);
+    netSession_->FreezeRoster();
+    netConfig_.rules = netSession_->Rules();
+    netRoster_ = netConfig_.rules.roster;
+    netCarCount_ = static_cast<std::uint8_t>(std::clamp<int>(netRoster_.count, 1, net::kMaxCars));
+    if (const auto seat = net::SeatOf(netRoster_, localPlayerId_)) {
+        netLocalSeat_.store(*seat, std::memory_order_relaxed);
+    }
     netSession_->BroadcastLobby();
     std::lock_guard lock(hostWorldMutex_);
     hostWorldFresh_ = false;
     StartRace();
     if (netRole_ == NetRole::Host) {
         netSession_->StartRace(static_cast<std::uint16_t>(3.5f * 100));
+    }
+    std::printf("[net] grid:");
+    for (const Racer& racer : racers_) {
+        std::printf(" seat=%d:%s", racer.seat, racer.name.c_str());
+    }
+    std::printf(" (local seat %d)\n", LocalSeat());
+    std::fflush(stdout);
+}
+
+void Game::ApplyHostRules(const net::RulesPacket& rules) {
+    // The host's rules are the simulation: season gates and assist levels decide
+    // what the car has and how it handles, so a client on a different local
+    // config would be driving a different car on the same grid.
+    netRules_ = rules;
+    netRulesLocked_ = true;
+    seasonDrs_ = (rules.seasonBits & net::kSeasonDrs) != 0;
+    seasonAero_ = (rules.seasonBits & net::kSeasonActiveAero) != 0;
+    seasonOverride_ = (rules.seasonBits & net::kSeasonOvertake) != 0;
+    seasonErs_ = (rules.seasonBits & net::kSeasonErs) != 0;
+    netRoster_ = rules.roster;
+    if (const auto seat = net::SeatOf(netRoster_, localPlayerId_)) {
+        netLocalSeat_.store(*seat, std::memory_order_relaxed);
     }
 }
 
@@ -614,7 +812,8 @@ void Game::LanBeginClientRace() {
     const std::string mapName = netConfig_.mapName.empty() ? mapName_ : netConfig_.mapName;
     mapName_ = mapName;
     totalLaps_ = std::clamp<int>(netConfig_.rules.laps, 1, 99);
-    netCarCount_ = std::max<std::uint8_t>(1, netConfig_.rules.carCount);
+    netCarCount_ = std::max<std::uint8_t>(1, netConfig_.rules.roster.count);
+    netRulesLocked_ = true;
     netRemoteFresh_.fill(false);
     StartRace();
     netInterp_ = std::make_unique<RemoteInterpolator>();
@@ -626,7 +825,8 @@ void Game::LanBeginClientRace() {
     localInputSeq_ = 0;
     if (world_ && !racers_.empty()) {
         netProxies_ = std::make_unique<RemoteProxies>();
-        netProxies_->Build(*world_, netCarCount_, 0, racers_.front().vehicle.Params());
+        netProxies_->Build(*world_, netCarCount_, netLocalSeat_.load(std::memory_order_relaxed),
+                           LocalRacer().vehicle.Params());
         netProxies_->SetEnabled(true);
     }
 }
@@ -648,9 +848,9 @@ void Game::LanBuildHostWorld(net::INetSession::HostWorld& out) {
         static_cast<std::uint32_t>(std::clamp(raceClock_, 0.f, 4.0e6f) * 1000.f);
     out.packet.carCount = static_cast<std::uint8_t>(std::min<int>(racers_.size(), net::kMaxCars));
     out.packet.hostTick = hostTick_;
-    // Anchor at the first car so int16 offsets stay small.
+    // Anchor at our own car so int16 offsets stay small.
     if (!racers_.empty()) {
-        const Transform t = racers_.front().vehicle.State().transform;
+        const Transform t = LocalRacer().vehicle.State().transform;
         out.packet.anchor[0] = t.position.x;
         out.packet.anchor[1] = t.position.y;
         out.packet.anchor[2] = t.position.z;
@@ -662,20 +862,27 @@ void Game::LanBuildHostWorld(net::INetSession::HostWorld& out) {
         if (world_) {
             if (const auto t = world_->GetTransform(racer.vehicle.Chassis())) chassis = *t;
         }
-        ToCarNetState(static_cast<std::uint8_t>(i), chassis, state, static_cast<std::uint8_t>(racer.lap),
+        // The wire carries the seat, not the local array index: that is what a
+        // client matches against its own seat and what the host's input mailbox
+        // is keyed by.
+        ToCarNetState(static_cast<std::uint8_t>(racer.seat), chassis, state,
+                      static_cast<std::uint8_t>(racer.lap),
                       static_cast<std::uint8_t>(std::clamp(racer.position, 0, 255)),
                       racer.finished, false, out.packet.cars[static_cast<std::size_t>(i)]);
+        // The self block is addressed to the recipient, whose session slot is
+        // its seat.
         const VehicleSnapshotState snap = racer.vehicle.SaveState();
-        ToSelfState(snap, out.self[static_cast<std::size_t>(i)]);
-        out.selfValid[static_cast<std::size_t>(i)] = 1;
+        const auto seat = static_cast<std::size_t>(racer.seat);
+        if (seat < static_cast<std::size_t>(net::kMaxCars)) {
+            ToSelfState(snap, out.self[seat]);
+            out.selfValid[seat] = 1;
+        }
     }
 }
 
 // ------------------------------------------------------------ host inputs ---
 
 void Game::LanApplyRemoteInputs() {
-    const float dt = fixedDt_;
-    (void)dt;
     std::array<net::InputSample, net::kMaxCars> inputs;
     std::array<bool, net::kMaxCars> fresh;
     {
@@ -683,14 +890,23 @@ void Game::LanApplyRemoteInputs() {
         inputs = netRemoteInput_;
         fresh = netRemoteFresh_;
     }
-    for (int slot = 1; slot < netCarCount_ && slot < static_cast<int>(racers_.size()); ++slot) {
-        Racer& racer = racers_[static_cast<std::size_t>(slot)];
+    const std::uint8_t localSeat = netLocalSeat_.load(std::memory_order_relaxed);
+    // One pass over the roster: the car for a peer is the car on its seat, so a
+    // roster hole leaves a seat cold instead of feeding a neighbour's input to
+    // the wrong car.
+    for (int s = 0; s < netRoster_.count; ++s) {
+        const std::uint8_t seat = netRoster_.entries[static_cast<std::size_t>(s)].seat;
+        if (seat == localSeat) continue;   // our own car is driven by the mailbox
+        Racer* racerPtr = RacerBySlot(seat);
+        if (!racerPtr) continue;
+        Racer& racer = *racerPtr;
         CarInput& in = racer.input;
         if (phase_ != RacePhase::Racing) {
             in = CarInput{};
             continue;
         }
-        if (!fresh[static_cast<std::size_t>(slot)]) {
+        const auto slot = static_cast<std::size_t>(seat);
+        if (!fresh[slot]) {
             // No packets for this peer: coast instead of running away.
             in.throttle = 0.f;
             in.brake = 0.6f;
@@ -703,27 +919,27 @@ void Game::LanApplyRemoteInputs() {
             in.overtake = false;
             continue;
         }
-        const net::InputSample& s = inputs[static_cast<std::size_t>(slot)];
+        const net::InputSample& sample = inputs[slot];
         const float d = track_.ProjectDistance(racer.vehicle.State().transform.position,
-                                               racer.lapDistance);
+                                              racer.lapDistance);
         const bool inZone = track_.InDrsZone(d);
-        bool& latch = netDrsLatch_[static_cast<std::size_t>(slot)];
+        bool& latch = netDrsLatch_[slot];
         if (!inZone) {
             latch = false;
-        } else if (s.drsPress != lastDrsPress_[static_cast<std::size_t>(slot)] && seasonDrs_) {
+        } else if (sample.drsPress != lastDrsPress_[slot] && seasonDrs_) {
             latch = !latch;
         }
-        lastDrsPress_[static_cast<std::size_t>(slot)] = s.drsPress;
-        in.throttle = s.throttle;
-        in.brake = s.brake;
-        in.steer = s.steer;
-        in.handbrake = s.handbrake;
-        in.reverse = s.reverse;
+        lastDrsPress_[slot] = sample.drsPress;
+        in.throttle = sample.throttle;
+        in.brake = sample.brake;
+        in.steer = sample.steer;
+        in.handbrake = sample.handbrake;
+        in.reverse = sample.reverse;
         in.drsZone = inZone;
         in.drsRequest = latch;
-        in.wingToggle = seasonAero_ && s.wingPress != lastWingPress_[static_cast<std::size_t>(slot)];
-        lastWingPress_[static_cast<std::size_t>(slot)] = s.wingPress;
-        in.overtake = seasonOverride_ && s.overtakePress != 0;
+        in.wingToggle = seasonAero_ && sample.wingPress != lastWingPress_[slot];
+        lastWingPress_[slot] = sample.wingPress;
+        in.overtake = seasonOverride_ && sample.overtakePress != 0;
     }
 }
 
@@ -752,15 +968,17 @@ net::InputSample Game::LanSampleLocalInput() {
 
 void Game::LanClientSimTick(float frameDt) {
     if (racers_.empty() || !netSession_) return;
-    Racer& player = racers_.front();
+    Racer& player = LocalRacer();
+    const std::uint8_t localSeat = netLocalSeat_.load(std::memory_order_relaxed);
 
     // Snapshot -> predictor mailbox (converted here so the sim thread only sees
-    // engine types).
+    // engine types). The authority for our car is the car on our seat; taking
+    // car 0 instead would snap us onto the host's car every snapshot.
     if (netPredict_ && netSession_) {
         if (const net::SnapshotPacket* snap = netSession_->LatestSnapshot()) {
             for (int i = 0; i < snap->carCount; ++i) {
                 const net::CarNetState& car = snap->cars[static_cast<std::size_t>(i)];
-                if (car.slot != 0) continue;
+                if (car.slot != localSeat) continue;
                 netPredict_->PushAuthority(car, snap->hasSelf ? &snap->self : nullptr,
                                            snap->appliedInputSeq, snap->hostTick);
                 break;

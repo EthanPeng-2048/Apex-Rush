@@ -14,6 +14,8 @@
 #include <string>
 #include <vector>
 
+#include "net/identity.h"
+
 namespace apex::net {
 
 enum class NetError : std::uint8_t {
@@ -31,10 +33,10 @@ enum class NetError : std::uint8_t {
     DuplicatePeer,
 };
 
-constexpr std::uint8_t kProtocolVersion = 1;
+constexpr std::uint8_t kProtocolVersion = 2;
 constexpr std::size_t kMaxDatagram = 1200;   // < ENet MTU: never fragment
 constexpr int kMaxCars = 8;
-constexpr std::size_t kNameBytes = 16;
+constexpr std::size_t kNameBytes = kPlayerNameBytes;
 constexpr std::size_t kMapNameBytes = 24;
 
 // Wire message ids.
@@ -78,18 +80,47 @@ enum InputButton : std::uint8_t {
     kBtnLookBack = 1u << 2,
 };
 
-// Game rules carried by Welcome / RaceStart.
+// RulesPacket::seasonBits — the feature gates both ends must agree on, because
+// they change the physics the car runs (a client on a different season is a
+// different simulation).
+enum SeasonBit : std::uint8_t {
+    kSeasonDrs = 1u << 0,
+    kSeasonActiveAero = 1u << 1,
+    kSeasonOvertake = 1u << 2,
+    kSeasonErs = 1u << 3,
+};
+
+// One seated player. `seat` doubles as the grid slot: it is the rank of
+// `playerId` in the roster sorted ascending, so every machine derives the same
+// grid from the same list and no role is "car 0" by construction.
+struct RosterEntry {
+    PlayerId playerId = kInvalidPlayerId;
+    std::uint8_t seat = 0;
+    std::string name;
+};
+
+// Fixed-size on the wire (kMaxCars slots, zero-filled) so rules packets stay
+// one datagram and the decoder never has to trust a length field.
+struct Roster {
+    std::uint8_t count = 0;
+    std::array<RosterEntry, kMaxCars> entries{};
+};
+
+// Game rules carried by Welcome / RaceStart. The roster is frozen by the host
+// when the race starts and travels with the rules; P0 has no mid-race joins, so
+// it stays valid for the whole race.
 struct RulesPacket {
     std::uint8_t laps = 3;
     std::uint8_t carCount = 4;
     std::uint8_t damage = 1;
-    std::uint8_t seasonBits = 1;   // bit0 DRS, bit1 active aero, bit2 overtake
+    std::uint8_t seasonBits = kSeasonDrs;
     std::uint8_t absLevel = 0;
     std::uint8_t tcLevel = 0;
     std::uint8_t escLevel = 0;
     std::uint8_t steerLevel = 0;
     std::uint8_t physicsEngine = 0;  // 0 qu3e, 1 nudge, 2 rpc
     std::uint8_t snapshotHz = 30;
+    Roster roster{};
 };
 
 // ---------------------------------------------------------------- input (C1)
@@ -176,10 +207,15 @@ struct HelloPacket {
     std::uint32_t mapHash = 0;
     std::string name;
     std::uint8_t colorPref = 0;
+    // Identity claimed by the joining player; the host rejects a second Hello
+    // carrying an id it already seated.
+    PlayerId playerId = kInvalidPlayerId;
 };
 
 struct WelcomePacket {
     std::uint8_t peerId = 0;
+    // Session slot assigned on arrival. It is provisional: the race start
+    // renumbers slots to seats (RaceStart carries the roster).
     std::uint8_t slot = 0;
     std::uint32_t sessionId = 0;
     RulesPacket rules{};
@@ -187,6 +223,9 @@ struct WelcomePacket {
     std::string mapName;
     float gridPos[3]{};
     std::uint16_t gridYaw = 0;
+    // Echo of the accepted id, so the client can tell it was seated as itself
+    // and not as the previous owner of that slot.
+    PlayerId playerId = kInvalidPlayerId;
 };
 
 struct RejectPacket {
@@ -285,6 +324,8 @@ struct AnnouncePacket {
     std::uint8_t players = 1;
     std::uint8_t maxPlayers = 8;
     std::uint8_t phase = 0;
+    // Host identity: room lists show who is hosting, not just a display name.
+    PlayerId playerId = kInvalidPlayerId;
 };
 
 struct QueryPacket {

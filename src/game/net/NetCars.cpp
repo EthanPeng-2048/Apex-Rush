@@ -329,11 +329,14 @@ bool LocalPredictor::Reconcile(Vehicle& vehicle, IPhysicsWorld& world, float dt,
 
 void RemoteProxies::Build(IPhysicsWorld& world, int carCount, std::uint8_t localSlot,
                           const VehicleParams& params) {
+    localSlot_ = localSlot;
     (void)carCount;
-    (void)localSlot;
     for (int slot = 0; slot < net::kMaxCars; ++slot) {
         Proxy& p = proxies_[static_cast<std::size_t>(slot)];
         if (p.active) continue;
+        // Our own seat is a real car here: a second solid box under it would
+        // fight the simulation it is supposed to shadow.
+        if (slot == static_cast<int>(localSlot_)) continue;
         BodyDesc desc;
         desc.halfExtents = Vec3{params.chassisHalfX, params.chassisHalfY, params.chassisHalfZ};
         desc.mass = 0.f;   // static: moved by SetTransform, never pushed
@@ -362,8 +365,8 @@ void RemoteProxies::Update(IPhysicsWorld& world, const RemoteInterpolator& inter
         if (!p.active) continue;
         Transform chassis;
         VehicleState state;
-        if (!enabled_ || slot >= carCount || !interp.Sample(static_cast<std::uint8_t>(slot),
-                                                           renderTimeMs, chassis, state)) {
+        if (!enabled_ || slot == static_cast<int>(localSlot_) || slot >= carCount ||
+            !interp.Sample(static_cast<std::uint8_t>(slot), renderTimeMs, chassis, state)) {
             if (p.placed) {
                 // Park it far below the map so it cannot block anyone.
                 Transform away;

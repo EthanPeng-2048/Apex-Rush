@@ -43,6 +43,11 @@ public:
         u16(static_cast<std::uint16_t>(v));
         u16(static_cast<std::uint16_t>(v >> 16));
     }
+    // Little-endian by construction (two u32 halves), like every other field.
+    void u64(std::uint64_t v) {
+        u32(static_cast<std::uint32_t>(v));
+        u32(static_cast<std::uint32_t>(v >> 32));
+    }
     void f32(float f) {
         std::uint32_t bits = 0;
         std::memcpy(&bits, &f, sizeof(bits));
@@ -90,6 +95,11 @@ public:
         const std::uint32_t lo = u16();
         const std::uint32_t hi = u16();
         return lo | (hi << 16);
+    }
+    std::uint64_t u64() {
+        const std::uint64_t lo = u32();
+        const std::uint64_t hi = u32();
+        return lo | (hi << 32);
     }
     float f32() {
         const std::uint32_t bits = u32();
@@ -261,6 +271,15 @@ void WriteRules(Writer& w, const RulesPacket& r) {
     w.u8(r.steerLevel);
     w.u8(r.physicsEngine);
     w.u8(r.snapshotHz);
+    // Roster: fixed kMaxCars records (25 B each) so Rules keeps one size no
+    // matter how many are seated and the decoder needs no length trust.
+    w.u8(r.roster.count);
+    for (int i = 0; i < kMaxCars; ++i) {
+        const RosterEntry& e = r.roster.entries[static_cast<std::size_t>(i)];
+        w.u64(e.playerId);
+        w.u8(e.seat);
+        w.fixedStr(e.name, kNameBytes);
+    }
 }
 
 RulesPacket ReadRules(Reader& r) {
@@ -275,6 +294,13 @@ RulesPacket ReadRules(Reader& r) {
     p.steerLevel = r.u8();
     p.physicsEngine = r.u8();
     p.snapshotHz = r.u8();
+    p.roster.count = r.u8();
+    for (int i = 0; i < kMaxCars; ++i) {
+        RosterEntry& e = p.roster.entries[static_cast<std::size_t>(i)];
+        e.playerId = r.u64();
+        e.seat = r.u8();
+        e.name = r.fixedStr(kNameBytes);
+    }
     return p;
 }
 
@@ -429,6 +455,7 @@ std::expected<std::size_t, NetError> EncodeHello(const HelloPacket& p, std::span
     w.u32(p.mapHash);
     w.fixedStr(p.name, kNameBytes);
     w.u8(p.colorPref);
+    w.u64(p.playerId);
     if (!w.ok()) return std::unexpected(NetError::PayloadTooLarge);
     return w.size();
 }
@@ -441,6 +468,7 @@ std::expected<HelloPacket, NetError> DecodeHello(std::span<const std::byte> in) 
     p.mapHash = r.u32();
     p.name = r.fixedStr(kNameBytes);
     p.colorPref = r.u8();
+    p.playerId = r.u64();
     if (!r.done()) return std::unexpected(NetError::Malformed);
     return p;
 }
@@ -458,6 +486,7 @@ std::expected<std::size_t, NetError> EncodeWelcome(const WelcomePacket& p, std::
     w.f32(Safe(p.gridPos[1]));
     w.f32(Safe(p.gridPos[2]));
     w.u16(p.gridYaw);
+    w.u64(p.playerId);
     if (!w.ok()) return std::unexpected(NetError::PayloadTooLarge);
     return w.size();
 }
@@ -476,6 +505,8 @@ std::expected<WelcomePacket, NetError> DecodeWelcome(std::span<const std::byte> 
     p.gridPos[1] = r.f32();
     p.gridPos[2] = r.f32();
     p.gridYaw = r.u16();
+    p.playerId = r.u64();
+    if (p.rules.roster.count > kMaxCars) return std::unexpected(NetError::Malformed);
     if (!r.done()) return std::unexpected(NetError::Malformed);
     return p;
 }
@@ -552,6 +583,7 @@ std::expected<RaceStartPacket, NetError> DecodeRaceStart(std::span<const std::by
     p.startHostTick = r.u32();
     p.countdownCs = r.u16();
     p.rules = ReadRules(r);
+    if (p.rules.roster.count > kMaxCars) return std::unexpected(NetError::Malformed);
     if (!r.done()) return std::unexpected(NetError::Malformed);
     return p;
 }
@@ -763,6 +795,7 @@ std::expected<std::size_t, NetError> EncodeAnnounce(const AnnouncePacket& p, std
     w.u8(p.phase);
     w.fixedStr(p.mapName, kMapNameBytes);
     w.fixedStr(p.hostName, kNameBytes);
+    w.u64(p.playerId);
     if (!w.ok()) return std::unexpected(NetError::PayloadTooLarge);
     return w.size();
 }
@@ -785,6 +818,7 @@ std::expected<AnnouncePacket, NetError> DecodeAnnounce(std::span<const std::byte
     p.phase = r.u8();
     p.mapName = r.fixedStr(kMapNameBytes);
     p.hostName = r.fixedStr(kNameBytes);
+    p.playerId = r.u64();
     if (!r.done()) return std::unexpected(NetError::Malformed);
     return p;
 }

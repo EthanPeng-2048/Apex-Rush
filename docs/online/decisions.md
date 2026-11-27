@@ -90,9 +90,9 @@
 
 ## ADR-07 发现层自写 Winsock 广播
 
-**决策**：主机 1 Hz 广播 `ANNOUNCE`（62 B），客户端监听 + 主动 `QUERY`（主机单播回应）；不引入 udp-discovery-cpp。
+**决策**：主机 1 Hz 广播 `ANNOUNCE`（70 B），客户端监听 + 主动 `QUERY`（主机单播回应）；不引入 udp-discovery-cpp。
 
-**理由**：功能只要一个 62 B 定长报文；新依赖与体积/许可成本不划算（NF-01）。`QUERY` 单播兜底是广播被防火墙/多网卡挡住时唯一的自救路径。
+**理由**：功能只要一个 70 B 定长报文；新依赖与体积/许可成本不划算（NF-01）。`QUERY` 单播兜底是广播被防火墙/多网卡挡住时唯一的自救路径。
 
 **可替换**：`IRoomDiscovery` 后面还有 `StaticDiscovery`（测试/同机双开）与 `NullDiscovery`（WASM）。
 
