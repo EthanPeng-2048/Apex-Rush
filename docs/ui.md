@@ -56,6 +56,8 @@ class UiController {
 | Digits | 是 | 移动第几位 | 改这一位的数字（0–9 回绕）→ `Adjust*(id, 新数字)` | `Activate(id)` |
 | TextField | 是 | — | — | `Activate(id)` |
 
+焦点默认**循环**（与旧的手写菜单 `(cursor+1)%rows` 一致）；需要到端点停住的屏（短确认框、表单）在构建时写 `screen.wrapFocus = false`。这是数据开关，不是让游戏层自己再实现一遍移动。
+
 ## 3. 三条硬规则
 
 1. **Screen 是持有式数据，不要每帧重建。** `cursor`/`focused`/`subCursor`/文本缓冲都在 screen 里。每帧 new 一个 `UiScreen` 会让焦点回到第一行（玩家按一次"上"就跳回顶部）。做法：把 screen 作为成员持有，只在**屏幕打开时** `ResetFocus`，其余帧就地更新动态内容（设置值文本、房间列表条目）。

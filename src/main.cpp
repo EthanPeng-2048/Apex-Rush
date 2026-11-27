@@ -2012,6 +2012,35 @@ int RunUiSelfTest() {
     action = ui.Update(screen, select);
     check(action.kind == UiActionKind::Activate && action.id == "code", "enter activates the row");
 
+    // Focus wrapping: menus cycle (the old hand-written screens did), and a
+    // screen that wants hard ends clears the flag. Buttons only — Up/Down on a
+    // digit wheel is a value edit, not a focus move.
+    UiScreen wrapScreen;
+    wrapScreen.widgets = {
+        {.kind = UiKind::Button, .id = "a", .label = "A"},
+        {.kind = UiKind::Button, .id = "b", .label = "B"},
+        {.kind = UiKind::Button, .id = "c", .label = "C"},
+    };
+    wrapScreen.cursor = 2;
+    InputState upWrap;
+    upWrap.menuUp = true;
+    ui.Update(wrapScreen, upWrap);
+    check(wrapScreen.cursor == 1, "wrap screen: up steps to the previous row");
+
+    wrapScreen.cursor = 0;
+    InputState upToEnd;
+    upToEnd.menuUp = true;
+    ui.Update(wrapScreen, upToEnd);
+    check(wrapScreen.cursor == 2, "wrap screen: up from the first row lands on the last row");
+
+    UiScreen clamped = wrapScreen;
+    clamped.wrapFocus = false;
+    clamped.cursor = 2;
+    InputState downClamp;
+    downClamp.menuDown = true;
+    ui.Update(clamped, downClamp);
+    check(clamped.cursor == 2, "non-wrapping screen keeps focus at the last row");
+
     // Text field: typing, backspace, Enter, Escape.
     UiScreen nameScreen;
     nameScreen.title = "NAME";
