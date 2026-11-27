@@ -18,6 +18,7 @@ import rush.engine.physics;
 import rush.engine.render;
 import rush.engine.input;
 import rush.engine.runtime;
+import rush.engine.ui;
 
 namespace apex {
 
@@ -61,7 +62,11 @@ public:
     // LAN role. Offline = the original single-player flow.
     enum class NetRole { Offline, Host, Client };
     // LAN screen sub-state (all under RacePhase::Lan).
-    enum class LanUi { Root, JoinCode, RoomList, Lobby, Message };
+    // RoomCode is the shared room-code editor: HOST and JOIN both enter it and
+    // the role only decides what a confirmed code does.
+    enum class LanUi { Root, RoomCode, RoomList, Lobby, Message };
+    // Which role a confirmed room code launches.
+    enum class LanRole { None, Host, Join };
 
     // Race-setup rows: circuit, laps, cars, damage, start, back.
     static constexpr int kRaceSetupRowCount = 6;
@@ -271,9 +276,6 @@ private:
 
     NetRole netRole_ = NetRole::Offline;
     LanUi lanUi_ = LanUi::Root;
-    int lanCursor_ = 0;
-    int lanDigitCursor_ = 0;
-    std::array<int, 4> lanCode_{0, 0, 0, 0};
     std::string lanMessage_;
     float lanMessageTimer_ = 0.f;
     std::uint64_t lanJoinStartMs_ = 0;
@@ -382,9 +384,6 @@ private:
 
     // Menu / settings state.
     InputState rawInput_;
-    int menuCursor_ = 0;
-    int settingsCursor_ = 0;
-    int raceSetupCursor_ = 0;
 
     // Main → sim control mailbox. Continuous fields (axes) are overwritten
     // every main-thread frame; edge requests are set-only by the producer
@@ -420,6 +419,51 @@ private:
     std::unique_ptr<RaceBuildResult> pending_;
     std::atomic<bool> loadDone_{false};
     std::atomic<bool> loadCancelled_{false};
+
+    // --- Declarative menus (rush.engine.ui) ---------------------------------
+    // A UiScreen is owned state, not immediate mode: the focus index, the
+    // per-row focus flags, the digit sub-cursor and text buffers all live in
+    // it. So every screen is a member that is built when it opens and only has
+    // its dynamic text refreshed afterwards — rebuilding per frame would reset
+    // the focus. The engine resolves input and draws; the game declares rows
+    // and reacts to the UiAction that comes back.
+    struct UiScreens {
+        UiScreen menu;
+        UiScreen settings;
+        UiScreen raceSetup;
+        UiScreen lanRoot;
+        UiScreen lanCode;   // the shared room-code wheel (HOST and JOIN)
+        UiScreen lanRooms;  // discovered rooms: rows change with the LAN
+        UiScreen lanLobby;
+        UiScreen lanMessage;
+    };
+    UiScreens screens_;
+    UiController ui_;
+    RacePhase uiPhase_ = RacePhase::Countdown;  // phase the open screens belong to
+    LanUi lanScreenState_ = LanUi::Root;        // LAN sub-state last built
+    bool lanScreensStale_ = true;               // LAN entered: rebuild + refocus
+    NetRole lanLobbyRole_ = NetRole::Offline;   // role the lobby rows were built for
+    LanRole lanPendingRole_ = LanRole::None;    // what a confirmed room code does
+    std::vector<net::RoomInfo> lanRooms_;       // last filtered discovery result
+
+    // Open the screen a phase change needs (focus reset is a screen open).
+    void SyncUiPhase();
+    void OpenPhaseScreen(RacePhase phase);
+    void BuildMenuScreen();
+    void BuildSettingsScreen();
+    void BuildRaceSetupScreen();
+    void RefreshSettingsValues();
+    void RefreshRaceSetupValues();
+    // LAN: static skeletons once per visit, dynamic rows refreshed in place.
+    void BuildLanScreens();
+    void SyncLanScreen();
+    UiScreen& ActiveLanScreen();
+    std::uint16_t LanRoomCode();
+    void LanOpenRoomCode(LanRole role);
+    void LanConfirmRoomCode();
+    void LanLeaveToMenu();
+    void ApplySettingStep(const std::string& id, int step);
+    void ApplyRaceSetupStep(const std::string& id, int step);
 };
 
 }  // namespace apex
