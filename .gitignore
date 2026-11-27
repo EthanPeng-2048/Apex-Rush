@@ -15,5 +15,6 @@ config.rushconf
 build-web/
 .deps/
 build-tools/
+build-static/
 *.rushmap
 *.rushconf

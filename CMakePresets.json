@@ -22,6 +22,13 @@
       }
     },
     {
+      "name": "release-static",
+      "displayName": "Clang Release + Static CRT (no VC++ redist on target)",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/build-static",
+      "cacheVariables": { "APEX_STATIC_RUNTIME": "ON" }
+    },
+    {
       "name": "debug",
       "displayName": "Clang Debug",
       "inherits": "clang-base",
@@ -51,6 +58,7 @@
   ],
   "buildPresets": [
     { "name": "release", "configurePreset": "release", "jobs": 32 },
+    { "name": "release-static", "configurePreset": "release-static", "jobs": 32 },
     { "name": "debug", "configurePreset": "debug", "jobs": 32 },
     { "name": "debug-tools", "configurePreset": "debug-tools", "jobs": 32 },
     { "name": "web", "configurePreset": "web", "jobs": 32 }

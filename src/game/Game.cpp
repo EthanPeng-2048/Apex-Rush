@@ -277,7 +277,7 @@ void Game::SpawnRacersInto(std::vector<Racer>& out, const Track& track, IPhysics
         params.overtakeEnabled = cfg.seasonOverride;
 
         Transform pose;
-        pose.position = track.StartPosition(i);
+        pose.position = track.StartPosition(i + cfg.gridOffset);
         pose.rotation = track.StartRotation();
         racer.vehicle.Spawn(world, pose, params, &racer);
     }
@@ -289,6 +289,14 @@ Game::RaceBuildConfig Game::MakeRaceBuildConfig() {
     cfg.fixedDt = fixedDt_;
     cfg.engine = config_.GetString("physics", "engine", "qu3e");
     cfg.carCount = std::clamp(config_.GetInt("race", "cars", 4), 1, 120);
+    // LAN roles override the grid: the host drives every joined car, the client
+    // only its own (spawned on its authoritative slot).
+    if (netRole_ == NetRole::Host) {
+        cfg.carCount = std::clamp<int>(netCarCount_, 1, net::kMaxCars);
+    } else if (netRole_ == NetRole::Client) {
+        cfg.carCount = 1;
+        cfg.gridOffset = netConfig_.rules.carCount > 1 ? netLocalSlot_ : 0;
+    }
     cfg.damage = config_.GetBool("race", "damage", true);
     cfg.absLevel = ParseAssistLevel(config_, "abs", DefaultAssistLevel("abs"));
     cfg.tcLevel = ParseAssistLevel(config_, "tc", DefaultAssistLevel("tc"));
@@ -342,6 +350,9 @@ void Game::StartRace() {
     LoadSettings();
     racers_.clear();
     drsWanted_ = false;
+    hostTick_ = 0;
+    localTick_ = 0;
+    netCarCount_ = netCarCount_ > 0 ? netCarCount_ : 1;
     // Swap collision backends in-game via [physics] engine (qu3e | nudge | rpc).
     world_ = MakePhysicsWorld(config_.GetString("physics", "engine", "qu3e"), fixedDt_);
     world_->SetGravity({0.f, -9.81f, 0.f});
@@ -441,11 +452,15 @@ void Game::Update() {
     // RaceSetup → Countdown so this frame already starts the sim worker.
     PollRaceLoad();
 
+    // LAN: pump discovery + session every frame (any phase), so lobby traffic
+    // keeps flowing while the room browser is open.
+    if (netRole_ != NetRole::Offline) LanTick();
+
     // Single load: phase_ is written by both threads (pause vs. race rules),
     // so read it once per frame for consistent dispatch.
     const RacePhase ph = phase_;
-    const bool menuPhase =
-        ph == RacePhase::Menu || ph == RacePhase::Settings || ph == RacePhase::RaceSetup;
+    const bool menuPhase = ph == RacePhase::Menu || ph == RacePhase::Settings ||
+                           ph == RacePhase::RaceSetup || ph == RacePhase::Lan;
 
     if (menuPhase) {
         // Menus always own the caller thread; park the sim worker.
@@ -458,6 +473,8 @@ void Game::Update() {
             UpdateMenu();
         } else if (ph == RacePhase::Settings) {
             UpdateSettings();
+        } else if (ph == RacePhase::Lan) {
+            UpdateLan();
         } else {
             UpdateRaceSetup();
         }
@@ -522,13 +539,21 @@ void Game::Update() {
 }
 
 void Game::UpdateSim(float frameDt) {
+    // LAN client: only the local car is simulated (prediction + rollback).
+    if (netRole_ == NetRole::Client) {
+        LanClientSimTick(frameDt);
+        return;
+    }
+
     // Latch the player mailbox before anything reads player.input — mapping,
     // DRS zone latching, autopilot and restart all run on this thread so
     // they never race the sim worker's view of racers_.
     ApplyPlayerIntent();
 
-    // Data-parallel AI: each car only writes its own CarInput.
-    if (benchOn_) {
+    if (netRole_ == NetRole::Host) {
+        // Remote cars are driven by their owners' inputs, never by the AI.
+        LanApplyRemoteInputs();
+    } else if (benchOn_) {
         const BenchClock::time_point t0 = BenchClock::now();
         rush::JobSystem::Get().ParallelFor(racers_.size(), [&](std::size_t i) {
             Racer& racer = racers_[i];
@@ -566,6 +591,13 @@ void Game::UpdateSim(float frameDt) {
     // Inline mode draws straight from racers_ — only the async path needs
     // a published snapshot.
     if (threadedSim_) PublishSnapshot();
+
+    // Host: hand the authoritative world to the net layer at ~snapshot rate.
+    if (netRole_ == NetRole::Host && netSession_) {
+        LanBuildHostWorld(hostWorld_);
+        std::lock_guard lock(hostWorldMutex_);
+        hostWorldFresh_ = true;
+    }
 }
 
 void Game::PublishSnapshot() {
@@ -667,6 +699,28 @@ void Game::Render3D() {
             drawT.position += pose.state.velocity * ahead;
             Vehicle::RenderPose(renderer_, drawT, pose.state, pose.params, pose.tint);
         }
+        // LAN client: other players are not simulated locally, so they come
+        // straight from the snapshot playout buffer (rendered slightly in the
+        // past, which is what N-05 asks for).
+        if (netRole_ == NetRole::Client && netInterp_ && !racers_.empty()) {
+            const double now2 = std::chrono::duration<double>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count() * 1000.0;
+            const double renderMs = now2 - netInterp_->DelayMs();
+            for (int slot = 0; slot < netCarCount_; ++slot) {
+                if (slot == static_cast<int>(netLocalSlot_)) continue;
+                Transform chassis;
+                VehicleState state;
+                if (!netInterp_->Sample(static_cast<std::uint8_t>(slot), renderMs, chassis, state)) {
+                    continue;
+                }
+                Color tint{1.0f, 0.86f, 0.74f, 1.f};
+                tint.r = 0.55f + 0.12f * static_cast<float>(slot % 3);
+                tint.g = 0.75f;
+                tint.b = 0.95f - 0.10f * static_cast<float>(slot % 3);
+                Vehicle::RenderPose(renderer_, chassis, state, racers_.front().vehicle.Params(), tint);
+            }
+        }
         return;
     }
 
@@ -680,8 +734,8 @@ void Game::UpdatePlayerInput() {
     // Menus own their input (UpdateMenu / UpdateSettings / UpdateRaceSetup);
     // cars stay parked and the sim worker is (or will be) stopped.
     const RacePhase ph = phase_;
-    const bool menuPhase =
-        ph == RacePhase::Menu || ph == RacePhase::Settings || ph == RacePhase::RaceSetup;
+    const bool menuPhase = ph == RacePhase::Menu || ph == RacePhase::Settings ||
+                           ph == RacePhase::RaceSetup || ph == RacePhase::Lan;
 
     // Switch the input context before sampling so race-gated events
     // (throttle, DRS, ...) freeze in menus and menu registrations take over.
@@ -706,6 +760,11 @@ void Game::UpdatePlayerInput() {
     // this is the only main-thread write during a race — the worker observes
     // it and parks without the main thread ever touching racers_ here.
     if (raw.pause) {
+        if (netRole_ != NetRole::Offline) {
+            // Online races never pause: leaving the room is the only exit.
+            LanStop("LEFT ROOM");
+            return;
+        }
         phase_ = RacePhase::Menu;
         menuCursor_ = 0;
         std::lock_guard lock(intentMutex_);
@@ -912,6 +971,7 @@ void Game::UpdateAI(Racer& racer, float dt) {
 void Game::StepPhysics(float dt) {
     const bool b = benchOn_;
     if (b) ++bench_.physSteps;
+    ++hostTick_;
 
     BenchClock::time_point t = b ? BenchClock::now() : BenchClock::time_point{};
     // Vehicle::Update raycasts and applies forces on the shared IPhysicsWorld
@@ -989,10 +1049,26 @@ void Game::UpdateRace(float dt) {
                     racer.bestLapTime = lapTime;
                 }
                 racer.currentLapStart = raceClock_;
+                if (netRole_ == NetRole::Host && netSession_) {
+                    net::LapCompletePacket lapEvent;
+                    lapEvent.slot = static_cast<std::uint8_t>(&racer - racers_.data());
+                    lapEvent.lap = static_cast<std::uint8_t>(std::min(racer.lap, 255));
+                    lapEvent.lapTimeMs = static_cast<std::uint32_t>(lapTime * 1000.f);
+                    lapEvent.bestLapMs = static_cast<std::uint32_t>(racer.bestLapTime * 1000.f);
+                    netSession_->SendLapComplete(lapEvent);
+                }
             }
             if (racer.lap >= totalLaps_) {
                 racer.finished = true;
                 racer.raceTime = raceClock_;
+                if (netRole_ == NetRole::Host && netSession_) {
+                    net::PlayerFinishedPacket fin;
+                    fin.slot = static_cast<std::uint8_t>(&racer - racers_.data());
+                    fin.position = static_cast<std::uint8_t>(std::clamp(racer.position, 1, 255));
+                    fin.raceTimeMs = static_cast<std::uint32_t>(racer.raceTime * 1000.f);
+                    fin.bestLapMs = static_cast<std::uint32_t>(racer.bestLapTime * 1000.f);
+                    netSession_->SendPlayerFinished(fin);
+                }
             }
         }
         racer.lapDistance = d;
@@ -1032,9 +1108,27 @@ void Game::UpdateRace(float dt) {
         racers_[order[rank]].position = static_cast<int>(rank) + 1;
     }
 
-    // Race end: when the player finishes (or everyone has).
-    if (racers_.front().finished) {
+    // Race end: offline ends when the player finishes; a LAN host waits until
+    // every car is home (or ends it manually).
+    bool allDone = true;
+    for (const Racer& r : racers_) allDone = allDone && r.finished;
+    if ((netRole_ == NetRole::Host) ? allDone : racers_.front().finished) {
         phase_ = RacePhase::Finished;
+        if (netRole_ == NetRole::Host && netSession_ && !netEndSent_) {
+            netEndSent_ = true;
+            std::vector<net::RaceEndEntry> results;
+            for (std::size_t i = 0; i < racers_.size(); ++i) {
+                const Racer& r = racers_[i];
+                net::RaceEndEntry entry;
+                entry.slot = static_cast<std::uint8_t>(i);
+                entry.position = static_cast<std::uint8_t>(std::clamp(r.position, 1, 255));
+                entry.finished = r.finished ? 1 : 0;
+                entry.raceTimeMs = static_cast<std::uint32_t>(std::max(0.f, r.raceTime) * 1000.f);
+                entry.bestLapMs = static_cast<std::uint32_t>(std::max(0.f, r.bestLapTime) * 1000.f);
+                results.push_back(entry);
+            }
+            netSession_->EndRace(std::move(results));
+        }
     }
 }
 
@@ -1123,6 +1217,10 @@ void Game::RenderHUD() {
         RenderRaceSetup();
         return;
     }
+    if (phase_ == RacePhase::Lan) {
+        RenderLan();
+        return;
+    }
     if (racers_.empty()) return;
 
     // Race HUD fields: while the sim worker owns racers_, every sim-written
@@ -1136,8 +1234,12 @@ void Game::RenderHUD() {
     const std::array<float, 4>& partHealth =
         snapHud ? frameSnap_->cars[0].partHealth
                 : racers_.front().vehicle.Aero().StateRef().partHealth;
-    const int position = snapHud ? frameSnap_->cars[0].position : racers_.front().position;
-    const int lap = snapHud ? frameSnap_->cars[0].lap : racers_.front().lap;
+    const int position = (netRole_ == NetRole::Client && netReadout_.valid)
+                             ? static_cast<int>(netReadout_.position)
+                             : (snapHud ? frameSnap_->cars[0].position : racers_.front().position);
+    const int lap = (netRole_ == NetRole::Client && netReadout_.valid)
+                        ? static_cast<int>(netReadout_.lap)
+                        : (snapHud ? frameSnap_->cars[0].lap : racers_.front().lap);
     const float lastLapTime =
         snapHud ? frameSnap_->cars[0].lastLapTime : racers_.front().lastLapTime;
     const float bestLapTime =
@@ -1256,8 +1358,8 @@ void Game::RenderHUD() {
 void Game::UpdateMenu() {
     const InputState& in = rawInput_;
     if (audio_ && (in.menuUp || in.menuDown || in.menuSelect)) audio_->PlayUIClick();
-    if (in.menuUp) menuCursor_ = (menuCursor_ + 2) % 3;
-    if (in.menuDown) menuCursor_ = (menuCursor_ + 1) % 3;
+    if (in.menuUp) menuCursor_ = (menuCursor_ + 3) % 4;
+    if (in.menuDown) menuCursor_ = (menuCursor_ + 1) % 4;
     if (in.menuSelect) {
         switch (menuCursor_) {
             case 0:
@@ -1268,6 +1370,9 @@ void Game::UpdateMenu() {
             case 1:
                 phase_ = RacePhase::Settings;
                 settingsCursor_ = 0;
+                break;
+            case 2:
+                EnterLan();
                 break;
             default:
                 wantsQuit_ = true;
@@ -1527,9 +1632,10 @@ void Game::RenderMenu() {
     renderer_.DrawText2D("APEX RUSH", w * 0.5f - 165.f, h * 0.24f, 68, Color::White());
     renderer_.DrawText2D("OPEN F1 SIM", w * 0.5f - 92.f, h * 0.24f + 78.f, 20, Color::Gray());
 
-    const char* items[3] = {"START RACE", "SETTINGS", "QUIT"};
-    float y = h * 0.52f;
-    for (int i = 0; i < 3; ++i) {
+    // Index order is asserted by --drive-test: 0 race, 1 settings, quit last.
+    const char* items[4] = {"START RACE", "SETTINGS", "LAN RACE", "QUIT"};
+    float y = h * 0.46f;
+    for (int i = 0; i < 4; ++i) {
         const bool selected = (i == menuCursor_);
         const Vec2f size = renderer_.MeasureText2D(items[i], 28);
         const float x = w * 0.5f - size.x * 0.5f;

@@ -33,6 +33,18 @@ elseif(MSVC)
 endif()
 add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 
+# --- Static CRT (portable build) ---------------------------------------------
+# The default build links the runtime dynamically, so the exe needs
+# MSVCP140.dll / VCRUNTIME140.dll from the VC++ redistributable - which is
+# missing on freshly installed machines. APEX_STATIC_RUNTIME links libcmt /
+# libcpmt instead, leaving only DLLs that Windows ships itself. Player-facing
+# builds use it (preset release-static). It must cover every target, raylib and
+# enet included: lld rejects mixed CRT flavors with LNK2038.
+option(APEX_STATIC_RUNTIME "Link the C/C++ runtime statically (no VC++ redist on the target)" OFF)
+if(APEX_STATIC_RUNTIME AND NOT EMSCRIPTEN AND CMAKE_CXX_COMPILER_ID MATCHES "Clang|MSVC")
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 # --- Third-party: raylib (render/input/window) -------------------------------
 include(FetchContent)
 # Reuse a seeded raylib source tree (copy of the patched FetchContent checkout
@@ -69,6 +81,13 @@ add_executable(apex-rush
     src/audio/MiniaudioAudio.cpp
     src/game/Track.cpp
     src/game/Game.cpp
+    src/game/net/NetCars.cpp
+    src/game/net/LanGame.cpp
+    src/net/protocol/wire_codec.cpp
+    src/net/transport.cpp
+    src/net/discovery.cpp
+    src/net/session.cpp
+    src/net/net_selftest.cpp
 )
 
 target_include_directories(apex-rush PRIVATE src third_party/miniaudio rush-engine/src)  # rush-engine/src: TEMP probe

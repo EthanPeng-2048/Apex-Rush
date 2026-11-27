@@ -15,6 +15,10 @@ Windows 局域网多人 F1 风格竞速游戏。纯本地、零外部运行时�
 cmake --preset release
 cmake --build --preset release
 
+# 发布/外发用（CRT 静态链接：目标机不需要 VC++ 运行库）
+cmake --preset release-static
+cmake --build --preset release-static
+
 # 开发工具（mapconv：CSV → .rushmap）
 cmake --preset debug-tools
 cmake --build --preset debug-tools
@@ -28,7 +32,7 @@ cmake --preset web
 cmake --build --preset web
 ```
 
-产物：`build/apex-rush.exe`。配置与本机设置写在 EXE 同级 `config.rushconf`（KVRec；`config.ini` 已废弃）。
+产物：`build/apex-rush.exe`（`release-static` 出到 `build-static/apex-rush.exe`，只依赖 Windows 自带 DLL）。配置与本机设置写在 EXE 同级 `config.rushconf`（KVRec；`config.ini` 已废弃）。
 
 ---
 

@@ -10,6 +10,10 @@
 #include "audio/IAudio.h"
 import rush.engine.core;
 #include "game/Track.h"
+#include "game/net/NetCars.h"
+#include "net/discovery.h"
+#include "net/session.h"
+#include "net/transport.h"
 import rush.engine.physics;
 import rush.engine.render;
 import rush.engine.input;
@@ -22,6 +26,8 @@ namespace apex {
 void RegisterGameInput(InputSystem& input);
 
 // Race phases drive UI and input gating.
+// NOTE: the numeric order of the first six values is asserted by --drive-test
+// and by the shot automation; LAN is appended last so those stay stable.
 enum class RacePhase {
     Menu,
     Settings,
@@ -29,6 +35,7 @@ enum class RacePhase {
     Countdown,
     Racing,
     Finished,
+    Lan,         // LAN room browser / lobby (sub-state lives in LanUi)
 };
 
 struct Racer {
@@ -51,8 +58,17 @@ struct Racer {
 // Owns the world, track, racers and UI. One instance per running game.
 class Game {
 public:
+    // LAN role. Offline = the original single-player flow.
+    enum class NetRole { Offline, Host, Client };
+    // LAN screen sub-state (all under RacePhase::Lan).
+    enum class LanUi { Root, JoinCode, RoomList, Lobby, Message };
+
     // Race-setup rows: circuit, laps, cars, damage, start, back.
     static constexpr int kRaceSetupRowCount = 6;
+    // LAN root rows: host, join, back.
+    static constexpr int kLanRootRows = 3;
+    // LAN lobby rows: start (host) / leave.
+    static constexpr int kLanLobbyRows = 2;
     // Global settings rows: season + feature gates, assists, video/physics,
     // audio + BACK.
     static constexpr int kSettingsRowCount = 17;
@@ -67,6 +83,15 @@ public:
     void Render3D();
     void RenderHUD();
     bool WantsQuit() const { return wantsQuit_; }
+
+    NetRole Role() const { return netRole_; }
+    bool LanActive() const { return netRole_ != NetRole::Offline; }
+    // Opens the LAN screen (main menu entry point).
+    void EnterLan();
+    // Headless automation: start a host / join a room immediately (used by
+    // --net-host / --net-join; no menu interaction).
+    bool AutoHost(std::uint16_t roomCode);
+    bool AutoJoin(std::uint16_t roomCode, const std::string& hostIp);
 
     // Introspection for tests and (later) the network layer.
     const VehicleState& PlayerState() const { return racers_.front().vehicle.State(); }
@@ -167,6 +192,8 @@ private:
         // [physics] engine: "qu3e" | "nudge" | "rpc" (Rush Physics Core).
         std::string engine = "qu3e";
         int carCount = 4;
+        // LAN: grid slot offset (client sits on its own slot; host at 0).
+        int gridOffset = 0;
         bool damage = true;
         AssistLevel absLevel = AssistLevel::Sport;
         AssistLevel tcLevel = AssistLevel::Sport;
@@ -222,6 +249,82 @@ private:
     void StartSimWorker();
     void StopSimWorker();
     void UpdateCameraFrom(const VehicleState& player, float dt);
+
+    // --- LAN -----------------------------------------------------------------
+    void UpdateLan();
+    void RenderLan();
+    void LanStartHost(std::uint16_t roomCode);
+    void LanStartClient(std::uint16_t roomCode, const net::Endpoint& host);
+    void LanStop(const std::string& message);
+    void LanTick();                       // discovery + session pump + events
+    void LanHandleEvents();
+    void LanRequestRaceLoad();            // host: build the race for N players
+    void LanBeginClientRace();            // client: enter the race on RaceStart
+    void LanApplyRemoteInputs();          // host sim thread
+    void LanClientSimTick(float frameDt); // client sim thread (own car + proxies)
+    void LanPublishHostWorld();           // main thread: hand the world to the session
+    void LanBuildHostWorld(net::INetSession::HostWorld& out);  // sim thread
+    net::InputSample LanSampleLocalInput();    // main thread: InputState -> wire sample
+    void LanApplySessionToRacer(std::uint8_t slot);           // HUD mirrors
+    double LanRenderTimeMs() const;
+
+    NetRole netRole_ = NetRole::Offline;
+    LanUi lanUi_ = LanUi::Root;
+    int lanCursor_ = 0;
+    int lanDigitCursor_ = 0;
+    std::array<int, 4> lanCode_{0, 0, 0, 0};
+    std::string lanMessage_;
+    float lanMessageTimer_ = 0.f;
+    std::uint64_t lanJoinStartMs_ = 0;
+
+    std::unique_ptr<net::ITransport> netTransport_;
+    std::unique_ptr<net::IRoomDiscovery> netDiscovery_;
+    std::unique_ptr<net::INetSession> netSession_;
+    net::NetConfig netConfig_{};
+    std::unique_ptr<RemoteInterpolator> netInterp_;
+    std::unique_ptr<LocalPredictor> netPredict_;
+    std::unique_ptr<RemoteProxies> netProxies_;
+
+    std::uint32_t localTick_ = 0;
+    std::uint32_t hostTick_ = 0;
+    std::uint8_t netLocalSlot_ = 0;
+    std::uint8_t netPressDrsSeen_ = 0;
+    std::uint8_t netPressWingSeen_ = 0;
+    std::array<std::uint8_t, net::kMaxCars> lastDrsPress_{};
+    std::array<std::uint8_t, net::kMaxCars> lastWingPress_{};
+    std::uint32_t lastPushedHostTick_ = 0;
+    bool netEndSent_ = false;
+    std::uint64_t netLogMs_ = 0;
+    std::uint16_t localInputSeq_ = 0;
+    net::InputSample netLocalSample_{};
+    std::uint8_t netPressDrs_ = 0;
+    std::uint8_t netPressWing_ = 0;
+    std::uint8_t netPressOvertake_ = 0;
+    std::array<net::LobbyPlayer, net::kMaxCars> netLobby_{};
+    std::uint8_t netLobbyCount_ = 0;
+    std::uint8_t netCarCount_ = 1;
+    // Remote inputs are received on the main thread and consumed by the sim
+    // thread (same mailbox pattern as PlayerIntent).
+    std::mutex netInputMutex_;
+    std::array<net::InputSample, net::kMaxCars> netRemoteInput_{};
+    std::array<bool, net::kMaxCars> netRemoteFresh_{};
+    std::array<bool, net::kMaxCars> netDrsLatch_{};
+    bool clientDrsLatch_ = false;
+    float clientWingLatch_ = 0.f;
+    std::uint64_t netLastHostSendMs_ = 0;
+    net::INetSession::HostWorld hostWorld_{};
+    std::mutex hostWorldMutex_;
+    bool hostWorldFresh_ = false;
+    double netRenderDelayMs_ = 40.0;
+    // Authoritative race readout used by the client HUD (lap/position/clock).
+    struct NetRaceReadout {
+        bool valid = false;
+        std::uint8_t lap = 0;
+        std::uint8_t position = 0;
+        std::uint8_t phase = 0;
+        std::uint32_t raceClockMs = 0;
+        std::uint8_t carCount = 1;
+    } netReadout_;
 
     IRenderer& renderer_;
     InputSystem& input_;
