@@ -1,13 +1,16 @@
 // --net-selftest: protocol + session checks that run without a network stack
 // and without a window. Exit code 0 = every check passed.
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <vector>
 
 #include "net/discovery.h"
+#include "net/identity.h"
 #include "net/protocol/wire.h"
+#include "net/roster.h"
 #include "net/session.h"
 #include "net/transport.h"
 
@@ -153,12 +156,14 @@ void TestCodec() {
     hello.buildSig = 0xABCD1234u;
     hello.mapHash = 0x11112222u;
     hello.name = "PLAYER1";
+    hello.playerId = apex::MakePlayerId("PLAYER1");
     if (const auto n = EncodeHello(hello, buf)) {
-        Check(*n == 27, "hello encodes to 27 B");
+        Check(*n == 35, "hello encodes to 35 B");
         const auto back = DecodeHello(std::span<const std::byte>(buf.data(), *n));
         if (!back) std::printf("    hello decode err=%d\n", static_cast<int>(back.error()));
         Check(back.has_value() && back->name == "PLAYER1" && back->buildSig == hello.buildSig,
               "hello round-trip");
+        Check(back.has_value() && back->playerId == hello.playerId, "hello carries playerId");
     }
 
     WelcomePacket welcome;
@@ -167,12 +172,41 @@ void TestCodec() {
     welcome.sessionId = 9;
     welcome.rules.laps = 5;
     welcome.mapName = "test_circuit";
+    welcome.playerId = 0x1122334455667788ull;
+    welcome.rules.roster.count = 2;
+    welcome.rules.roster.entries[0].playerId = 0x10;
+    welcome.rules.roster.entries[0].seat = 0;
+    welcome.rules.roster.entries[0].name = "HOST";
+    welcome.rules.roster.entries[1].playerId = 0x20;
+    welcome.rules.roster.entries[1].seat = 1;
+    welcome.rules.roster.entries[1].name = "CLIENT";
     if (const auto n = EncodeWelcome(welcome, buf)) {
-        Check(*n == 60, "welcome encodes to 60 B");
+        Check(*n == 269, "welcome encodes to 269 B (rules carry the roster)");
         const auto back = DecodeWelcome(std::span<const std::byte>(buf.data(), *n));
         Check(back.has_value() && back->slot == 3 && back->rules.laps == 5 &&
                   back->mapName == "test_circuit",
               "welcome round-trip");
+        Check(back.has_value() && back->playerId == welcome.playerId, "welcome carries playerId");
+        Check(back.has_value() && back->rules.roster.count == 2 &&
+                  back->rules.roster.entries[1].seat == 1 &&
+                  back->rules.roster.entries[1].name == "CLIENT" &&
+                  back->rules.roster.entries[1].playerId == 0x20,
+              "welcome carries the roster");
+        Check(!DecodeWelcome(std::span<const std::byte>(buf.data(), *n - 1)).has_value(),
+              "welcome truncation rejected");
+    }
+
+    // Rules + roster in the RaceStart the client seats itself from.
+    RaceStartPacket start;
+    start.startHostTick = 42;
+    start.countdownCs = 350;
+    start.rules = welcome.rules;
+    if (const auto n = EncodeRaceStart(start, buf)) {
+        Check(*n == 219, "race start encodes to 219 B");
+        const auto back = DecodeRaceStart(std::span<const std::byte>(buf.data(), *n));
+        Check(back.has_value() && back->startHostTick == 42 &&
+                  back->rules.roster.entries[0].name == "HOST",
+              "race start round-trip with roster");
     }
 
     AnnouncePacket ad;
@@ -180,11 +214,13 @@ void TestCodec() {
     ad.gamePort = 45998;
     ad.mapName = "test_circuit";
     ad.hostName = "HOST";
+    ad.playerId = 0xDEADBEEFCAFEull;
     if (const auto n = EncodeAnnounce(ad, buf)) {
-        Check(*n == 62, "announce encodes to 62 B");
+        Check(*n == 70, "announce encodes to 70 B");
         const auto back = DecodeAnnounce(std::span<const std::byte>(buf.data(), *n));
         Check(back.has_value() && back->roomCode == 1234 && back->hostName == "HOST",
               "announce round-trip");
+        Check(back.has_value() && back->playerId == ad.playerId, "announce carries playerId");
     }
 
     QueryPacket query;
@@ -202,6 +238,56 @@ void TestCodec() {
           "short peek rejected");
 }
 
+// Identity + seat model: the id must not depend on spelling or spacing, seats
+// must be the rank of the id (so the host is not "car 0" by construction), and a
+// roster hole must not shift anybody onto someone else's grid box.
+void TestIdentityAndSeats() {
+    using namespace apex;
+    using namespace apex::net;
+    std::printf("[identity]\n");
+
+    const PlayerId pilot = MakePlayerId("Pilot");
+    Check(pilot != kInvalidPlayerId, "name hashes to an id");
+    Check(pilot == MakePlayerId("  PILOT "), "id ignores case and surrounding spaces");
+    Check(MakePlayerId("") == kInvalidPlayerId, "empty name has no id");
+    Check(MakePlayerId("pilot", 1) != pilot, "variant salt rehashes to a different id");
+    Check(MakePlayerId("pilot", 1) == MakePlayerId("PILOT", 1), "variant rehash stays stable");
+    Check(TrimPlayerName("  Pi lot  ") == "Pi lot", "display name keeps its spelling");
+
+    // Seats from ids, host included. Arrival slots {1,3} with a hole at 2 must
+    // still produce seats 0 and 1 — dense, and in id order, not slot order.
+    const PlayerId hostId = MakePlayerId("host");
+    const PlayerId aId = MakePlayerId("alpha");
+    const PlayerId bId = MakePlayerId("beta");
+    const RosterCandidate candidates[] = {
+        {.slot = 0, .playerId = hostId, .name = "host"},
+        {.slot = 3, .playerId = bId, .name = "beta"},
+        {.slot = 1, .playerId = aId, .name = "alpha"},
+    };
+    const Roster roster = BuildRoster(candidates);
+    Check(roster.count == 3, "roster seats every candidate");
+    // Sorted by playerId ascending, wherever each one sat in the session.
+    PlayerId sorted[3] = {hostId, aId, bId};
+    std::sort(sorted, sorted + 3);
+    bool orderOk = true;
+    for (int i = 0; i < 3; ++i) {
+        orderOk = orderOk && roster.entries[static_cast<std::size_t>(i)].playerId == sorted[i] &&
+                  roster.entries[static_cast<std::size_t>(i)].seat == i;
+    }
+    Check(orderOk, "seats are dense ranks of playerId (roster hole tolerated)");
+
+    const auto hostSeat = SeatOf(roster, hostId);
+    Check(hostSeat.has_value() && (*hostSeat == 0 || *hostSeat == 1 || *hostSeat == 2),
+          "host is seated like anybody else");
+    Check(SeatOf(roster, MakePlayerId("stranger")) == std::nullopt,
+          "unseated player has no seat");
+
+    // A candidate without an id (hashed off an empty name) is skipped, not
+    // seated on the first box.
+    const RosterCandidate noId[] = {{.slot = 0, .playerId = kInvalidPlayerId, .name = ""}};
+    Check(BuildRoster(noId).count == 0, "nameless candidate is not seated");
+}
+
 void TestSessions() {
     using namespace apex::net;
     std::printf("[session]\n");
@@ -214,6 +300,7 @@ void TestSessions() {
 
     NetConfig hostCfg;
     hostCfg.playerName = "HOST";
+    hostCfg.playerId = apex::MakePlayerId("HOST");
     hostCfg.roomCode = 1234;
     hostCfg.buildSig = 0xAABBCCDD;
     hostCfg.mapHash = 0x11223344;
@@ -222,6 +309,7 @@ void TestSessions() {
 
     NetConfig clientCfg = hostCfg;
     clientCfg.playerName = "CLIENT";
+    clientCfg.playerId = apex::MakePlayerId("CLIENT");
 
     auto host = CreateHostSession(hostCfg, *hostTransport, *hostDiscovery);
     Endpoint ep;
@@ -295,6 +383,46 @@ void TestSessions() {
         Check(snap->hasSelf, "snapshot carries the client's self block");
         Check(snap->appliedInputSeq == 3, "applied input seq reaches the client");
         Check(snap->cars[1].lap == 1 && snap->cars[1].position == 2, "authority race fields");
+    }
+
+    // --- roster freeze: seats, not arrival slots ---------------------------
+    host->SetRules(hostCfg.rules);
+    host->FreezeRoster();
+    const RulesPacket& frozen = host->Rules();
+    Check(frozen.roster.count == 2, "host seats every joined player");
+    const auto clientSeat = apex::net::SeatOf(frozen.roster, clientCfg.playerId);
+    Check(clientSeat.has_value(), "client appears in the frozen roster");
+    host->StartRace(350);
+    stepCollect(4);
+    Check(clientSeat.has_value() && client->LocalSlot() == *clientSeat,
+          "client takes its seat from the roster, not from its arrival slot");
+
+    // Duplicate identity: a second player claiming an id the host already
+    // seated is refused instead of sharing its car.
+    {
+        LoopbackNet net3;
+        auto hostTransport3 = MakeLoopbackTransport(net3, true);
+        auto clientTransport3 = MakeLoopbackTransport(net3, false);
+        auto hostDiscovery3 = MakeNullDiscovery();
+        auto clientDiscovery3 = MakeNullDiscovery();
+        NetConfig dupHost = hostCfg;
+        NetConfig dupClient = hostCfg;   // same name -> same playerId
+        auto host3 = CreateHostSession(dupHost, *hostTransport3, *hostDiscovery3);
+        auto client3 = CreateClientSession(dupClient, *clientTransport3, *clientDiscovery3, ep);
+        bool duplicate = false;
+        for (int i = 0; i < 40; ++i) {
+            now += 16;
+            host3->Tick(now);
+            client3->Tick(now);
+            (void)host3->DrainEvents();
+            for (const SessionEvent& ev : client3->DrainEvents()) {
+                if (ev.kind == SessionEventKind::JoinRejected &&
+                    ev.reason == RejectReason::DuplicatePeer) {
+                    duplicate = true;
+                }
+            }
+        }
+        Check(duplicate, "duplicate playerId rejected");
     }
 
     // Reject path: wrong build signature.
@@ -415,6 +543,7 @@ namespace apex {
 int RunNetSelfTest() {
     std::printf("apex-rush net self-test\n");
     TestCodec();
+    TestIdentityAndSeats();
     TestSessions();
     TestRealSockets();
     if (g_failures == 0) {

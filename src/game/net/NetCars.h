@@ -111,7 +111,9 @@ private:
 
 // Other players are not simulated locally, but they must be solid: a mass-0 box
 // tracked to the interpolated pose makes them block/deflect the local car
-// without ever becoming a second author of their own state.
+// without ever becoming a second author of their own state. Seats are dense
+// (see net/roster.h), so `carCount` + `localSlot` describe the set: every seat
+// gets a proxy except our own, which is a real simulated car.
 class RemoteProxies {
 public:
     void Build(IPhysicsWorld& world, int carCount, std::uint8_t localSlot,
@@ -128,6 +130,7 @@ private:
         bool placed = false;
     };
     std::array<Proxy, net::kMaxCars> proxies_{};
+    std::uint8_t localSlot_ = 0;
     bool enabled_ = true;
 };
 

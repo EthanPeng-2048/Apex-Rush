@@ -119,6 +119,15 @@ CS2 对照：服务器权威 / 客户端预测自身移动 / 其他玩家插值 
 
 `RacePhase` 只新增一个 `Lan`；联机期 `phase_/phaseTimer_/raceClock_` 只有主机写；比赛期禁暂停（ESC = 离开确认）；重开仅主机；结束条件 = 全员完赛或主机终止；Racing 期 `Hello` 拒绝；断线标 `RETIRED` 不阻塞结束。
 
+### 7.1 身份与座位
+
+- **玩家身份**：`PlayerId = FNV-1a 64(规范化名字)`（`src/net/identity.h`）。名字来源优先级：`--player` > `[net] player_name` > 本机登录页（引擎 `TextField`）> 角色默认名（`HOST` / `PLAYER-<n>`，无人值守路径用）。
+- **座位**：`seat` = 花名册按 `playerId` 升序的序号（`src/net/roster.*`），**主机也只是一个 seat**。开赛时主机 `FreezeRoster()` 算一次并随 `rules` 下发；会话槽位同时重编号为 seat，于是快照自车块 / `appliedInputSeq` / 输入投递 / `RacerBySlot()` 共用一套编号。
+- **车与座位绑定**：`Racer{playerId, seat}`；`LocalRacer()` / `LocalSeat()` 是所有 HUD / 相机 / 音频 / 输入 / 预测 / 结束判定的唯一入口（离线 seat = 0）；`GridPose(track, racer)` 是唯一的格位公式（出生、Enter 重置、联机 RaceStarted 重置都走它）。
+- **槽位空洞**：只可能来自"开赛前有人退出"（如 {1,3}）。座位只按 `playerId` 排序生成，空洞不会把谁挤到别人的格位；远端输入按 slot 投递并容忍空洞。
+- **冲突**：规范化同名（或哈希碰撞）→ 主机 `Reject(DuplicatePeer)`，不自动改名；需要换 id 的一方用 `MakePlayerId(name, variant)` 追加 `#<n>` 盐重哈希。
+- **物理一致性**：客户端用主机 `rules` 覆盖赛季门控（含 ERS 位）、辅助等级与伤害开关，避免两个赛季的物理同场。
+
 ---
 
 ## 8. 异常（只留必要的）
@@ -145,8 +154,7 @@ A1 满房 60 s 无掉线 · A2 `RaceEnd` 逐字段一致 · A3 带宽 ≤15 / �
 | # | 位置 | 改动 |
 |---|---|---|
 | 0 | `rush-engine/modules/physics.cppm` | **M0**：`VehicleSnapshotState` + `SaveState/RestoreState`（纯增量） |
-| 1 | `Game.h:34-49` `Racer` | 加 `kind`（Local/Remote） |
-| 2 | `Game::Init`（`Game.cpp:187-205`） | 按角色建会话；客户端建世界、只 spawn 自己的车 |
+| 1 | `Game.h:34-49` `Racer` | 加 `kind`（Local/Remote） || 2 | `Game::Init`（`Game.cpp:187-205`） | 按角色建会话；客户端建世界、只 spawn 自己的车 |
 | 3 | `Game::Update`（`Game.cpp:435-514`） | `net.Poll` → 输入 → `SubmitLocalInput` → 相位 → `CopyFront` |
 | 4 | `Game::UpdateSim`（`Game.cpp:524-569`） | 每 tick 预测自车；远端代理体跟随插值位姿 |
 | 5 | `ApplyPlayerIntent`（`Game.cpp:729-798`） | 抽 `ApplyInputMapping()`，两端共用 |

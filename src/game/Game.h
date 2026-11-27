@@ -12,6 +12,7 @@ import rush.engine.core;
 #include "game/Track.h"
 #include "game/net/NetCars.h"
 #include "net/discovery.h"
+#include "net/identity.h"
 #include "net/session.h"
 #include "net/transport.h"
 import rush.engine.physics;
@@ -43,6 +44,11 @@ struct Racer {
     Vehicle vehicle;
     CarInput input;
     std::string name;
+    // LAN identity. `playerId` is hashed from the player's name (net/identity.h)
+    // and `seat` is that id's rank in the frozen roster — also the grid slot.
+    // Offline there is no roster, so the seat is simply the spawn index.
+    PlayerId playerId = kInvalidPlayerId;
+    int seat = 0;
     bool isPlayer = false;
     int lap = 0;
     float lapDistance = 0.f;
@@ -56,6 +62,12 @@ struct Racer {
     bool finished = false;
 };
 
+// The only starting-pose formula in the game: the grid box for a racer's seat.
+// Spawning, the Enter restart, the LAN RaceStarted reset and the host's track
+// rebuild all come through here, so a car can never be dropped on a box that
+// belongs to someone else.
+Transform GridPose(const Track& track, const Racer& racer);
+
 // Owns the world, track, racers and UI. One instance per running game.
 class Game {
 public:
@@ -63,8 +75,9 @@ public:
     enum class NetRole { Offline, Host, Client };
     // LAN screen sub-state (all under RacePhase::Lan).
     // RoomCode is the shared room-code editor: HOST and JOIN both enter it and
-    // the role only decides what a confirmed code does.
-    enum class LanUi { Root, RoomCode, RoomList, Lobby, Message };
+    // the role only decides what a confirmed code does. NameEntry is the login
+    // screen that runs before any of them.
+    enum class LanUi { Root, RoomCode, RoomList, Lobby, Message, NameEntry };
     // Which role a confirmed room code launches.
     enum class LanRole { None, Host, Join };
 
@@ -97,9 +110,31 @@ public:
     // --net-host / --net-join; no menu interaction).
     bool AutoHost(std::uint16_t roomCode);
     bool AutoJoin(std::uint16_t roomCode, const std::string& hostIp);
+    // Highest-priority player name (CLI --player). Empty = not given.
+    void SetPlayerName(const std::string& name) { playerNameCli_ = name; }
+
+    // This machine's own car. Every HUD / camera / audio / input / prediction
+    // path goes through it: with a roster the local player is not necessarily
+    // racers_[0] (the host included).
+    Racer& LocalRacer();
+    const Racer& LocalRacer() const;
+    // Seat of this machine's player (offline = 0).
+    int LocalSeat() const {
+        return netRole_ == NetRole::Offline
+                   ? 0
+                   : static_cast<int>(netLocalSeat_.load(std::memory_order_relaxed));
+    }
+    // Single lookup entry for a seat, tolerant of roster holes and of the grid
+    // not existing yet (nullptr).
+    Racer* RacerBySlot(std::uint8_t seat);
+    // Grid box for `racer` under this track (see GridPose).
+    Transform GridPose(const Racer& racer) const;
+    // Park one car on its own grid box and clear everything the race owns.
+    void ResetRacerForStart(Racer& racer);
+    void ResetGridForStart();
 
     // Introspection for tests and (later) the network layer.
-    const VehicleState& PlayerState() const { return racers_.front().vehicle.State(); }
+    const VehicleState& PlayerState() const { return LocalRacer().vehicle.State(); }
     const std::vector<Racer>& Racers() const { return racers_; }
     RacePhase Phase() const { return phase_; }
     float RaceClock() const { return raceClock_; }
@@ -168,6 +203,8 @@ public:
     };
     struct RaceSnapshot {
         std::vector<CarPose> cars;
+        // Index into `cars` of this machine's own car (see LocalRacer).
+        int localIndex = 0;
         RacePhase phase = RacePhase::Menu;
         float raceClock = 0.f;
         bool valid = false;
@@ -197,8 +234,13 @@ private:
         // [physics] engine: "qu3e" | "nudge" | "rpc" (Rush Physics Core).
         std::string engine = "qu3e";
         int carCount = 4;
-        // LAN: grid slot offset (client sits on its own slot; host at 0).
-        int gridOffset = 0;
+        // LAN grid: the frozen roster (empty offline). When set, cars are built
+        // from seats instead of `carCount` synthetic AI entries, and `lanClient`
+        // spawns only the local player's car.
+        net::Roster roster{};
+        bool lanClient = false;
+        int localSeat = 0;
+        PlayerId localPlayerId = kInvalidPlayerId;
         bool damage = true;
         AssistLevel absLevel = AssistLevel::Sport;
         AssistLevel tcLevel = AssistLevel::Sport;
@@ -259,12 +301,23 @@ private:
     // --- LAN -----------------------------------------------------------------
     void UpdateLan();
     void RenderLan();
+    // Name entry (lanUi_ == LanUi::NameEntry). The screen itself lives in
+    // screens_.lanName like every other screen; these only open it and handle
+    // the action it reports.
+    void EnterLanNameEntry();
+    void UpdateLanNameEntry();
+    // Name used for this session: --player > [net] player_name > the name typed
+    // on the login screen. Empty means "nobody chose one yet".
+    std::string ChosenPlayerName() const;
+    // ChosenPlayerName(), else a role default (HOST / PLAYER-<n>) so unattended
+    // runs never need the login screen.
+    std::string EffectivePlayerName(bool host) const;
     void LanStartHost(std::uint16_t roomCode);
     void LanStartClient(std::uint16_t roomCode, const net::Endpoint& host);
     void LanStop(const std::string& message);
     void LanTick();                       // discovery + session pump + events
     void LanHandleEvents();
-    void LanRequestRaceLoad();            // host: build the race for N players
+    void LanRequestRaceLoad();            // host: freeze the roster + build the race
     void LanBeginClientRace();            // client: enter the race on RaceStart
     void LanApplyRemoteInputs();          // host sim thread
     void LanClientSimTick(float frameDt); // client sim thread (own car + proxies)
@@ -273,6 +326,12 @@ private:
     net::InputSample LanSampleLocalInput();    // main thread: InputState -> wire sample
     void LanApplySessionToRacer(std::uint8_t slot);           // HUD mirrors
     double LanRenderTimeMs() const;
+    // Client seat/car count from the host's frozen roster; copies the rules that
+    // decide the physics (season gates, assists, damage) so both ends simulate
+    // the same car.
+    void ApplyHostRules(const net::RulesPacket& rules);
+    // Host: local config + season gates -> the rules clients must run.
+    void FillHostRules(net::RulesPacket& rules) const;
 
     NetRole netRole_ = NetRole::Offline;
     LanUi lanUi_ = LanUi::Root;
@@ -290,7 +349,9 @@ private:
 
     std::uint32_t localTick_ = 0;
     std::uint32_t hostTick_ = 0;
-    std::uint8_t netLocalSlot_ = 0;
+    // Seat of this machine's player. Written by the handshake events on the main
+    // thread and read by the sim thread (LocalRacer), hence atomic.
+    std::atomic<std::uint8_t> netLocalSeat_{0};
     std::uint8_t netPressDrsSeen_ = 0;
     std::uint8_t netPressWingSeen_ = 0;
     std::array<std::uint8_t, net::kMaxCars> lastDrsPress_{};
@@ -306,6 +367,20 @@ private:
     std::array<net::LobbyPlayer, net::kMaxCars> netLobby_{};
     std::uint8_t netLobbyCount_ = 0;
     std::uint8_t netCarCount_ = 1;
+    net::Roster netRoster_{};   // frozen at race start, shared by both roles
+
+    // Player names, in resolution order (see ChosenPlayerName).
+    std::string playerNameCli_;     // --player
+    std::string lanPlayerName_;     // typed on the login screen
+    int lanJoinOrdinal_ = 0;        // PLAYER-<n> default for unattended joins
+    // Identity of this machine's player, hashed once when the LAN session opens.
+    PlayerId localPlayerId_ = kInvalidPlayerId;
+
+    // Client-side copy of the host's rules. They decide the physics (season
+    // gates, assists, damage) and the seat layout, so a client on a different
+    // local config still drives the host's car.
+    bool netRulesLocked_ = false;
+    net::RulesPacket netRules_{};
     // Remote inputs are received on the main thread and consumed by the sim
     // thread (same mailbox pattern as PlayerIntent).
     std::mutex netInputMutex_;
@@ -436,6 +511,7 @@ private:
         UiScreen lanRooms;  // discovered rooms: rows change with the LAN
         UiScreen lanLobby;
         UiScreen lanMessage;
+        UiScreen lanName;   // login: one text field, nothing else fits beside it
     };
     UiScreens screens_;
     UiController ui_;
