@@ -21,6 +21,7 @@ import rush.engine.job;
 import rush.engine.physics;
 import rush.engine.render;
 import rush.engine.input;
+import rush.engine.ui;
 
 namespace {
 
@@ -1188,9 +1189,9 @@ int RunSeasonGateTest(IPhysicsWorld& world) {
     // a DRS zone with a stale request.
     {
         VehicleParams params;
-        params.drsEnabled = false;
-        params.activeAeroEnabled = true;
-        params.overtakeEnabled = true;
+        params.capabilities = CapabilityBit(VehicleCapability::ActiveAero) |
+                              CapabilityBit(VehicleCapability::Overtake) |
+                              CapabilityBit(VehicleCapability::Ers);
         Vehicle car = spawn(params);
 
         CarInput drs;
@@ -1955,6 +1956,109 @@ int RunBench(Config& config, int cars, const char* engine, double raceSeconds, i
 
 }  // namespace
 
+// `apex-rush --ui-selftest`: windowless verification of the engine control
+// layer (rush.engine.ui). Covers focus movement over static rows, activation,
+// value/digit editing, text entry, Back, and drawing through the null backend.
+// This is the gate for "controls live in the engine" — the game only builds
+// screens and reacts to UiAction, so the resolution rules are testable here.
+int RunUiSelfTest() {
+    int failures = 0;
+    auto check = [&](bool ok, const char* what) {
+        std::printf("  %s %s\n", ok ? "ok  " : "FAIL", what);
+        if (!ok) ++failures;
+    };
+
+    UiController ui;
+    UiScreen screen;
+    screen.title = "SELFTEST";
+    screen.widgets = {
+        {.kind = UiKind::Header, .label = "HEADER"},
+        {.kind = UiKind::Button, .id = "start", .label = "START"},
+        {.kind = UiKind::Value, .id = "laps", .label = "LAPS", .value = "3"},
+        {.kind = UiKind::Digits, .id = "code", .label = "CODE", .value = "0042", .digits = 4},
+    };
+
+    UiController::ResetFocus(screen);
+    check(screen.cursor == 1, "focus skips non-focusable rows");
+
+    InputState down;
+    down.menuDown = true;
+    ui.Update(screen, down);
+    check(screen.cursor == 2, "down moves to the value row");
+
+    InputState left;
+    left.menuLeft = true;
+    UiAction action = ui.Update(screen, left);
+    check(action.kind == UiActionKind::AdjustLeft && action.id == "laps" && action.delta == -1,
+          "value row reports AdjustLeft with its id");
+
+    InputState ontoDigits;
+    ontoDigits.menuDown = true;
+    ui.Update(screen, ontoDigits);
+    check(screen.cursor == 3, "down moves onto the digit wheel");
+
+    InputState pickDigit;
+    pickDigit.menuRight = true;
+    ui.Update(screen, pickDigit);
+    InputState bumpDigit;
+    bumpDigit.menuUp = true;
+    action = ui.Update(screen, bumpDigit);
+    check(screen.widgets[3].subCursor == 1 && screen.widgets[3].value == "0142" &&
+              action.kind == UiActionKind::AdjustRight && action.delta == 1,
+          "digit wheel: right picks a digit, up changes it");
+
+    InputState select;
+    select.menuSelect = true;
+    action = ui.Update(screen, select);
+    check(action.kind == UiActionKind::Activate && action.id == "code", "enter activates the row");
+
+    // Text field: typing, backspace, Enter, Escape.
+    UiScreen nameScreen;
+    nameScreen.title = "NAME";
+    nameScreen.widgets = {{.kind = UiKind::TextField, .id = "name", .label = "NAME", .digits = 8}};
+    UiController::ResetFocus(nameScreen);
+
+    InputState typing;
+    std::strcpy(typing.text, "Pilot");
+    typing.textLen = 5;
+    action = ui.Update(nameScreen, typing);
+    check(action.kind == UiActionKind::TextChanged && nameScreen.widgets[0].value == "Pilot",
+          "text field appends typed text");
+
+    InputState backspace;
+    backspace.textBackspace = true;
+    ui.Update(nameScreen, backspace);
+    check(nameScreen.widgets[0].value == "Pilo", "backspace deletes the last byte");
+
+    InputState tooLong;
+    std::strcpy(tooLong.text, "ABCDEFGH");
+    tooLong.textLen = 8;
+    ui.Update(nameScreen, tooLong);
+    check(nameScreen.widgets[0].value.size() == 8, "text field honours its byte cap");
+
+    InputState enter;
+    enter.menuSelect = true;
+    action = ui.Update(nameScreen, enter);
+    check(action.kind == UiActionKind::Activate && action.id == "name",
+          "enter activates the text field");
+
+    InputState escape;
+    escape.menuBack = true;
+    action = ui.Update(nameScreen, escape);
+    check(action.kind == UiActionKind::Back, "escape reports Back");
+
+    // Drawing must not crash without a window.
+    NullBackend renderer;
+    if (renderer.Init(1280, 720, "ui-selftest")) {
+        ui.Draw(screen, renderer);
+        ui.Draw(nameScreen, renderer);
+        check(true, "draw runs on the null backend");
+    }
+
+    std::printf("ui-selftest: %s (%d failures)\n", failures == 0 ? "OK" : "FAILED", failures);
+    return failures == 0 ? 0 : 1;
+}
+
 // `apex-rush --stress [cars] [hz] [seconds]`: collision stress run. Collapses
 // the whole grid into one spot at speed (what a mid-pack pile-up does) and
 // reports frame cost plus any body that went non-finite or ran away, so
@@ -2078,6 +2182,7 @@ int main(int argc, char** argv) {
     double stressSeconds = 20.0;
     const char* stressEngine = "rpc";
     bool netSelfTest = false;
+    bool uiSelfTest = false;
     bool netAuto = false;
     int netSeconds = 0;
     int netHostCode = -1;
@@ -2086,6 +2191,8 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--net-selftest") == 0) {
             netSelfTest = true;
+        } else if (std::strcmp(argv[i], "--ui-selftest") == 0) {
+            uiSelfTest = true;
         } else if (std::strcmp(argv[i], "--net-auto") == 0) {
             netAuto = true;
         } else if (std::strcmp(argv[i], "--net-seconds") == 0 && i + 1 < argc) {
@@ -2161,6 +2268,9 @@ int main(int argc, char** argv) {
     // has no pthreads in our build (no COOP/COEP) — always serial there.
     if (netSelfTest) {
         return RunNetSelfTest();
+    }
+    if (uiSelfTest) {
+        return RunUiSelfTest();
     }
     if (driveTest) {
         rush::JobSystem::Get().Configure(0);

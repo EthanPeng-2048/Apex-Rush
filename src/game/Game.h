@@ -202,6 +202,7 @@ private:
         bool seasonDrs = true;
         bool seasonAero = false;
         bool seasonOverride = false;
+        bool seasonErs = false;
     };
     // Staging result: built off-thread, applied on the main thread in one
     // swap (meshes are the only half that needs the renderer).
@@ -375,6 +376,9 @@ private:
     bool seasonDrs_ = true;
     bool seasonAero_ = false;
     bool seasonOverride_ = false;
+    // ERS is its own gate: the 2026 preset turns it on with overtake, but a
+    // user can decouple them via [season] ers without touching the preset.
+    bool seasonErs_ = false;
 
     // Menu / settings state.
     InputState rawInput_;

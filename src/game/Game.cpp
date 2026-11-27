@@ -234,10 +234,13 @@ void Game::LoadSettings() {
     }
 
     // Season feature gates: classic (DRS) vs 2026 (active aero + override).
-    // Defaults = classic 2025 preset (DRS on, the 2026 systems off).
+    // Defaults = classic 2025 preset (DRS on, the 2026 systems off). ERS is a
+    // power-unit feature: it follows the overtake gate unless [season] ers
+    // says otherwise, so a server can run a hybrid without the shift boost.
     seasonDrs_ = config_.GetBool("season", "drs", true);
     seasonAero_ = config_.GetBool("season", "active_aero", false);
     seasonOverride_ = config_.GetBool("season", "overtake", false);
+    seasonErs_ = config_.GetBool("season", "ers", seasonOverride_);
 }
 
 // Fill a fresh racer list from a config snapshot. Static so the async build
@@ -271,10 +274,14 @@ void Game::SpawnRacersInto(std::vector<Racer>& out, const Track& track, IPhysics
             params.controls.steerLevel = AssistLevel::Full;
         }
         params.damageEnabled = cfg.damage;
-        // Season rules apply to every car (player and AI alike).
-        params.drsEnabled = cfg.seasonDrs;
-        params.activeAeroEnabled = cfg.seasonAero;
-        params.overtakeEnabled = cfg.seasonOverride;
+        // Fitted features are a build property of the car (see
+        // VehicleCapability): the vehicle gates activation itself, so a stale
+        // input can never leak a system that is not on the car.
+        params.capabilities = 0u;
+        if (cfg.seasonDrs) params.capabilities |= VehicleCapability::Drs;
+        if (cfg.seasonAero) params.capabilities |= VehicleCapability::ActiveAero;
+        if (cfg.seasonOverride) params.capabilities |= VehicleCapability::Overtake;
+        if (cfg.seasonErs) params.capabilities |= VehicleCapability::Ers;
 
         Transform pose;
         pose.position = track.StartPosition(i + cfg.gridOffset);
@@ -305,6 +312,7 @@ Game::RaceBuildConfig Game::MakeRaceBuildConfig() {
     cfg.seasonDrs = seasonDrs_;
     cfg.seasonAero = seasonAero_;
     cfg.seasonOverride = seasonOverride_;
+    cfg.seasonErs = seasonErs_;
     return cfg;
 }
 
