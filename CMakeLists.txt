@@ -141,6 +141,9 @@ if(WIN32)
 endif()
 
 # --- Web (Emscripten) ---------------------------------------------------------
+# APEX_PACK_SINGLE_HTML (web-single preset): -sSINGLE_FILE=1 embeds JS/WASM;
+# post-build packs .data + FileSaver into dist/apex-rush-single.html.
+option(APEX_PACK_SINGLE_HTML "After web link, pack offline single-file HTML" OFF)
 if(EMSCRIPTEN)
     target_link_options(apex-rush PRIVATE
         -sASYNCIFY
@@ -152,4 +155,14 @@ if(EMSCRIPTEN)
         --preload-file ${CMAKE_SOURCE_DIR}/assets/maps@/assets/maps
     )
     set_target_properties(apex-rush PROPERTIES SUFFIX ".html")
+    if(APEX_PACK_SINGLE_HTML)
+        add_custom_command(TARGET apex-rush POST_BUILD
+            COMMAND ${POWERSHELL_EXE} -NoProfile -ExecutionPolicy Bypass
+                -File ${CMAKE_SOURCE_DIR}/tools/pack-single-html.ps1
+                -BuildDir ${CMAKE_BINARY_DIR}
+                -OutFile ${CMAKE_SOURCE_DIR}/dist/apex-rush-single.html
+            COMMENT "Packing dist/apex-rush-single.html"
+            VERBATIM
+        )
+    endif()
 endif()

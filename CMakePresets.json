@@ -52,7 +52,18 @@
       "toolchainFile": "$env{EMSDK}/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "APEX_BUILD_TOOLS": "OFF"
+        "APEX_BUILD_TOOLS": "OFF",
+        "PLATFORM": "Web"
+      }
+    },
+    {
+      "name": "web-single",
+      "displayName": "Emscripten single-file HTML (offline dist/)",
+      "inherits": "web",
+      "binaryDir": "${sourceDir}/build-web-single",
+      "cacheVariables": {
+        "CMAKE_EXE_LINKER_FLAGS": "-sSINGLE_FILE=1",
+        "APEX_PACK_SINGLE_HTML": "ON"
       }
     }
   ],
@@ -61,7 +72,8 @@
     { "name": "release-static", "configurePreset": "release-static", "jobs": 32 },
     { "name": "debug", "configurePreset": "debug", "jobs": 32 },
     { "name": "debug-tools", "configurePreset": "debug-tools", "jobs": 32 },
-    { "name": "web", "configurePreset": "web", "jobs": 32 }
+    { "name": "web", "configurePreset": "web", "jobs": 32 },
+    { "name": "web-single", "configurePreset": "web-single", "jobs": 32 }
   ],
   "testPresets": [
     {

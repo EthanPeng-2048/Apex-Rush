@@ -30,9 +30,13 @@ build\apex-rush.exe --bench 100     # 百车分段计时
 # Web / WASM（先 source emsdk_env）
 cmake --preset web
 cmake --build --preset web
+
+# 单文件离线 HTML（SINGLE_FILE + 内嵌 data/FileSaver → dist/apex-rush-single.html）
+cmake --preset web-single
+cmake --build --preset web-single
 ```
 
-产物：`build/apex-rush.exe`（`release-static` 出到 `build-static/apex-rush.exe`，只依赖 Windows 自带 DLL）。配置与本机设置写在 EXE 同级 `config.rushconf`（KVRec；`config.ini` 已废弃）。
+产物：`build/apex-rush.exe`（`release-static` 出到 `build-static/apex-rush.exe`，只依赖 Windows 自带 DLL）。配置与本机设置写在 EXE 同级 `config.rushconf`（KVRec；`config.ini` 已废弃）。Web 多文件在 `build-web/`；单文件离线包在 `dist/apex-rush-single.html`（构建后自动调用 `tools/pack-single-html.ps1`）。
 
 ---
 
