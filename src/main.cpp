@@ -1147,10 +1147,10 @@ int RunSeasonGateTest(IPhysicsWorld& world) {
     };
 
     const float dt = 1.f / 240.f;
-    auto spawn = [&](const VehicleParams& params) {
+    auto spawn = [&](const VehicleParams& params, float x = 0.f) {
         Vehicle car;
         Transform pose;
-        pose.position = {0.f, 0.55f, 0.f};
+        pose.position = {x, 0.55f, 0.f};
         car.Spawn(world, pose, params);
         for (int i = 0; i < 60; ++i) {  // settle on the suspension
             car.Update(CarInput{}, dt);
@@ -1222,10 +1222,168 @@ int RunSeasonGateTest(IPhysicsWorld& world) {
               car.State().ersDeploying ? 1.f : 0.f, 1.f);
     }
 
+    // ERS is a fitted part, not a rule flag: a car without the Ers bit has no
+    // store at all, so braking must leave it empty. A classic-season car used
+    // to regrow charge (and a HUD bar) it had no hardware for.
+    {
+        auto chargeAfterBraking = [&](std::uint8_t caps, float x) {
+            VehicleParams params;
+            params.capabilities = caps;
+            // Clear of the cars spawned above: this world keeps them alive, and
+            // a car wedged against another never gets moving (the regen window
+            // needs speed).
+            Vehicle car = spawn(params, x);
+            CarInput gas;
+            gas.throttle = 1.f;
+            step(car, gas, 4.f);
+            const float speed = car.State().speed;
+            CarInput brake;
+            brake.brake = 0.6f;
+            const float before = car.State().ersCharge;
+            // Short brake window: regen needs speed > 8 m/s, so a full stop
+            // would hide it rather than measure it.
+            step(car, brake, 0.4f);
+            return std::array<float, 3>{before, car.State().ersCharge, speed};
+        };
+        const auto bare = chargeAfterBraking(CapabilityBit(VehicleCapability::Drs), 120.f);
+        check(bare[0] == 0.f, "ers: car without the Ers part starts empty", bare[0], 0.f);
+        check(bare[1] == 0.f, "ers: car without the Ers part never regenerates", bare[1], 0.f);
+
+        const auto fitted = chargeAfterBraking(CapabilityBit(VehicleCapability::Drs) |
+                                               CapabilityBit(VehicleCapability::Ers), 160.f);
+        check(fitted[2] > 8.f, "ers: regen case reaches the regen speed window", fitted[2], 8.f);
+        check(fitted[1] > fitted[0], "ers: fitted car regenerates under braking", fitted[1],
+              fitted[0]);
+    }
+
     return failures;
 }
 
-// `apex-rush --drive-test`: headless physics/controls verification. Drives the
+// Suspension travel limit (the 300 km/h corner/brake sink-through). Two
+// properties, because the bug was a chain: a force clamp at the travel limit
+// (so load could out-run support and the body sank), and a buried hardpoint
+// reported as airborne (so the sunken car free-fell instead of being pushed
+// back out).
+int RunSuspensionLimitTest(IPhysicsWorld& world) {
+    world.SetGravity({0.f, -9.81f, 0.f});
+
+    BodyDesc ground;
+    ground.transform.position = {0.f, -1.f, 0.f};
+    ground.halfExtents = {2000.f, 1.f, 2000.f};
+    ground.friction = 0.9f;
+    ground.userData = SurfaceTag(SurfaceType::Road);
+    (void)world.CreateBody(ground);
+
+    int failures = 0;
+    auto check = [&failures](bool ok, const char* what, float got, float want) {
+        std::printf("[%s] %s (got %.2f, target %.2f)\n", ok ? "PASS" : "FAIL", what, got, want);
+        if (!ok) ++failures;
+    };
+
+    // (a) The spring law itself: force must keep growing past the travel limit
+    // and stay continuous where the bump stop takes over. A clamp here is the
+    // whole bug, so it is cheaper to pin the curve than to reproduce the sink.
+    {
+        SuspensionParams sp;
+        const float k = 38000.f;
+        const float atLimit = sp.SpringForce(sp.suspensionMaxTravel, k);
+        const float halfway = sp.SpringForce(sp.suspensionMaxTravel + sp.bumpStopTravel * 0.5f, k);
+        const float atStop = sp.SpringForce(sp.CompressionLimit(), k);
+        check(atLimit > k * sp.suspensionMaxTravel - 1.f, "suspension: force at the travel limit",
+              atLimit, k * sp.suspensionMaxTravel);
+        check(halfway > atLimit * 1.2f, "suspension: force keeps rising into the bump stop",
+              halfway, atLimit * 1.2f);
+        check(atStop > atLimit * 1.4f, "suspension: force at the end of the bump stop", atStop,
+              atLimit * 1.4f);
+        const float justBefore = sp.SpringForce(sp.suspensionMaxTravel - 1e-6f, k);
+        check(std::fabs(justBefore - atLimit) < 1.f, "suspension: force is continuous at the limit",
+              justBefore, atLimit);
+        check(sp.RayLength(0.33f) > sp.suspensionRestLength + sp.CompressionLimit() + 0.32f,
+              "suspension: ray covers the whole strut travel", sp.RayLength(0.33f),
+              sp.suspensionRestLength + sp.CompressionLimit() + 0.33f);
+    }
+
+    // (b) The reported failure, modelled directly: hold the aerodynamic load a
+    // 300 km/h car carries (~30 kN against 7.4 kN of weight) and the body must
+    // stay on its struts. With the old force clamp the corners saturated and
+    // the body sank until the chassis was inside the road.
+    {
+        const float dt = 1.f / 240.f;
+        VehicleParams params;
+        Vehicle car;
+        Transform pose;
+        pose.position = {0.f, 0.55f, 0.f};
+        car.Spawn(world, pose, params);
+        for (int i = 0; i < 60; ++i) {   // settle on the suspension
+            car.Update(CarInput{}, dt);
+            world.Step(dt);
+        }
+        const float settledY = car.State().transform.position.y;
+
+        float minY = settledY;
+        int minGrounded = 4;
+        for (int i = 0; i < 480; ++i) {   // 2 s under load
+            (void)world.ApplyForce(car.Chassis(), Vec3{0.f, -30000.f, 0.f},
+                                   car.State().transform.position);
+            car.Update(CarInput{}, dt);
+            world.Step(dt);
+            const VehicleState& s = car.State();
+            minY = std::min(minY, s.transform.position.y);
+            int grounded = 0;
+            for (int k = 0; k < 4; ++k) {
+                if (s.wheels[k].grounded) ++grounded;
+            }
+            minGrounded = std::min(minGrounded, grounded);
+        }
+        // Travel limit 0.22 m below the 0.44 m static height: a body that stays
+        // above 0.20 m never pushed its chassis into the road (without the bump
+        // stop the same load keeps sinking it to road level).
+        check(minY > 0.20f, "suspension: body does not sink under 300 km/h downforce", minY, 0.20f);
+        check(minGrounded == 4, "suspension: all four wheels stay grounded under load",
+              static_cast<float>(minGrounded), 4.f);
+    }
+
+    // (c) Ray contract: a hardpoint that starts inside the road is a bottomed
+    // out strut, not a wheel in the air. Reported as a miss, all four corners
+    // go airborne at once and the car falls through the slab.
+    {
+        const float dt = 1.f / 240.f;
+        VehicleParams params;
+        Vehicle car;
+        Transform pose;
+        pose.position = {0.f, 0.55f, 0.f};
+        car.Spawn(world, pose, params);
+        for (int i = 0; i < 60; ++i) {
+            car.Update(CarInput{}, dt);
+            world.Step(dt);
+        }
+
+        Transform buried = pose;
+        buried.position = {200.f, 0.55f, 0.f};   // clear of the car above
+        Vehicle carB;
+        carB.Spawn(world, buried, params);
+        for (int i = 0; i < 60; ++i) {
+            carB.Update(CarInput{}, dt);
+            world.Step(dt);
+        }
+
+        buried.position = {200.f, -0.12f, 0.f};   // hardpoints inside the road box
+        (void)world.SetTransform(carB.Chassis(), buried);
+        (void)world.SetLinearVelocity(carB.Chassis(), Vec3{});
+        carB.Update(CarInput{}, dt);
+        world.Step(dt);
+
+        int grounded = 0;
+        for (int i = 0; i < 4; ++i) {
+            if (carB.State().wheels[i].grounded) ++grounded;
+        }
+        check(grounded == 4, "suspension: buried hardpoints still report ground contact",
+              static_cast<float>(grounded), 4.f);
+    }
+
+    return failures;
+}
+
 // player car with scripted input and asserts acceleration, braking, steering
 // and reverse. Exits 0 on success, 1 on failure. No window is created, so it
 // runs on locked sessions and in CI. The full suite runs once per physics
@@ -1501,6 +1659,12 @@ int RunDriveTestForEngine(Config& config, const char* engine) {
     {
         std::unique_ptr<IPhysicsWorld> frictionWorld = MakeWorld(engine);
         failures += RunFrictionRaycastTest(*frictionWorld);
+    }
+
+    // 5e) Suspension travel limit + buried-ray contract.
+    {
+        std::unique_ptr<IPhysicsWorld> limitWorld = MakeWorld(engine);
+        failures += RunSuspensionLimitTest(*limitWorld);
     }
 
     // 6) Menu / settings flow (headless, backend-agnostic).
