@@ -7,6 +7,8 @@
 #include <atomic>
 #include <cstring>
 
+#include "net/roster.h"
+
 namespace apex::net {
 namespace {
 
@@ -21,12 +23,20 @@ std::vector<std::byte> EncodeToBuffer(auto&& encoder) {
     return out;
 }
 
+// The id is what seats a player, so it must exist before the first Hello: a
+// caller that only supplied a name gets the id hashed from it.
+NetConfig ResolveIdentity(const NetConfig& cfg) {
+    NetConfig out = cfg;
+    if (out.playerId == kInvalidPlayerId) out.playerId = MakePlayerId(out.playerName);
+    return out;
+}
+
 // --------------------------------------------------------------- host ------
 
 class HostSession final : public INetSession {
 public:
     HostSession(const NetConfig& cfg, ITransport& transport, IRoomDiscovery& discovery)
-        : cfg_(cfg), transport_(transport), discovery_(discovery) {
+        : cfg_(ResolveIdentity(cfg)), transport_(transport), discovery_(discovery) {
         for (auto& seq : appliedSeq_) seq.store(0);
     }
 
@@ -49,6 +59,7 @@ public:
         ad.players = 1;
         ad.maxPlayers = static_cast<std::uint8_t>(cfg_.maxPlayers);
         ad.phase = 0;
+        ad.playerId = cfg_.playerId;
         (void)discovery_.Advertise(ad);
         state_ = SessionState::Advertising;
     }
@@ -82,7 +93,8 @@ public:
 
     SessionState State() const override { return state_; }
     bool IsHost() const override { return true; }
-    std::uint8_t LocalSlot() const override { return 0; }
+    std::uint8_t LocalSlot() const override { return localSlot_; }
+    const RulesPacket& Rules() const override { return cfg_.rules; }
 
     void PublishSnapshot(const HostWorld& world) override {
         world_ = world;
@@ -94,6 +106,36 @@ public:
     }
 
     void SetRules(const RulesPacket& rules) override { cfg_.rules = rules; }
+
+    void FreezeRoster() override {
+        // The roster is the identity of the race: seats are ranks of playerId,
+        // not arrival order, so a slot hole (someone left before the start)
+        // can never shift a car onto another player's grid box.
+        std::vector<RosterCandidate> candidates;
+        candidates.reserve(peers_.size() + 1);
+        RosterCandidate host;
+        host.slot = localSlot_;
+        host.playerId = cfg_.playerId;
+        host.name = cfg_.playerName;
+        candidates.push_back(host);
+        for (const PeerSlot& peer : peers_) {
+            RosterCandidate candidate;
+            candidate.slot = peer.slot;
+            candidate.playerId = peer.playerId;
+            candidate.name = peer.name;
+            candidates.push_back(candidate);
+        }
+        cfg_.rules.roster = BuildRoster(candidates);
+        cfg_.rules.carCount = cfg_.rules.roster.count;
+
+        // From here on a peer's slot *is* its seat, so the snapshot self block,
+        // appliedInputSeq and the host's racer lookup all agree without a
+        // second mapping.
+        if (const auto seat = SeatOf(cfg_.rules.roster, cfg_.playerId)) localSlot_ = *seat;
+        for (PeerSlot& peer : peers_) {
+            if (const auto seat = SeatOf(cfg_.rules.roster, peer.playerId)) peer.slot = *seat;
+        }
+    }
 
     void StartRace(std::uint16_t countdownCs) override {
         RaceStartPacket p;
@@ -128,7 +170,7 @@ public:
         LobbyUpdatePacket p;
         LobbyPlayer host;
         host.peerId = 0;
-        host.slot = 0;
+        host.slot = localSlot_;
         host.name = cfg_.playerName;
         host.color = 0;
         host.ready = 1;
@@ -179,6 +221,7 @@ private:
     struct PeerSlot {
         PeerId id{};
         std::uint8_t slot = 0;
+        PlayerId playerId = kInvalidPlayerId;
         std::uint8_t color = 0;
         std::string name;
         InputSample latest{};
@@ -244,10 +287,28 @@ private:
             SendReject(ev.peer, RejectReason::MapMismatch);
             return;
         }
+        // Identity is the seat key, so a second claim on the same id (two
+        // players who normalised to the same name, or a genuine hash collision)
+        // is refused here instead of being papered over with a duplicate seat.
+        if (hello->playerId == kInvalidPlayerId) {
+            SendReject(ev.peer, RejectReason::DuplicatePeer);
+            return;
+        }
+        if (hello->playerId == cfg_.playerId) {
+            SendReject(ev.peer, RejectReason::DuplicatePeer);
+            return;
+        }
+        for (const PeerSlot& peer : peers_) {
+            if (peer.playerId == hello->playerId) {
+                SendReject(ev.peer, RejectReason::DuplicatePeer);
+                return;
+            }
+        }
 
         PeerSlot peer;
         peer.id = ev.peer;
-        peer.slot = static_cast<std::uint8_t>(peers_.size() + 1);   // slot 0 = host
+        peer.slot = static_cast<std::uint8_t>(peers_.size() + 1);   // arrival order
+        peer.playerId = hello->playerId;
         peer.name = hello->name.empty() ? ("P" + std::to_string(peer.slot)) : hello->name;
         peer.color = static_cast<std::uint8_t>(peer.slot);
         peers_.push_back(peer);
@@ -259,6 +320,7 @@ private:
         welcome.rules = cfg_.rules;
         welcome.mapHash = cfg_.mapHash;
         welcome.mapName = cfg_.mapName;
+        welcome.playerId = peer.playerId;
         auto welcomeBytes =
             EncodeToBuffer([&](std::span<std::byte> b) { return EncodeWelcome(welcome, b); });
         if (!welcomeBytes.empty()) {
@@ -360,6 +422,7 @@ private:
         ad.players = static_cast<std::uint8_t>(peers_.size() + 1);
         ad.maxPlayers = static_cast<std::uint8_t>(cfg_.maxPlayers);
         ad.phase = phase;
+        ad.playerId = cfg_.playerId;
         (void)discovery_.Advertise(ad);
     }
 
@@ -371,6 +434,7 @@ private:
     std::vector<PeerSlot> peers_;
     HostWorld world_{};
     bool worldValid_ = false;
+    std::uint8_t localSlot_ = 0;   // the host's own seat once the roster is frozen
     std::uint16_t snapSeq_ = 0;
     std::uint64_t lastSnapshotMs_ = 0;
     std::uint64_t lastTickMs_ = 0;
@@ -385,7 +449,7 @@ class ClientSession final : public INetSession {
 public:
     ClientSession(const NetConfig& cfg, ITransport& transport, IRoomDiscovery& discovery,
                   Endpoint host)
-        : cfg_(cfg), transport_(transport), discovery_(discovery), host_(host) {}
+        : cfg_(ResolveIdentity(cfg)), transport_(transport), discovery_(discovery), host_(host) {}
 
     void Start() {
         state_ = SessionState::Joining;
@@ -447,6 +511,7 @@ public:
     SessionState State() const override { return state_; }
     bool IsHost() const override { return false; }
     std::uint8_t LocalSlot() const override { return slot_; }
+    const RulesPacket& Rules() const override { return rules_; }
 
     void SubmitLocalInput(const InputSample& sample) override {
         sample_ = sample;
@@ -491,6 +556,7 @@ private:
         h.buildSig = cfg_.buildSig;
         h.mapHash = cfg_.mapHash;
         h.name = cfg_.playerName.substr(0, kNameBytes - 1);
+        h.playerId = cfg_.playerId;
         std::array<std::byte, kMaxDatagram> buf{};
         const auto n = EncodeHello(h, buf);
         if (!n) return;
@@ -573,10 +639,14 @@ private:
                 if (!r) return;
                 rules_ = r->rules;
                 countdownCs_ = r->countdownCs;
+                // The host froze the roster: our seat is our rank in it, not
+                // the arrival slot Welcome handed out.
+                if (const auto seat = SeatOf(rules_.roster, cfg_.playerId)) slot_ = *seat;
                 state_ = SessionState::Racing;
                 SessionEvent e;
                 e.kind = SessionEventKind::RaceStarted;
                 e.rules = rules_;
+                e.slot = slot_;
                 e.hostTick = r->startHostTick;
                 e.countdownCs = r->countdownCs;
                 pending_.push_back(e);

@@ -67,6 +67,13 @@ struct ScriptedInput {
         f.keys[static_cast<size_t>(KeyCode::R)] = s.reverse;
         f.keys[static_cast<size_t>(KeyCode::LShift)] = s.overtake;
         f.keys[static_cast<size_t>(KeyCode::B)] = s.lookBack;
+        // Typed text reaches the recognizers as device codepoints, same path a
+        // real keyboard takes into the text channel (name entry).
+        f.textCount = static_cast<std::uint8_t>(std::min<std::size_t>(s.textLen, 32u));
+        for (std::uint8_t i = 0; i < f.textCount; ++i) {
+            f.text[i] = static_cast<std::uint32_t>(static_cast<unsigned char>(s.text[i]));
+        }
+        f.keys[static_cast<size_t>(KeyCode::Backspace)] = s.textBackspace;
         source.scripted = f;
 
         // Edge-triggered actions: one event per set() call (old IsKeyPressed
@@ -1223,6 +1230,88 @@ int RunSeasonGateTest(IPhysicsWorld& world) {
 // and reverse. Exits 0 on success, 1 on failure. No window is created, so it
 // runs on locked sessions and in CI. The full suite runs once per physics
 // backend (qu3e, nudge and rush-physics-core must all pass it).
+// Grid identity: every car must stand on its own grid box, before and after the
+// Enter restart (the restart used to send the whole AI field to slot 1), and the
+// boxes must stay far enough apart that the field does not spawn overlapping.
+int RunGridResetTest(Config& base) {
+    Config config = base;
+    config.SetString("race", "cars", "6");
+    config.SetString("race", "autopilot", "false");
+    // Fitted-feature plumbing: the HUD gates its ERS / DRS / aero readouts on
+    // the local car's capability bits, so those bits must actually reach the
+    // car built for the player (config season gates -> VehicleParams).
+    config.SetString("season", "ers", "1");
+
+    NullBackend backend;
+    ScriptedInput testInput;
+    if (!backend.Init(1280, 720, "grid-reset")) {
+        std::printf("[FAIL] grid-reset backend init\n");
+        return 1;
+    }
+    Game game(backend, testInput.system, config);
+    if (!game.Init()) {
+        std::printf("[FAIL] grid-reset game init\n");
+        return 1;
+    }
+
+    int failures = 0;
+    auto check = [&failures](bool ok, const char* what, float got, float want) {
+        std::printf("[%s] grid: %s (got %.2f, target %.2f)\n", ok ? "PASS" : "FAIL", what, got,
+                    want);
+        if (!ok) ++failures;
+    };
+    auto run = [&](float seconds, InputState input) {
+        testInput.set(input);
+        const int frames = static_cast<int>(seconds / backend.frameDt + 0.5f);
+        for (int i = 0; i < frames; ++i) {
+            backend.BeginFrame();
+            game.Update();
+            game.RenderHUD();   // exercises the HUD (capability-gated readouts)
+            backend.EndFrame();
+        }
+    };
+
+    run(4.0f, InputState{});   // countdown -> racing
+    InputState restart;
+    restart.restart = true;
+    run(0.05f, restart);       // ENTER: back to the grid
+    run(1.2f, InputState{});   // let every suspension settle
+
+    const std::vector<Racer>& racers = game.Racers();
+    check(racers.size() == 6, "six cars on the grid", static_cast<float>(racers.size()), 6.f);
+
+    float worstPose = 0.f;
+    for (const Racer& racer : racers) {
+        const Transform expected = game.GridPose(racer);
+        const Vec3 delta = racer.vehicle.State().transform.position - expected.position;
+        const float horizontal = std::sqrt(delta.x * delta.x + delta.z * delta.z);
+        worstPose = std::max(worstPose, horizontal);
+    }
+    check(worstPose < 1.0f, "every car on its GridPose box", worstPose, 0.f);
+
+    float closest = 1e9f;
+    for (std::size_t i = 0; i < racers.size(); ++i) {
+        for (std::size_t j = i + 1; j < racers.size(); ++j) {
+            const Vec3 a = racers[i].vehicle.State().transform.position;
+            const Vec3 b = racers[j].vehicle.State().transform.position;
+            const Vec3 d = a - b;
+            closest = std::min(closest, std::sqrt(d.x * d.x + d.z * d.z));
+        }
+    }
+    check(closest > 3.f, "grid boxes at least 3 m apart", closest, 3.f);
+
+    // The player's car carries exactly the season it was built for: ERS on,
+    // aero / overtake off. This is the same bitmask the HUD reads.
+    const std::uint8_t caps = game.LocalRacer().vehicle.Params().capabilities;
+    check(HasCapability(caps, VehicleCapability::Ers), "player car has ERS",
+          HasCapability(caps, VehicleCapability::Ers) ? 1.f : 0.f, 1.f);
+    check(!HasCapability(caps, VehicleCapability::ActiveAero), "player car has no active aero",
+          HasCapability(caps, VehicleCapability::ActiveAero) ? 1.f : 0.f, 0.f);
+
+    backend.Shutdown();
+    return failures;
+}
+
 int RunDriveTestForEngine(Config& config, const char* engine) {
     config.SetString("physics", "engine", engine);
     // Pin the simulation environment: user config (assists / hz / season)
@@ -1427,6 +1516,9 @@ int RunDriveTestForEngine(Config& config, const char* engine) {
 
     // 8) AI cars ignore player difficulty assists (never spin at assists-off).
     failures += RunAIDifficultyIsolationTest(engine);
+
+    // 9) Grid identity: one box per seat, restart included.
+    failures += RunGridResetTest(config);
 
     std::printf("drive-test[%s]: %s (%d failures)\n", engine,
                 failures == 0 ? "OK" : "FAILED", failures);
@@ -1797,6 +1889,73 @@ int RunInputTest() {
     return failures;
 }
 
+// Login screen golden path: the LAN entry point asks for a name before it opens
+// the room browser, the engine text field receives typed bytes, and confirming
+// the name is what lets HOST RACE actually open a session.
+int RunLanNameEntryTest(Config& base) {
+    Config config = base;
+    // Start at the main menu: the login screen is reached from the LAN entry.
+    config.SetString("race", "autostart", "false");
+    // test mode: Load/Save are no-ops, so the typed name never reaches the
+    // user's config file.
+    config.SetString("net", "player_name", "");
+    config.SetString("net", "game_port", "51330");
+    config.SetString("net", "discovery_port", "51331");
+
+    NullBackend backend;
+    ScriptedInput testInput;
+    if (!backend.Init(1280, 720, "lan-name")) {
+        std::printf("[FAIL] lan-name backend init\n");
+        return 1;
+    }
+    Game game(backend, testInput.system, config);
+    if (!game.Init()) {
+        std::printf("[FAIL] lan-name game init\n");
+        return 1;
+    }
+
+    int failures = 0;
+    auto check = [&failures](bool ok, const char* what) {
+        std::printf("[%s] lan-name: %s\n", ok ? "PASS" : "FAIL", what);
+        if (!ok) ++failures;
+    };
+    auto tap = [&](const InputState& input) {
+        testInput.set(input);
+        backend.BeginFrame();
+        game.Update();
+        game.RenderHUD();
+        backend.EndFrame();
+    };
+
+    InputState down;
+    down.menuDown = true;
+    tap(down);
+    tap(down);   // main menu cursor: START RACE -> SETTINGS -> LAN RACE
+    InputState select;
+    select.menuSelect = true;
+    tap(select);  // LAN RACE with no name -> login screen, no session yet
+    check(game.Phase() == RacePhase::Lan, "LAN entry opens the login screen");
+    check(game.Role() == Game::NetRole::Offline, "no session before a name is set");
+
+    InputState typing;
+    std::strcpy(typing.text, "Pilot7");
+    typing.textLen = 6;
+    tap(typing);
+    InputState backspace;
+    backspace.textBackspace = true;
+    tap(backspace);   // "Pilot" — the field owns the buffer, the engine edited it
+    tap(select);      // ENTER confirms the name -> LAN root
+    check(game.Role() == Game::NetRole::Offline, "confirming the name does not start a room");
+
+    tap(select);      // HOST RACE: reachable only with a name -> room-code wheel
+    check(game.Role() == Game::NetRole::Offline, "hosting still asks for a room code");
+    tap(select);      // ENTER confirms the code and opens the room
+    check(game.Role() == Game::NetRole::Host, "named player can host");
+
+    backend.Shutdown();
+    return failures;
+}
+
 int RunDriveTest(Config& config) {
     int failures = 0;
     std::printf("=== input recognizers ===\n");
@@ -1816,6 +1975,8 @@ int RunDriveTest(Config& config) {
     }
     std::printf("=== threaded sim smoke ===\n");
     failures += RunThreadedSmokeTest(config);
+    std::printf("=== LAN name entry ===\n");
+    failures += RunLanNameEntryTest(config);
     std::printf("drive-test: %s (%d failures)\n", failures == 0 ? "OK" : "FAILED", failures);
     return failures == 0 ? 0 : 1;
 }
@@ -2217,8 +2378,13 @@ int main(int argc, char** argv) {
     int netHostCode = -1;
     int netJoinCode = -1;
     const char* netJoinIp = nullptr;
+    // --player <name>: explicit identity for LAN play and automation. Highest
+    // priority name source (see Game::ChosenPlayerName).
+    const char* playerName = nullptr;
     for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--net-selftest") == 0) {
+        if (std::strcmp(argv[i], "--player") == 0 && i + 1 < argc) {
+            playerName = argv[++i];
+        } else if (std::strcmp(argv[i], "--net-selftest") == 0) {
             netSelfTest = true;
         } else if (std::strcmp(argv[i], "--ui-selftest") == 0) {
             uiSelfTest = true;
@@ -2360,6 +2526,7 @@ int main(int argc, char** argv) {
         ScriptedInput testInput;
         backend.Init(1280, 720, "lan-headless");
         Game game(backend, testInput.system, config);
+        if (playerName) game.SetPlayerName(playerName);
         game.SetThreadedSim(false);
         if (!game.Init()) return 1;
         if (netHostCode >= 0) {
@@ -2417,6 +2584,7 @@ int main(int argc, char** argv) {
     }
 
     Game game(backend, inputSystem, config, &audio);
+    if (playerName) game.SetPlayerName(playerName);
     // Native play: race stages run on the sim worker; menus stay on main.
     // Headless tests / --bench keep inline (deterministic pump).
     #if !defined(__EMSCRIPTEN__)

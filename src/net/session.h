@@ -77,6 +77,9 @@ struct InputSample {
 
 struct NetConfig {
     std::string playerName = "PLAYER";
+    // Identity hashed from the name (net/identity.h). Sent in Hello; the host
+    // refuses a second player claiming an id it already seated.
+    PlayerId playerId = kInvalidPlayerId;
     std::uint16_t roomCode = 0;
     std::uint16_t gamePort = kGamePortDefault;
     std::uint16_t discoveryPort = kDiscoveryPortDefault;
@@ -101,6 +104,10 @@ public:
 
     virtual SessionState State() const = 0;
     virtual bool IsHost() const = 0;
+    // Seat of the local player. Before a race it is the arrival slot (dense,
+    // may still change); FreezeRoster/serve renumbers it to the seat, and the
+    // seat is what the grid, the snapshot `slot` field and input routing use
+    // for the rest of the race.
     virtual std::uint8_t LocalSlot() const = 0;
 
     // --- host side ---------------------------------------------------------
@@ -120,6 +127,12 @@ public:
     }
     // Host: update the rule set that gets advertised in Welcome/RaceStart.
     virtual void SetRules(const RulesPacket& rules) { (void)rules; }
+    // Host: seat every joined player (rank of playerId, see net/roster.h) and
+    // fold the frozen roster into the rules. Called once, before StartRace, so
+    // the grid both ends build is the same grid. Renumbers peer slots to seats.
+    virtual void FreezeRoster() {}
+    // Rules currently in force (the host's own copy, or the last one received).
+    virtual const RulesPacket& Rules() const = 0;
     virtual void StartRace(std::uint16_t countdownCs) { (void)countdownCs; }
     virtual void RestartRace(std::uint16_t countdownCs) { (void)countdownCs; }
     virtual void EndRace(std::vector<RaceEndEntry> results) {}

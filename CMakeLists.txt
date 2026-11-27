@@ -84,6 +84,8 @@ add_executable(apex-rush
     src/game/net/NetCars.cpp
     src/game/net/LanGame.cpp
     src/net/protocol/wire_codec.cpp
+    src/net/identity.cpp
+    src/net/roster.cpp
     src/net/transport.cpp
     src/net/discovery.cpp
     src/net/session.cpp

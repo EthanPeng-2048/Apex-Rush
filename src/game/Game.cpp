@@ -106,6 +106,13 @@ std::string Pad(const std::string& s, size_t width) {
     return s.size() >= width ? s.substr(0, width) : s + std::string(width - s.size(), ' ');
 }
 
+// This machine's car inside a published snapshot. The sim worker fills
+// RaceSnapshot::localIndex because racers_[0] is not necessarily ours.
+const Game::CarPose& SnapshotLocalCar(const Game::RaceSnapshot& snap) {
+    const std::size_t index = static_cast<std::size_t>(std::max(0, snap.localIndex));
+    return snap.cars[index < snap.cars.size() ? index : 0];
+}
+
 }  // namespace
 
 // Game-side input registration: declare the events the game consumes, their
@@ -251,11 +258,32 @@ void Game::SpawnRacersInto(std::vector<Racer>& out, const Track& track, IPhysics
     // Large grids (up to 120) so the async bench can stress the sim; the
     // settings CARS row cycles the same range.
     const int carCount = std::clamp(cfg.carCount, 1, 120);
-    out.resize(static_cast<size_t>(carCount));
-    for (int i = 0; i < carCount; ++i) {
+    const int rosterCount = cfg.roster.count;
+    // LAN grid: one car per seat, built from the frozen roster. A client spawns
+    // only its own car (the far side simulates the rest), and its grid box comes
+    // from its seat — never from "I am car 0".
+    const int spawnCount = rosterCount > 0 ? (cfg.lanClient ? 1 : rosterCount) : carCount;
+    out.resize(static_cast<size_t>(spawnCount));
+    for (int i = 0; i < spawnCount; ++i) {
         Racer& racer = out[static_cast<size_t>(i)];
-        racer.name = (i == 0) ? "YOU" : ("AI " + std::to_string(i));
-        racer.isPlayer = (i == 0);
+        const net::RosterEntry* seatEntry = nullptr;
+        for (int s = 0; s < rosterCount; ++s) {
+            const net::RosterEntry& entry = cfg.roster.entries[static_cast<size_t>(s)];
+            const bool mine = cfg.lanClient ? entry.seat == cfg.localSeat : entry.seat == i;
+            if (mine) {
+                seatEntry = &entry;
+                break;
+            }
+        }
+        racer.seat = seatEntry ? static_cast<int>(seatEntry->seat) : i;
+        if (seatEntry) {
+            racer.name = seatEntry->name;
+            racer.playerId = seatEntry->playerId;
+        } else {
+            racer.name = (i == 0) ? "YOU" : ("AI " + std::to_string(i));
+            racer.playerId = (i == 0) ? cfg.localPlayerId : kInvalidPlayerId;
+        }
+        racer.isPlayer = (racer.seat == cfg.localSeat);
 
         VehicleParams params;
         if (racer.isPlayer) {
@@ -283,11 +311,57 @@ void Game::SpawnRacersInto(std::vector<Racer>& out, const Track& track, IPhysics
         if (cfg.seasonOverride) params.capabilities |= VehicleCapability::Overtake;
         if (cfg.seasonErs) params.capabilities |= VehicleCapability::Ers;
 
-        Transform pose;
-        pose.position = track.StartPosition(i + cfg.gridOffset);
-        pose.rotation = track.StartRotation();
-        racer.vehicle.Spawn(world, pose, params, &racer);
+        racer.vehicle.Spawn(world, apex::GridPose(track, racer), params, &racer);
     }
+}
+
+Transform GridPose(const Track& track, const Racer& racer) {
+    Transform pose;
+    pose.position = track.StartPosition(racer.seat);
+    pose.rotation = track.StartRotation();
+    return pose;
+}
+
+Transform Game::GridPose(const Racer& racer) const { return apex::GridPose(track_, racer); }
+
+Racer& Game::LocalRacer() {
+    for (Racer& racer : racers_) {
+        if (racer.seat == LocalSeat()) return racer;
+    }
+    return racers_.front();
+}
+
+const Racer& Game::LocalRacer() const {
+    for (const Racer& racer : racers_) {
+        if (racer.seat == LocalSeat()) return racer;
+    }
+    return racers_.front();
+}
+
+Racer* Game::RacerBySlot(std::uint8_t seat) {
+    for (Racer& racer : racers_) {
+        if (racer.seat == static_cast<int>(seat)) return &racer;
+    }
+    return nullptr;
+}
+
+void Game::ResetRacerForStart(Racer& racer) {
+    racer.input = CarInput{};
+    racer.vehicle.Reset(GridPose(racer));
+    racer.lap = 0;
+    racer.lapDistance = 0.f;
+    racer.lastLapTime = 0.f;
+    racer.bestLapTime = 0.f;
+    racer.currentLapStart = 0.f;
+    racer.raceTime = 0.f;
+    racer.position = 1;
+    racer.progress = 0.f;
+    racer.stuckTimer = 0.f;
+    racer.finished = false;
+}
+
+void Game::ResetGridForStart() {
+    for (Racer& racer : racers_) ResetRacerForStart(racer);
 }
 
 Game::RaceBuildConfig Game::MakeRaceBuildConfig() {
@@ -296,13 +370,19 @@ Game::RaceBuildConfig Game::MakeRaceBuildConfig() {
     cfg.fixedDt = fixedDt_;
     cfg.engine = config_.GetString("physics", "engine", "qu3e");
     cfg.carCount = std::clamp(config_.GetInt("race", "cars", 4), 1, 120);
-    // LAN roles override the grid: the host drives every joined car, the client
-    // only its own (spawned on its authoritative slot).
+    // LAN roles override the grid: the host drives every seated car, the client
+    // only its own (on its own seat).
     if (netRole_ == NetRole::Host) {
-        cfg.carCount = std::clamp<int>(netCarCount_, 1, net::kMaxCars);
+        cfg.carCount = std::clamp<int>(netRoster_.count, 1, net::kMaxCars);
+        cfg.roster = netRoster_;
+        cfg.localSeat = LocalSeat();
+        cfg.localPlayerId = localPlayerId_;
     } else if (netRole_ == NetRole::Client) {
         cfg.carCount = 1;
-        cfg.gridOffset = netConfig_.rules.carCount > 1 ? netLocalSlot_ : 0;
+        cfg.roster = netRoster_;
+        cfg.lanClient = true;
+        cfg.localSeat = LocalSeat();
+        cfg.localPlayerId = localPlayerId_;
     }
     cfg.damage = config_.GetBool("race", "damage", true);
     cfg.absLevel = ParseAssistLevel(config_, "abs", DefaultAssistLevel("abs"));
@@ -313,7 +393,42 @@ Game::RaceBuildConfig Game::MakeRaceBuildConfig() {
     cfg.seasonAero = seasonAero_;
     cfg.seasonOverride = seasonOverride_;
     cfg.seasonErs = seasonErs_;
+    // A LAN client runs the host's rules: season gates decide which systems the
+    // car has, the assist levels decide how it handles. Its own config would
+    // otherwise put two different simulations on the same grid.
+    if (netRole_ == NetRole::Client && netRulesLocked_) {
+        cfg.damage = netRules_.damage != 0;
+        cfg.absLevel = static_cast<AssistLevel>(netRules_.absLevel);
+        cfg.tcLevel = static_cast<AssistLevel>(netRules_.tcLevel);
+        cfg.escLevel = static_cast<AssistLevel>(netRules_.escLevel);
+        cfg.steerLevel = static_cast<AssistLevel>(netRules_.steerLevel);
+        cfg.seasonDrs = (netRules_.seasonBits & net::kSeasonDrs) != 0;
+        cfg.seasonAero = (netRules_.seasonBits & net::kSeasonActiveAero) != 0;
+        cfg.seasonOverride = (netRules_.seasonBits & net::kSeasonOvertake) != 0;
+        cfg.seasonErs = (netRules_.seasonBits & net::kSeasonErs) != 0;
+    }
     return cfg;
+}
+
+// Host-side rule set: the single place that turns the local config + season
+// gates into the rules every client must run. The client applies them back in
+// MakeRaceBuildConfig, so both ends build the same car.
+void Game::FillHostRules(net::RulesPacket& rules) const {
+    rules.laps = static_cast<std::uint8_t>(std::clamp(totalLaps_, 1, 99));
+    rules.damage = config_.GetBool("race", "damage", true) ? 1 : 0;
+    rules.seasonBits = static_cast<std::uint8_t>(
+        (seasonDrs_ ? net::kSeasonDrs : 0) | (seasonAero_ ? net::kSeasonActiveAero : 0) |
+        (seasonOverride_ ? net::kSeasonOvertake : 0) | (seasonErs_ ? net::kSeasonErs : 0));
+    rules.absLevel =
+        static_cast<std::uint8_t>(ParseAssistLevel(config_, "abs", DefaultAssistLevel("abs")));
+    rules.tcLevel =
+        static_cast<std::uint8_t>(ParseAssistLevel(config_, "tc", DefaultAssistLevel("tc")));
+    rules.escLevel =
+        static_cast<std::uint8_t>(ParseAssistLevel(config_, "esc", DefaultAssistLevel("esc")));
+    rules.steerLevel = static_cast<std::uint8_t>(
+        ParseAssistLevel(config_, "steer", DefaultAssistLevel("steer")));
+    rules.snapshotHz = static_cast<std::uint8_t>(
+        std::clamp(config_.GetInt("net", "snapshot_hz", 30), 10, 60));
 }
 
 // Build the selected collision backend: qu3e | nudge | rpc (Rush Physics Core).
@@ -510,11 +625,11 @@ void Game::Update() {
         // snapshot (never touches racers_ while the worker owns them).
         // statusTimer_ is sim-owned and decremented in UpdateSim.
         if (frameSnap_ && frameSnap_->valid && !frameSnap_->cars.empty()) {
-            const VehicleState& s = frameSnap_->cars[0].state;
+            const VehicleState& s = SnapshotLocalCar(*frameSnap_).state;
             UpdateCameraFrom(s, frameDt);
         }
         if (audio_ && frameSnap_ && frameSnap_->valid && !frameSnap_->cars.empty()) {
-            const VehicleState& s = frameSnap_->cars[0].state;
+            const VehicleState& s = SnapshotLocalCar(*frameSnap_).state;
             AudioState audioState;
             audioState.engineRpm = s.rpm;
             audioState.engineLoad = s.throttle;
@@ -531,7 +646,7 @@ void Game::Update() {
         UpdateCamera(frameDt);
 
         if (audio_ && !racers_.empty()) {
-            const VehicleState& s = racers_.front().vehicle.State();
+            const VehicleState& s = LocalRacer().vehicle.State();
             AudioState audioState;
             audioState.engineRpm = s.rpm;
             audioState.engineLoad = s.throttle;
@@ -643,6 +758,7 @@ void Game::PublishSnapshot() {
         pose.raceTime = racer.raceTime;
         pose.partHealth = racer.vehicle.Aero().StateRef().partHealth;
         pose.damageTotal = racer.vehicle.Aero().DamageTotal();
+        if (racer.seat == LocalSeat()) snap.localIndex = static_cast<int>(i);
     }
     snap.valid = true;
     snap.publishTime = std::chrono::duration<double>(
@@ -723,18 +839,17 @@ void Game::Render3D() {
                                     std::chrono::steady_clock::now().time_since_epoch())
                                     .count() * 1000.0;
             const double renderMs = now2 - netInterp_->DelayMs();
-            for (int slot = 0; slot < netCarCount_; ++slot) {
-                if (slot == static_cast<int>(netLocalSlot_)) continue;
+            for (int s = 0; s < netRoster_.count; ++s) {
+                const std::uint8_t seat = netRoster_.entries[static_cast<std::size_t>(s)].seat;
+                if (seat == netLocalSeat_.load(std::memory_order_relaxed)) continue;
                 Transform chassis;
                 VehicleState state;
-                if (!netInterp_->Sample(static_cast<std::uint8_t>(slot), renderMs, chassis, state)) {
-                    continue;
-                }
+                if (!netInterp_->Sample(seat, renderMs, chassis, state)) continue;
                 Color tint{1.0f, 0.86f, 0.74f, 1.f};
-                tint.r = 0.55f + 0.12f * static_cast<float>(slot % 3);
+                tint.r = 0.55f + 0.12f * static_cast<float>(seat % 3);
                 tint.g = 0.75f;
-                tint.b = 0.95f - 0.10f * static_cast<float>(slot % 3);
-                Vehicle::RenderPose(renderer_, chassis, state, racers_.front().vehicle.Params(), tint);
+                tint.b = 0.95f - 0.10f * static_cast<float>(seat % 3);
+                Vehicle::RenderPose(renderer_, chassis, state, LocalRacer().vehicle.Params(), tint);
             }
         }
         return;
@@ -811,7 +926,7 @@ void Game::ApplyPlayerIntent() {
     }
 
     if (racers_.empty()) return;
-    Racer& player = racers_.front();
+    Racer& player = LocalRacer();
 
     // --- Input mapping (phase as of this sim tick).
     if (phase_ == RacePhase::Racing && !player.finished) {
@@ -847,17 +962,10 @@ void Game::ApplyPlayerIntent() {
         player.input.brake = 0.8f;
     }
 
-    // ENTER restarts: reset the whole grid back to the countdown.
+    // ENTER restarts: reset the whole grid back to the countdown, every car on
+    // its own grid box (the AI used to be piled onto one slot here).
     if (it.restart) {
-        for (Racer& racer : racers_) {
-            const Transform pose{track_.StartPosition(racer.isPlayer ? 0 : 1),
-                                 track_.StartRotation()};
-            racer.vehicle.Reset(pose);
-            racer.lap = 0;
-            racer.finished = false;
-            racer.lapDistance = 0.f;
-            racer.currentLapStart = 0.f;
-        }
+        ResetGridForStart();
         phase_ = RacePhase::Countdown;
         phaseTimer_ = 3.5f;
         raceClock_ = 0.f;
@@ -1024,7 +1132,7 @@ void Game::ProcessCollisionEvents(float dt) {
 
     // Collision thump for the player's car.
     if (audio_ && !racers_.empty()) {
-        const BodyHandle playerBody = racers_.front().vehicle.Chassis();
+        const BodyHandle playerBody = LocalRacer().vehicle.Chassis();
         for (const ContactEvent& event : contacts) {
             if (event.bodyA != playerBody && event.bodyB != playerBody) continue;
             if (event.impactSpeed > 1.5f) {
@@ -1066,7 +1174,7 @@ void Game::UpdateRace(float dt) {
                 racer.currentLapStart = raceClock_;
                 if (netRole_ == NetRole::Host && netSession_) {
                     net::LapCompletePacket lapEvent;
-                    lapEvent.slot = static_cast<std::uint8_t>(&racer - racers_.data());
+                    lapEvent.slot = static_cast<std::uint8_t>(racer.seat);
                     lapEvent.lap = static_cast<std::uint8_t>(std::min(racer.lap, 255));
                     lapEvent.lapTimeMs = static_cast<std::uint32_t>(lapTime * 1000.f);
                     lapEvent.bestLapMs = static_cast<std::uint32_t>(racer.bestLapTime * 1000.f);
@@ -1078,7 +1186,7 @@ void Game::UpdateRace(float dt) {
                 racer.raceTime = raceClock_;
                 if (netRole_ == NetRole::Host && netSession_) {
                     net::PlayerFinishedPacket fin;
-                    fin.slot = static_cast<std::uint8_t>(&racer - racers_.data());
+                    fin.slot = static_cast<std::uint8_t>(racer.seat);
                     fin.position = static_cast<std::uint8_t>(std::clamp(racer.position, 1, 255));
                     fin.raceTimeMs = static_cast<std::uint32_t>(racer.raceTime * 1000.f);
                     fin.bestLapMs = static_cast<std::uint32_t>(racer.bestLapTime * 1000.f);
@@ -1127,15 +1235,14 @@ void Game::UpdateRace(float dt) {
     // every car is home (or ends it manually).
     bool allDone = true;
     for (const Racer& r : racers_) allDone = allDone && r.finished;
-    if ((netRole_ == NetRole::Host) ? allDone : racers_.front().finished) {
+    if ((netRole_ == NetRole::Host) ? allDone : LocalRacer().finished) {
         phase_ = RacePhase::Finished;
         if (netRole_ == NetRole::Host && netSession_ && !netEndSent_) {
             netEndSent_ = true;
             std::vector<net::RaceEndEntry> results;
-            for (std::size_t i = 0; i < racers_.size(); ++i) {
-                const Racer& r = racers_[i];
+            for (const Racer& r : racers_) {
                 net::RaceEndEntry entry;
-                entry.slot = static_cast<std::uint8_t>(i);
+                entry.slot = static_cast<std::uint8_t>(r.seat);
                 entry.position = static_cast<std::uint8_t>(std::clamp(r.position, 1, 255));
                 entry.finished = r.finished ? 1 : 0;
                 entry.raceTimeMs = static_cast<std::uint32_t>(std::max(0.f, r.raceTime) * 1000.f);
@@ -1149,7 +1256,7 @@ void Game::UpdateRace(float dt) {
 
 void Game::UpdateCamera(float dt) {
     if (racers_.empty()) return;
-    UpdateCameraFrom(racers_.front().vehicle.State(), dt);
+    UpdateCameraFrom(LocalRacer().vehicle.State(), dt);
 }
 
 void Game::UpdateCameraFrom(const VehicleState& state, float dt) {
@@ -1244,26 +1351,23 @@ void Game::RenderHUD() {
     // members on this same thread.
     const bool snapHud = threadedSim_ && simWorker_.Running() && frameSnap_ &&
                          frameSnap_->valid && !frameSnap_->cars.empty();
-    const VehicleState& state =
-        snapHud ? frameSnap_->cars[0].state : racers_.front().vehicle.State();
+    const CarPose* own = snapHud ? &SnapshotLocalCar(*frameSnap_) : nullptr;
+    const VehicleState& state = own ? own->state : LocalRacer().vehicle.State();
     const std::array<float, 4>& partHealth =
-        snapHud ? frameSnap_->cars[0].partHealth
-                : racers_.front().vehicle.Aero().StateRef().partHealth;
+        own ? own->partHealth : LocalRacer().vehicle.Aero().StateRef().partHealth;
     // Fitted features come from the car, not from the season globals: a car
     // without a system shows no readout for it (see VehicleCapability).
-    const std::uint8_t capabilities = snapHud ? frameSnap_->cars[0].params.capabilities
-                                              : racers_.front().vehicle.Params().capabilities;
+    const std::uint8_t capabilities =
+        own ? own->params.capabilities : LocalRacer().vehicle.Params().capabilities;
     const int position = (netRole_ == NetRole::Client && netReadout_.valid)
                              ? static_cast<int>(netReadout_.position)
-                             : (snapHud ? frameSnap_->cars[0].position : racers_.front().position);
+                             : (own ? own->position : LocalRacer().position);
     const int lap = (netRole_ == NetRole::Client && netReadout_.valid)
                         ? static_cast<int>(netReadout_.lap)
-                        : (snapHud ? frameSnap_->cars[0].lap : racers_.front().lap);
-    const float lastLapTime =
-        snapHud ? frameSnap_->cars[0].lastLapTime : racers_.front().lastLapTime;
-    const float bestLapTime =
-        snapHud ? frameSnap_->cars[0].bestLapTime : racers_.front().bestLapTime;
-    const float raceTime = snapHud ? frameSnap_->cars[0].raceTime : racers_.front().raceTime;
+                        : (own ? own->lap : LocalRacer().lap);
+    const float lastLapTime = own ? own->lastLapTime : LocalRacer().lastLapTime;
+    const float bestLapTime = own ? own->bestLapTime : LocalRacer().bestLapTime;
+    const float raceTime = own ? own->raceTime : LocalRacer().raceTime;
     const float raceClock = snapHud ? frameSnap_->raceClock : raceClock_;
     const float phaseTimer = snapHud ? frameSnap_->phaseTimer : phaseTimer_;
     const float statusTimer = snapHud ? frameSnap_->statusTimer : statusTimer_;
