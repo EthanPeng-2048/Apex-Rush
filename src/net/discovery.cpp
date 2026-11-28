@@ -1,13 +1,21 @@
-// UDP room discovery. Winsock is confined to this file.
+// UDP room discovery. Raw sockets (Winsock / BSD) are confined to this file.
 
 #include "net/discovery.h"
 
 #include <algorithm>
 #include <cstring>
 
-#if !defined(__EMSCRIPTEN__)
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#elif !defined(__EMSCRIPTEN__)
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #endif
 
 namespace apex::net {
@@ -33,16 +41,36 @@ public:
 
 namespace {
 
-bool WsaReady() {
-    static bool ready = false;
-    static bool tried = false;
-    if (!tried) {
+// Winsock and BSD sockets differ in the handle type, the close call, the
+// non-blocking switch and process-wide init. These four shims are the only
+// platform-specific knowledge below.
+#if defined(_WIN32)
+using NativeSocket = SOCKET;
+constexpr NativeSocket kNoSocket = INVALID_SOCKET;
+
+bool SocketLayerReady() {
+    static const bool ready = [] {
         WSADATA data;
-        ready = WSAStartup(MAKEWORD(2, 2), &data) == 0;
-        tried = true;
-    }
+        return WSAStartup(MAKEWORD(2, 2), &data) == 0;
+    }();
     return ready;
 }
+void CloseSocket(NativeSocket s) { closesocket(s); }
+bool SetNonBlocking(NativeSocket s) {
+    u_long on = 1;
+    return ioctlsocket(s, FIONBIO, &on) == 0;
+}
+#else
+using NativeSocket = int;
+constexpr NativeSocket kNoSocket = -1;
+
+bool SocketLayerReady() { return true; }  // nothing to initialise on POSIX
+void CloseSocket(NativeSocket s) { ::close(s); }
+bool SetNonBlocking(NativeSocket s) {
+    const int flags = ::fcntl(s, F_GETFL, 0);
+    return flags != -1 && ::fcntl(s, F_SETFL, flags | O_NONBLOCK) != -1;
+}
+#endif
 
 class UdpDiscovery final : public IRoomDiscovery {
 public:
@@ -76,7 +104,7 @@ public:
     }
 
     void Poll(std::uint64_t nowMs) override {
-        if (socket_ == INVALID_SOCKET) return;
+        if (socket_ == kNoSocket) return;
 
         if (advertising_ && nowMs - lastBroadcastMs_ >= kAnnounceIntervalMs) {
             lastBroadcastMs_ = nowMs;
@@ -88,9 +116,12 @@ public:
 
         for (;;) {
             sockaddr_in from{};
-            int fromLen = static_cast<int>(sizeof(from));
-            const int got = recvfrom(socket_, reinterpret_cast<char*>(rx_.data()), static_cast<int>(rx_.size()), 0,
-                                     reinterpret_cast<sockaddr*>(&from), &fromLen);
+            socklen_t fromLen = static_cast<socklen_t>(sizeof(from));
+            const long long got = static_cast<long long>(
+                recvfrom(socket_, reinterpret_cast<char*>(rx_.data()),
+                         static_cast<int>(rx_.size()), 0,
+                         reinterpret_cast<sockaddr*>(&from), &fromLen));
+            // Non-blocking socket: <= 0 means drained (EWOULDBLOCK) or error.
             if (got <= 0) break;
             HandleDatagram(std::span<const std::byte>(rx_.data(), static_cast<std::size_t>(got)),
                            from, nowMs);
@@ -109,35 +140,37 @@ public:
 
 private:
     bool EnsureSocket() {
-        if (socket_ != INVALID_SOCKET) return true;
-        if (!WsaReady()) return false;
+        if (socket_ != kNoSocket) return true;
+        if (!SocketLayerReady()) return false;
         socket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (socket_ == INVALID_SOCKET) return false;
-        const BOOL reuse = TRUE;
-        setsockopt(socket_, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse),
-                   sizeof(reuse));
-        const BOOL bcast = TRUE;
-        setsockopt(socket_, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&bcast),
-                   sizeof(bcast));
-        u_long nonBlocking = 1;
-        ioctlsocket(socket_, FIONBIO, &nonBlocking);
+        if (socket_ == kNoSocket) return false;
+        const int on = 1;
+        setsockopt(socket_, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&on),
+                   sizeof(on));
+        setsockopt(socket_, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&on),
+                   sizeof(on));
+        if (!SetNonBlocking(socket_)) {
+            CloseSocket(socket_);
+            socket_ = kNoSocket;
+            return false;
+        }
 
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
         addr.sin_port = htons(port_);
-        if (bind(socket_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
-            closesocket(socket_);
-            socket_ = INVALID_SOCKET;
+        if (bind(socket_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+            CloseSocket(socket_);
+            socket_ = kNoSocket;
             return false;
         }
         return true;
     }
 
     void Close() {
-        if (socket_ != INVALID_SOCKET) {
-            closesocket(socket_);
-            socket_ = INVALID_SOCKET;
+        if (socket_ != kNoSocket) {
+            CloseSocket(socket_);
+            socket_ = kNoSocket;
         }
     }
 
@@ -190,7 +223,7 @@ private:
     }
 
     std::uint16_t port_ = kDiscoveryPortDefault;
-    SOCKET socket_ = INVALID_SOCKET;
+    NativeSocket socket_ = kNoSocket;
     bool advertising_ = false;
     bool searching_ = false;
     std::uint64_t lastBroadcastMs_ = 0;

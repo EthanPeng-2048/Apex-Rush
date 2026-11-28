@@ -20,6 +20,8 @@
 #include <enet/enet.h>
 #endif
 
+#include <cerrno>
+
 namespace apex::net {
 
 namespace {
@@ -28,6 +30,16 @@ std::vector<std::byte> CopyBytes(const void* p, std::size_t n) {
     std::vector<std::byte> v(n);
     if (n != 0) std::memcpy(v.data(), p, n);
     return v;
+}
+
+// enet_host_create() returns NULL without telling why; surface the platform's
+// last socket error (Winsock and POSIX keep it in different places).
+int LastSocketError() {
+#if defined(_WIN32)
+    return WSAGetLastError();
+#else
+    return errno;
+#endif
 }
 }  // namespace
 
@@ -105,8 +117,8 @@ public:
         addr.port = bind.port;
         host_ = enet_host_create(&addr, static_cast<size_t>(std::max(1, maxPeers)), 2, 0, 0);
         if (!host_) {
-            std::fprintf(stderr, "[net] enet_host_create(port=%u, peers=%d) failed, wsa=%d\n",
-                         static_cast<unsigned>(addr.port), maxPeers, WSAGetLastError());
+            std::fprintf(stderr, "[net] enet_host_create(port=%u, peers=%d) failed, err=%d\n",
+                         static_cast<unsigned>(addr.port), maxPeers, LastSocketError());
             return std::unexpected(NetError::NotReady);
         }
         role_ = Role::Host;
