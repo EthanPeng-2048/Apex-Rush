@@ -386,7 +386,22 @@ private:
     // thread (same mailbox pattern as PlayerIntent).
     std::mutex netInputMutex_;
     std::array<net::InputSample, net::kMaxCars> netRemoteInput_{};
+    std::array<std::uint16_t, net::kMaxCars> netRemoteInputSeq_{};
     std::array<bool, net::kMaxCars> netRemoteFresh_{};
+    // Sim-owned: the input sequence the last stepped tick used for each seat.
+    // Published with the world so `appliedInputSeq` describes the state it
+    // travels with instead of whatever happened to have arrived.
+    std::array<std::uint16_t, net::kMaxCars> netAppliedSeq_{};
+    // Client only: absorbs a rollback correction into a decaying render offset
+    // (docs/online/architecture.md §4.4), so the drawn pose never pops.
+    CorrectionSmoother clientCorrection_{};
+    // Per-second rollback health, printed with the 1 Hz client log line: the
+    // biggest correction the last second needed, how many of them could replay,
+    // and how many had to fall back to a snap (input gap). Jitter regressions
+    // show up here first.
+    float netCorrMaxM_ = 0.f;
+    int netReconciles_ = 0;
+    int netSnaps_ = 0;
     std::array<bool, net::kMaxCars> netDrsLatch_{};
     bool clientDrsLatch_ = false;
     float clientWingLatch_ = 0.f;

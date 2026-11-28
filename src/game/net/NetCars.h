@@ -4,6 +4,7 @@
 // rollback prediction, and remote car interpolation with collision proxies.
 // See docs/online/architecture.md §4-§5.
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <mutex>
@@ -53,7 +54,6 @@ public:
                 VehicleState& state) const;
 
     bool HasData(std::uint8_t slot) const;
-    std::uint16_t LastAppliedInputSeq() const;
 
 private:
     struct Stored {
@@ -64,6 +64,51 @@ private:
     };
     std::vector<Stored> buffer_;
     double delayMs_ = 40.0;
+};
+
+// --- correction smoothing ----------------------------------------------------
+
+// Pose difference a rollback produced: the simulated pose moved by this much
+// when the authority took over. `position` is (before - after), `rotation` is
+// (before * inverse(after)) — apply them on top of the corrected pose to keep
+// the drawn car where the player already saw it. `replayed` says whether the
+// unconfirmed inputs could be re-simulated (false = input gap, hard snap).
+struct ReconcileCorrection {
+    bool applied = false;
+    bool replayed = false;
+    Vec3 position{};
+    Quat rotation = Quat::Identity();
+};
+
+// Absorbs corrections into a decaying render offset instead of snapping the
+// drawn car (docs/online/architecture.md §4.4): tau = time constant, and
+// anything past the snap thresholds is accepted instantly — a 2 m jump is a
+// teleport, not something to animate.
+class CorrectionSmoother {
+public:
+    void Reset();
+    void SetTauMs(float ms) { tauSec_ = std::clamp(ms, 0.f, 1000.f) * 0.001f; }
+    float TauSec() const { return tauSec_; }
+
+    // Sim thread, right after a rollback landed. Accumulates so back-to-back
+    // corrections do not cancel the smoothing of the earlier one.
+    void Push(const ReconcileCorrection& correction);
+
+    // Sim thread, once per tick: exponential decay toward zero.
+    void Decay(float dt);
+
+    // Adds the remaining offset to a drawn/published pose.
+    void Apply(Transform& pose) const;
+    bool Active() const;
+
+private:
+    Vec3 position_{};
+    // Rotation offset kept as axis + angle: decaying an angle is a scalar
+    // multiply, while decay through quaternions would have to rebuild it every
+    // tick and could never reach zero (acos near w = 1 is float-quantised).
+    Vec3 rotAxis_{0.f, 1.f, 0.f};
+    float rotAngleRad_ = 0.f;
+    float tauSec_ = 0.08f;
 };
 
 // --- local prediction --------------------------------------------------------
@@ -84,9 +129,13 @@ public:
                        std::uint16_t appliedInputSeq, std::uint32_t hostTick);
 
     // Sim thread: consume a pending authority view (if any) by restoring and
-    // replaying. Returns true when a correction was applied.
+    // replaying. `lastSimulatedTick` is the newest tick that has already run —
+    // the replay covers everything after the authoritative input up to and
+    // including it, and the tick being started now is simulated normally after.
+    // Returns true when a correction was applied; `correction` then describes the
+    // pose delta for the render layer.
     bool Reconcile(Vehicle& vehicle, IPhysicsWorld& world, float dt,
-                   std::uint32_t currentTick);
+                   std::uint32_t lastSimulatedTick, ReconcileCorrection* correction);
 
     void Record(std::uint32_t tick, std::uint16_t seq, const CarInput& input);
 
@@ -99,6 +148,7 @@ private:
 
     std::mutex mutex_;
     bool hasAuthority_ = false;
+    bool anyReconciled_ = false;
     net::CarNetState authorityCar_{};
     net::SelfState authoritySelf_{};
     bool authorityHasSelf_ = false;

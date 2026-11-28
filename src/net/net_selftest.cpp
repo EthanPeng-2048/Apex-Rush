@@ -360,6 +360,10 @@ void TestSessions() {
     const InputSample received = host->LatestInput(1);
     Check(std::abs(received.throttle - 0.75f) < 0.01f, "host receives client throttle");
     Check(std::abs(received.steer + 0.5f) < 0.02f, "host receives client steering");
+    // The rollback landmark needs both numbers: the session that stamps the
+    // sample and the host report that echoes it back with the state.
+    Check(client->LocalInputSeq() == 1, "client stamps its own input sequence");
+    Check(host->LatestInputSeq(1) == 1, "host reports the sequence it received");
 
     // Host publishes a snapshot; the client must receive it with its own self
     // block and an applied-input sequence.
@@ -373,7 +377,7 @@ void TestSessions() {
     world.packet.cars[1].position = 2;
     world.selfValid[1] = 1;
     world.self[1].slipRatio[0] = 0.05f;
-    host->SetAppliedInputSeq(1, 3);
+    world.appliedSeq[1] = 3;
     for (int i = 0; i < 8; ++i) {
         host->PublishSnapshot(world);
         step(2);
@@ -527,7 +531,7 @@ void TestRealSockets() {
     world.packet.cars[1].slot = 1;
     world.packet.cars[1].lap = 2;
     world.selfValid[1] = 1;
-    host->SetAppliedInputSeq(client->LocalSlot(), 5);
+    world.appliedSeq[client->LocalSlot()] = 5;
     bool snapSeen = false;
     for (int i = 0; i < 200 && !snapSeen; ++i) {
         host->PublishSnapshot(world);

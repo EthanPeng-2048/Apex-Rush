@@ -745,6 +745,12 @@ void Game::PublishSnapshot() {
         pose.chassis = world_ ? world_->GetTransform(racer.vehicle.Chassis())
                                        .value_or(racer.vehicle.State().transform)
                               : racer.vehicle.State().transform;
+        // LAN client: our own car carries the decaying offset of the last
+        // rollback, so the camera and the model keep the pose the player already
+        // saw instead of popping to the corrected one (architecture §4.4).
+        if (netRole_ == NetRole::Client && racer.seat == LocalSeat()) {
+            clientCorrection_.Apply(pose.chassis);
+        }
         pose.state = racer.vehicle.State();
         pose.state.transform = pose.chassis;
         pose.params = racer.vehicle.Params();

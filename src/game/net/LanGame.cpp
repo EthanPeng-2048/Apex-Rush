@@ -281,6 +281,8 @@ void Game::LanStop(const std::string& message) {
     netRulesLocked_ = false;
     netLocalSeat_.store(0, std::memory_order_relaxed);
     netReadout_ = NetRaceReadout{};
+    netAppliedSeq_.fill(0);
+    clientCorrection_.Reset();
     {
         std::lock_guard lock(netInputMutex_);
         netRemoteFresh_.fill(false);
@@ -312,6 +314,10 @@ void Game::LanTick() {
             std::lock_guard lock(netInputMutex_);
             for (int slot = 0; slot < net::kMaxCars; ++slot) {
                 netRemoteInput_[static_cast<std::size_t>(slot)] = netSession_->LatestInput(
+                    static_cast<std::uint8_t>(slot));
+                // The seq travels with the sample it belongs to: the host reports
+                // "this state was built from that input" per recipient.
+                netRemoteInputSeq_[static_cast<std::size_t>(slot)] = netSession_->LatestInputSeq(
                     static_cast<std::uint8_t>(slot));
                 netRemoteFresh_[static_cast<std::size_t>(slot)] = netSession_->HasFreshInput(
                     static_cast<std::uint8_t>(slot));
@@ -353,7 +359,9 @@ void Game::LanTick() {
             netLocalSample_ = sample;
         }
         netSession_->SubmitLocalInput(sample);
-        ++localInputSeq_;
+        // One sequence space: the session stamps the sample, the rollback history
+        // records the same number, the host echoes it back in appliedInputSeq.
+        localInputSeq_ = netSession_->LocalInputSeq();
     }
     if (const net::SnapshotPacket* snap = netSession_->LatestSnapshot()) {
         if (netInterp_ && snap->hostTick != lastPushedHostTick_) {
@@ -366,7 +374,8 @@ void Game::LanTick() {
             const VehicleState& own =
                 racers_.empty() ? VehicleState{} : LocalRacer().vehicle.State();
             std::printf("[net] client t=%.0fs rtt=%ums cars=%u lap=%u pos=%u/%u seat=%d "
-                        "pos3=(%.1f,%.1f,%.1f) speed=%.0fkm/h\n",
+                        "pos3=(%.1f,%.1f,%.1f) speed=%.0fkm/h "
+                        "rollback=%d snap=%d corr=%.0fmm\n",
                         static_cast<double>(now) / 1000.0, st.rttMs,
                         static_cast<unsigned>(snap->carCount), static_cast<unsigned>(netReadout_.lap),
                         static_cast<unsigned>(netReadout_.position),
@@ -374,7 +383,11 @@ void Game::LanTick() {
                         static_cast<double>(own.transform.position.x),
                         static_cast<double>(own.transform.position.y),
                         static_cast<double>(own.transform.position.z),
-                        static_cast<double>(own.speedKmh));
+                        static_cast<double>(own.speedKmh), netReconciles_, netSnaps_,
+                        static_cast<double>(netCorrMaxM_ * 1000.f));
+            netReconciles_ = 0;
+            netSnaps_ = 0;
+            netCorrMaxM_ = 0.f;
             std::fflush(stdout);
         }
         netReadout_.valid = true;
@@ -446,6 +459,7 @@ void Game::LanHandleEvents() {
                         ResetGridForStart();
                         localTick_ = 0;
                         if (netPredict_) netPredict_->Reset(0);
+                        clientCorrection_.Reset();
                         phase_ = RacePhase::Countdown;
                         phaseTimer_ = static_cast<float>(ev.countdownCs) * 0.01f;
                         raceClock_ = 0.f;
@@ -859,6 +873,10 @@ void Game::LanBeginClientRace() {
     netPredict_->Reset(0);
     localTick_ = 0;
     localInputSeq_ = 0;
+    // Corrections are absorbed visually over this window (§4.4); 0 snaps instead.
+    clientCorrection_.SetTauMs(
+        static_cast<float>(config_.GetInt("net", "correction_tau_ms", 80)));
+    clientCorrection_.Reset();
     if (world_ && !racers_.empty()) {
         netProxies_ = std::make_unique<RemoteProxies>();
         netProxies_->Build(*world_, netCarCount_, netLocalSeat_.load(std::memory_order_relaxed),
@@ -912,6 +930,9 @@ void Game::LanBuildHostWorld(net::INetSession::HostWorld& out) {
         if (seat < static_cast<std::size_t>(net::kMaxCars)) {
             ToSelfState(snap, out.self[seat]);
             out.selfValid[seat] = 1;
+            // Which input this car's state was just built from: the recipient
+            // replays everything after it.
+            out.appliedSeq[seat] = netAppliedSeq_[seat];
         }
     }
 }
@@ -920,10 +941,12 @@ void Game::LanBuildHostWorld(net::INetSession::HostWorld& out) {
 
 void Game::LanApplyRemoteInputs() {
     std::array<net::InputSample, net::kMaxCars> inputs;
+    std::array<std::uint16_t, net::kMaxCars> seqs;
     std::array<bool, net::kMaxCars> fresh;
     {
         std::lock_guard lock(netInputMutex_);
         inputs = netRemoteInput_;
+        seqs = netRemoteInputSeq_;
         fresh = netRemoteFresh_;
     }
     const std::uint8_t localSeat = netLocalSeat_.load(std::memory_order_relaxed);
@@ -976,6 +999,10 @@ void Game::LanApplyRemoteInputs() {
         in.wingToggle = seasonAero_ && sample.wingPress != lastWingPress_[slot];
         lastWingPress_[slot] = sample.wingPress;
         in.overtake = seasonOverride_ && sample.overtakePress != 0;
+        // This is the input the tick about to run will step, so it is the rollback
+        // landmark the client must replay from. Stale peers keep the previous
+        // value: their car was driven by the coast input, not by a new sample.
+        netAppliedSeq_[slot] = seqs[slot];
     }
 }
 
@@ -1030,7 +1057,16 @@ void Game::LanClientSimTick(float frameDt) {
 
         const bool racing = phase_ == RacePhase::Racing;
         if (netPredict_) {
-            (void)netPredict_->Reconcile(player.vehicle, *world_, fixedDt_, localTick_);
+            // Rollback to the last authority, replay our unconfirmed inputs up to
+            // the tick that has already run, then simulate the current one below.
+            ReconcileCorrection correction;
+            if (netPredict_->Reconcile(player.vehicle, *world_, fixedDt_, localTick_ - 1,
+                                       &correction)) {
+                clientCorrection_.Push(correction);
+                netCorrMaxM_ = std::max(netCorrMaxM_, Length(correction.position));
+                ++netReconciles_;
+                if (!correction.replayed) ++netSnaps_;
+            }
         }
 
         CarInput in{};
@@ -1078,6 +1114,9 @@ void Game::LanClientSimTick(float frameDt) {
             }
         }
     }
+    // The visual offset left by a rollback ages on wall-clock time, not on the
+    // authority timeline: it exists only to hide the seam from the player.
+    clientCorrection_.Decay(frameDt);
     if (phase_ == RacePhase::Countdown) {
         phaseTimer_ -= frameDt;
         if (phaseTimer_ <= 0.f) {

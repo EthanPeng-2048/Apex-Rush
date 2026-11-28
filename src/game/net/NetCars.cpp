@@ -17,6 +17,25 @@ float MixAngle(float a, float b, float period, float t) {
     return a + d * t;
 }
 
+Quat NormQuat(const Quat& q) {
+    const float len = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+    return len > 1e-6f ? Quat{q.x / len, q.y / len, q.z / len, q.w / len} : Quat::Identity();
+}
+
+// Shortest-arc axis/angle of `q`.
+void ToAxisAngle(const Quat& q, Vec3& axis, float& angleRad) {
+    const Quat n = q.w < 0.f ? Quat{-q.x, -q.y, -q.z, -q.w} : q;
+    angleRad = 2.f * std::acos(std::clamp(n.w, 0.f, 1.f));
+    const float s = std::sqrt(std::max(0.f, 1.f - n.w * n.w));
+    if (s > 1e-6f) axis = Vec3{n.x / s, n.y / s, n.z / s};
+}
+
+// A correction this large is a teleport, not something to animate away.
+constexpr float kSnapDistanceM = 2.f;
+constexpr float kSnapAngleRad = 15.f * 0.01745329252f;
+constexpr float kZeroOffsetM2 = 1e-8f;
+constexpr float kZeroAngleRad = 1e-4f;
+
 Transform TransformFromWire(const net::CarNetState& c) {
     Transform t;
     t.position = Vec3{c.pos[0], c.pos[1], c.pos[2]};
@@ -162,10 +181,6 @@ bool RemoteInterpolator::HasData(std::uint8_t slot) const {
     return false;
 }
 
-std::uint16_t RemoteInterpolator::LastAppliedInputSeq() const {
-    return buffer_.empty() ? 0 : 0;   // per-recipient value lives in the packet header
-}
-
 bool RemoteInterpolator::Sample(std::uint8_t slot, double renderTimeMs, Transform& chassis,
                                 VehicleState& state) const {
     if (buffer_.size() < 2) return false;
@@ -251,6 +266,7 @@ void LocalPredictor::Reset(std::uint32_t tick) {
     for (auto& h : history_) h = HistoryEntry{};
     std::lock_guard lock(mutex_);
     hasAuthority_ = false;
+    anyReconciled_ = false;
     lastReconciledSeq_ = 0;
 }
 
@@ -275,7 +291,9 @@ void LocalPredictor::Record(std::uint32_t tick, std::uint16_t seq, const CarInpu
 }
 
 bool LocalPredictor::Reconcile(Vehicle& vehicle, IPhysicsWorld& world, float dt,
-                               std::uint32_t currentTick) {
+                               std::uint32_t lastSimulatedTick, ReconcileCorrection* correction) {
+    if (correction) *correction = ReconcileCorrection{};
+
     net::CarNetState car;
     net::SelfState self;
     bool hasSelf = false;
@@ -284,45 +302,100 @@ bool LocalPredictor::Reconcile(Vehicle& vehicle, IPhysicsWorld& world, float dt,
         std::lock_guard lock(mutex_);
         if (!hasAuthority_) return false;
         hasAuthority_ = false;
-        if (!net::SeqNewer(authoritySeq_, lastReconciledSeq_) && lastReconciledSeq_ != 0) {
-            return false;
-        }
+        // The same authority view twice (no newer snapshot): nothing new to
+        // correct, and re-applying it would pin the car to a stale pose every
+        // frame instead of letting the prediction run.
+        if (anyReconciled_ && !net::SeqNewer(authoritySeq_, lastReconciledSeq_)) return false;
         car = authorityCar_;
         self = authoritySelf_;
         hasSelf = authorityHasSelf_;
         seq = authoritySeq_;
         lastReconciledSeq_ = seq;
+        anyReconciled_ = true;
     }
 
-    // Where did we apply that input? Search newest -> oldest.
-    std::uint32_t replayFrom = currentTick;
+    // Where did we apply that input? Search newest -> oldest over the ticks that
+    // have actually run (`lastSimulatedTick`), not over the tick about to start.
+    std::uint32_t replayFrom = lastSimulatedTick + 1;
     bool found = false;
-    for (std::uint32_t back = 0; back < kHistory && back <= headTick_; ++back) {
-        if (headTick_ < back) break;
-        const std::uint32_t tick = headTick_ - back;
+    const std::uint32_t newest = std::min(lastSimulatedTick, headTick_);
+    for (std::uint32_t back = 0; back < kHistory && back <= newest; ++back) {
+        const std::uint32_t tick = newest - back;
         const HistoryEntry& e = history_[tick % kHistory];
         if (!e.hasInput || e.tick != tick) continue;
         if (e.seq == seq) {
-            replayFrom = tick;
+            replayFrom = tick + 1;
             found = true;
             break;
         }
     }
 
+    Transform before = vehicle.State().transform;
+    if (const auto t = world.GetTransform(vehicle.Chassis())) before = *t;
+
     VehicleSnapshotState snapshot = vehicle.SaveState();
     ApplyWireToSnapshot(car, hasSelf ? &self : nullptr, snapshot);
     vehicle.RestoreState(snapshot);
-    if (!found) return true;
 
-    if (currentTick - replayFrom > kMaxReplay) return true;   // too far: keep the snap
+    // No history entry (input gap, or the authority is newer than anything we
+    // still remember): keep the authoritative state and let the render layer
+    // absorb the jump. Otherwise replay our unconfirmed inputs on top of it.
+    if (found && lastSimulatedTick - (replayFrom - 1) <= kMaxReplay) {
+        for (std::uint32_t tick = replayFrom; tick <= lastSimulatedTick; ++tick) {
+            const HistoryEntry& e = history_[tick % kHistory];
+            if (!e.hasInput || e.tick != tick) break;
+            vehicle.Update(e.input, dt);
+            world.Step(dt);
+        }
+    }
 
-    for (std::uint32_t tick = replayFrom + 1; tick <= currentTick; ++tick) {
-        const HistoryEntry& e = history_[tick % kHistory];
-        if (!e.hasInput || e.tick != tick) break;
-        vehicle.Update(e.input, dt);
-        world.Step(dt);
+    if (correction) {
+        Transform after = vehicle.State().transform;
+        if (const auto t = world.GetTransform(vehicle.Chassis())) after = *t;
+        correction->applied = true;
+        correction->replayed = found;
+        correction->position = before.position - after.position;
+        correction->rotation = NormQuat(before.rotation * Conjugate(after.rotation));
     }
     return true;
+}
+
+// ------------------------------------------------------- correction smoothing ---
+
+void CorrectionSmoother::Reset() {
+    position_ = Vec3{};
+    rotAxis_ = Vec3{0.f, 1.f, 0.f};
+    rotAngleRad_ = 0.f;
+}
+
+void CorrectionSmoother::Push(const ReconcileCorrection& correction) {
+    if (!correction.applied) return;
+    position_ += correction.position;
+    Quat rot = Quat::FromAxisAngle(rotAxis_, rotAngleRad_) * correction.rotation;
+    ToAxisAngle(NormQuat(rot), rotAxis_, rotAngleRad_);
+    if (Length(position_) > kSnapDistanceM || rotAngleRad_ > kSnapAngleRad) Reset();
+}
+
+void CorrectionSmoother::Decay(float dt) {
+    if (tauSec_ <= 0.f) {
+        Reset();
+        return;
+    }
+    const float k = std::exp(-std::max(dt, 0.f) / tauSec_);
+    position_ *= k;
+    rotAngleRad_ *= k;
+    if (LengthSq(position_) < kZeroOffsetM2 && rotAngleRad_ < kZeroAngleRad) Reset();
+}
+
+void CorrectionSmoother::Apply(Transform& pose) const {
+    pose.position += position_;
+    if (rotAngleRad_ > 0.f) {
+        pose.rotation = NormQuat(Quat::FromAxisAngle(rotAxis_, rotAngleRad_) * pose.rotation);
+    }
+}
+
+bool CorrectionSmoother::Active() const {
+    return LengthSq(position_) > kZeroOffsetM2 || rotAngleRad_ > kZeroAngleRad;
 }
 
 // ------------------------------------------------------------------ proxies ---

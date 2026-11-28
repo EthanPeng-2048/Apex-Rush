@@ -113,18 +113,17 @@ public:
     // --- host side ---------------------------------------------------------
     // Authoritative world published at the snapshot rate. `self` carries each
     // slot's full integrator state so the host can attach the right one to each
-    // recipient; header fields (tick/seq/applied) are filled by the session.
+    // recipient; `appliedSeq` is the input sequence this very world reflects for
+    // that slot (the client's rollback landmark), and it travels with the state
+    // instead of through a side channel so the two can never disagree.
+    // Header fields (tick/seq) are filled by the session.
     struct HostWorld {
         SnapshotPacket packet{};
         std::array<SelfState, kMaxCars> self{};
         std::array<std::uint8_t, kMaxCars> selfValid{};
+        std::array<std::uint16_t, kMaxCars> appliedSeq{};
     };
     virtual void PublishSnapshot(const HostWorld& world) { (void)world; }
-    // Sim thread: record which input sequence has actually been simulated.
-    virtual void SetAppliedInputSeq(std::uint8_t slot, std::uint16_t seq) {
-        (void)slot;
-        (void)seq;
-    }
     // Host: update the rule set that gets advertised in Welcome/RaceStart.
     virtual void SetRules(const RulesPacket& rules) { (void)rules; }
     // Host: seat every joined player (rank of playerId, see net/roster.h) and
@@ -144,10 +143,21 @@ public:
     virtual void Kick(PeerId) {}
     // Slot -> latest received input, or a zeroed sample when nothing arrived.
     virtual InputSample LatestInput(std::uint8_t slot) const { return {}; }
+    // Sequence number of that same sample (0 before the peer's first packet):
+    // pairing it with LatestInput is what lets the host say which input its
+    // authoritative state was built from.
+    virtual std::uint16_t LatestInputSeq(std::uint8_t slot) const {
+        (void)slot;
+        return 0;
+    }
     virtual bool HasFreshInput(std::uint8_t slot) const { return false; }
 
     // --- client side -------------------------------------------------------
     virtual void SubmitLocalInput(const InputSample&) {}
+    // Sequence the session stamped on the sample passed to SubmitLocalInput.
+    // The rollback history records this value, so it must be read from here
+    // rather than tracked with a parallel counter.
+    virtual std::uint16_t LocalInputSeq() const { return 0; }
     // Snapshot history with arrival stamps, oldest first (interpolation source).
     struct TimedSnapshot {
         SnapshotPacket packet{};

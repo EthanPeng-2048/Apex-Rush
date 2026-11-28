@@ -36,9 +36,7 @@ NetConfig ResolveIdentity(const NetConfig& cfg) {
 class HostSession final : public INetSession {
 public:
     HostSession(const NetConfig& cfg, ITransport& transport, IRoomDiscovery& discovery)
-        : cfg_(ResolveIdentity(cfg)), transport_(transport), discovery_(discovery) {
-        for (auto& seq : appliedSeq_) seq.store(0);
-    }
+        : cfg_(ResolveIdentity(cfg)), transport_(transport), discovery_(discovery) {}
 
     ~HostSession() override { discovery_.StopAdvertising(); }
 
@@ -99,10 +97,6 @@ public:
     void PublishSnapshot(const HostWorld& world) override {
         world_ = world;
         worldValid_ = true;
-    }
-
-    void SetAppliedInputSeq(std::uint8_t slot, std::uint16_t seq) override {
-        if (slot < kMaxCars) appliedSeq_[slot].store(seq);
     }
 
     void SetRules(const RulesPacket& rules) override { cfg_.rules = rules; }
@@ -213,6 +207,13 @@ public:
             return lastTickMs_ - peer.lastInputMs < 250;
         }
         return false;
+    }
+
+    std::uint16_t LatestInputSeq(std::uint8_t slot) const override {
+        for (const PeerSlot& peer : peers_) {
+            if (peer.slot == slot) return peer.hasInput ? peer.lastSeq : 0;
+        }
+        return 0;
     }
 
     std::uint8_t PeerCount() const { return static_cast<std::uint8_t>(peers_.size()); }
@@ -395,7 +396,7 @@ private:
         for (const PeerSlot& peer : peers_) {
             SnapshotPacket p = world_.packet;
             p.snapSeq = ++snapSeq_;
-            p.appliedInputSeq = appliedSeq_[peer.slot].load();
+            p.appliedInputSeq = world_.appliedSeq[peer.slot];
             if (world_.selfValid[peer.slot] != 0) {
                 p.hasSelf = true;
                 p.self = world_.self[peer.slot];
@@ -438,7 +439,6 @@ private:
     std::uint16_t snapSeq_ = 0;
     std::uint64_t lastSnapshotMs_ = 0;
     std::uint64_t lastTickMs_ = 0;
-    std::array<std::atomic<std::uint16_t>, kMaxCars> appliedSeq_{};
     std::vector<SessionEvent> pending_;
     std::vector<SessionEvent> drainBuffer_;
 };
@@ -520,6 +520,8 @@ public:
         ++historyCount_;
         ++seq_;
     }
+
+    std::uint16_t LocalInputSeq() const override { return seq_; }
 
     const SnapshotPacket* LatestSnapshot() const override {
         return snapshots_.empty() ? nullptr : &snapshots_.back().packet;
