@@ -143,7 +143,7 @@
 | 11 | `raceClockMs` | u32 |
 | 15 | `carCount` | u8 |
 | 16 | `anchor` | f32 ×3，本包 `pos` 的相对原点 |
-| 28 | `appliedInputSeq` | u16，主机已处理到的**收包方**输入序号（回滚界标） |
+| 28 | `appliedInputSeq` | u16，**本包状态所反映的**收包方输入序号（回滚界标）：由仿真线程在构建 `HostWorld` 时逐 seat 填入，随状态一起走，客户端从该 tick 起重放未确认输入 |
 
 ### 6.2 每车（35 B × 8）
 

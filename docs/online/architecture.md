@@ -64,16 +64,24 @@ CS2 对照：服务器权威 / 客户端预测自身移动 / 其他玩家插值 
 
 ## 4. 我的车：预测与校正
 
-**每 tick（240 Hz）**：取最新输入 → `ApplyInputMapping()`（与主机同一份实现：`drsZone`、季节门控）→ `InputSmoother`（两端同一 tau）→ `Vehicle::Update` + `world.Step` → 记历史 `{tick, seq, CarInput}`（32 tick 环）。
+**每 tick（120/240 Hz，随 `[physics] hz`）**：取最新输入 → `ApplyInputMapping()`（与主机同一份实现：`drsZone`、季节门控）→ `InputSmoother`（两端同一 tau）→ `Vehicle::Update` + `world.Step` → 记历史 `{tick, seq, CarInput}`（32 tick 环）。
 
-**收到快照**（含 `appliedInputSeq` + 自车全状态块）：
+**收到的快照带 `appliedInputSeq`** —— 主机在**它自己的状态块里**说明"这台车的状态是由哪个输入序号解出来的"，客户端用它当回滚界标：
 
-1. 在历史里找 `seq == appliedInputSeq` 的 tick `T_a`；找不到（断流 >133 ms）→ 直接 `RestoreState` + 大 tau；
-2. `RestoreState(权威状态)`；
-3. 重放 `T_a+1 … 现在` 的输入（上限 16 tick）；
-4. 校正前后的位姿差交给渲染层做平滑（τ=80 ms；>2 m 或 >15° 直接吸附）。
+1. 在历史里找 `seq == appliedInputSeq` 的 tick `T_a`（只搜已经跑过的 tick，不搜即将要跑的那个）；找不到（断流 >133 ms，或主机还没收到任何输入）→ 直接 `RestoreState` + 交给渲染层吸收；
+2. 同一份 `appliedInputSeq` 只应用一次：重复到达的权威视图必须忽略，否则每帧都把车拍回同一个旧位姿（这正是"从机自车疯狂抖动"的成因）；
+3. `RestoreState(权威状态)`，重放 `T_a+1 … 已跑到的最后一个 tick` 的输入（上限 16 tick）；
+4. 校正前后的位姿差交给渲染层做平滑（`CorrectionSmoother`：τ=`[net] correction_tau_ms`，默认 80 ms，指数衰减；>2 m 或 >15° 直接吸附）；偏移只叠加在发布的位姿上，不进入物理。
 
-这是 CS2 的"重放未确认指令"，唯一的本作特化是状态恢复需要 M0 的 `SaveState/RestoreState`（`Vehicle::Reset` 会清零胎耗/ERS/损伤，不能当回滚用）。
+`appliedInputSeq` 的产出链是单一真值：客户端的序号由会话在 `SubmitLocalInput` 时盖章（`LocalInputSeq()`），主机把**本 tick 真正喂给该车**的序号随 `HostWorld` 一起带出（`LanApplyRemoteInputs` → `LanBuildHostWorld` → `appliedSeq[seat]`），快照按收件人各填各的。**不要**再引入第二套计数器或旁路写入口。
+
+**位姿往返必须是恒等**：`IPhysicsWorld::GetTransform` 返回的是刚体**原点**，`SetTransform` 收的是**质心**（qu3e/rpc 的约定），适配层负责用 `R * localCenter` 折算。少了这一步，每次 `RestoreState` 都会把车顶掉十几厘米——和"没重放"叠加起来就是画面高频抖动。
+
+这是 CS2 的"重放未确认指令"，唯一的本作特化是状态恢复需要 M0 的 `SaveState/RestoreState`（`Vehicle::Reset` 会清零胎耗/ERS/损伤，不能当回滚用）。状态块只带得走位姿/速度/轮胎积分器，发动机、变速箱、悬架、输入平滑的内部状态沿用当前预测值——回滚因此是"近似"而非逐位复现，残差由第 4 步的平滑吸收。
+
+**残差的量级与来源**（`APEX_NET_HEADLESS` 双进程实测，loopback RTT 15–20 ms，客户端 120 Hz 模拟 + 60 Hz 输入）：每秒回滚 22–23 次、**退化吸附 0 次**；直道 100–200 km/h 单次校正典型 **0.2–0.8 m**（≈1–2 tick 的行程），冲出赛道/上路肩的冲击帧可见 1–7 m 的孤立尖峰（那是地形冲击，不是网络）。剩余残差有两个来源，都不是 bug：① **tick 与输入序号的粒度差**——输入 60 Hz、模拟 120 Hz，同一个序号在客户端覆盖两个 tick，而主机何时换到下一个样本取决于收包时刻，于是 `appliedInputSeq` 天然带 ±1 tick 的歧义（200 km/h ≈ 0.46 m/tick）；② 上面说的分量内部状态近似。要消掉①必须给输入打时间戳并在两端按 tick 插值——那正是 ADR-06 明确否掉的方向（无时间戳、无时钟同步）。所以这里的选择是：**结构上修到"只差一个输入采样"的量级，剩下的交给 80 ms 平滑**，而不是再加一层补偿。
+
+`Game::LanTick` 的 1 Hz 客户端日志带 `rollback=/snap=/corr=` 三个量：每秒回滚次数、其中退化成吸附的次数（应为 0，除非断流）、该秒最大校正量（mm）。抖动回归会先在这里露头。
 
 **没有的东西**：没有"限幅"、没有误差死区、没有预测置信度衰减。物理永远等于"权威状态 + 我的输入"，画面用偏移吸收跳变——一层就够。
 
@@ -95,8 +103,8 @@ CS2 对照：服务器权威 / 客户端预测自身移动 / 其他玩家插值 
 
 | 时钟 | 频率 | 说明 |
 |---|---|---|
-| `hostTick` | 240 Hz | 主机权威时间线（只用于标注与统计） |
-| `localTick` | 240 Hz | 客户端本地模拟，各自单调，**不做时钟同步** |
+| `hostTick` | `[physics] hz`（默认 120，上限 1000） | 主机权威时间线（只用于标注与统计） |
+| `localTick` | 同上 | 客户端本地模拟，各自单调，**不做时钟同步** |
 
 客户端用**输入序号**与权威对齐（`appliedInputSeq`），不需要共享时间线——因为别人的车不由我们模拟。这是 v3 的 tick 软同步被删掉的原因。
 
@@ -104,7 +112,8 @@ CS2 对照：服务器权威 / 客户端预测自身移动 / 其他玩家插值 
 
 | 数据流 | 生产 | 消费 | 机制 |
 |---|---|---|---|
-| 远端输入（主机） | 主线程收包 | 仿真线程 | 每 peer 邮箱（沿用 `PlayerIntent` 模式，`Game.h:286-294`） |
+| 远端输入（主机） | 主线程收包（`LatestInput` + `LatestInputSeq` 成对进邮箱） | 仿真线程 | 每 peer 邮箱（沿用 `PlayerIntent` 模式，`Game.h:286-294`） |
+| 已处理输入序号（主机） | 仿真线程（`LanApplyRemoteInputs` → `netAppliedSeq_`） | 主线程（`LanBuildHostWorld` 写进 `HostWorld.appliedSeq`） | 随权威世界一起，`hostWorldMutex_` |
 | 快照 → 校正 | 主线程 | 仿真线程 | 单槽 mailbox（只留最新） |
 | 事件 | 仿真线程 | 主线程 | `EventBus`（同 `CollisionBus` 约定） |
 | 快照外发 | 主线程读 `frameSnap_` | 网络 | `CopyFront()` |
@@ -173,6 +182,6 @@ A1 满房 60 s 无掉线 · A2 `RaceEnd` 逐字段一致 · A3 带宽 ≤15 / �
 
 ## 11. 配置（`[net]`）
 
-`player_name` · `room_code` · `input_hz`(60) · `snapshot_hz`(30) · `interp_buffer_ms`(40，自适应上限 150) · `history_ticks`(32) · `smooth_tau_ms`(80) · `snap_threshold_m`(2.0) · `max_players`(8) · `game_port`(51230) · `discovery_port`(51231) · `discovery_port_span`(8) · `discovery_multicast`(true) · `enable`(true)。
+`player_name` · `room_code` · `input_hz`(60) · `snapshot_hz`(30) · `interp_buffer_ms`(40，自适应上限 150) · `history_ticks`(32) · `correction_tau_ms`(80，回滚校正的视觉平滑时间常数，0 = 直接吸附) · `max_players`(8) · `game_port`(51230) · `discovery_port`(51231) · `discovery_port_span`(8) · `discovery_multicast`(true) · `enable`(true)。吸附阈值固定为 >2 m 或 >15°（常量在 `src/game/net/NetCars.cpp`，不进配置——它只该在两种极端之间取值，没有可调的意义）。
 
 发现端口是一段而非一个：实例绑定 `discovery_port … discovery_port + discovery_port_span - 1` 里的首个空闲端口，主机把 `ANNOUNCE` 同时发到组播组（`239.255.72.31:discovery_port`）与每个网卡的子网广播/网卡地址上的段内全部端口。端口被占用、组播被过滤都不再等于"找不到房间"，真实端口与收发计数显示在房间列表上（见 ADR-07a）。`--net-disco-probe <秒> [房间码]` 可无窗口复现整条发现链路。

@@ -66,6 +66,8 @@
 
 **约束**：不改 `Reset` 语义与任何现有调用路径；`--drive-test` 三后端 0 failures、`--bench` 分段计时不变；M0 门禁是"存档→跑 10 tick→恢复→重跑同样输入→逐位相等"。
 
+**后续修正（本次）**：适配层原先直接把 `GetTransform()` 的结果喂给 `SetTransform()`，但 qu3e/rpc 的约定是前者给**刚体原点**、后者收**质心**，于是每次 `RestoreState` 都把车顶掉 `R * localCenter`（整车约 16 cm）。M0 门禁只比对状态字段，没发现这个位姿偏移。现在两个适配器都用 `R * localCenter` 折算（引擎侧只加了一个只读 `GetLocalCenter()`），往返成为恒等，`--drive-test` 的 `rollback[*]` 用 <2 cm 判定守住它。
+
 ---
 
 ## ADR-05 手写位打包编解码
