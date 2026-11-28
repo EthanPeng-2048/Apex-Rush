@@ -36,6 +36,13 @@
       "cacheVariables": { "APEX_STATIC_RUNTIME": "ON" }
     },
     {
+      "name": "release-static-avx2",
+      "displayName": "Clang Release + Static CRT, x86-64-v3 baseline (AVX2+FMA)",
+      "inherits": "release-static",
+      "binaryDir": "${sourceDir}/build-static-avx2",
+      "cacheVariables": { "APEX_NATIVE_ARCH": "ON" }
+    },
+    {
       "name": "debug",
       "displayName": "Clang Debug",
       "inherits": "clang-base",
@@ -102,6 +109,7 @@
     { "name": "release", "configurePreset": "release", "jobs": 32 },
     { "name": "release-avx2", "configurePreset": "release-avx2", "jobs": 32 },
     { "name": "release-static", "configurePreset": "release-static", "jobs": 32 },
+    { "name": "release-static-avx2", "configurePreset": "release-static-avx2", "jobs": 32 },
     { "name": "debug", "configurePreset": "debug", "jobs": 32 },
     { "name": "debug-tools", "configurePreset": "debug-tools", "jobs": 32 },
     { "name": "release-linux", "configurePreset": "release-linux", "jobs": 32 },
