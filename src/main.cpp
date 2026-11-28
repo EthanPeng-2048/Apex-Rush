@@ -2151,6 +2151,183 @@ int RunParamsDigestTest() {
     return failures;
 }
 
+// ---------------------------------------------------------------------------
+// Client rollback (docs/online/roadmap.md M5, architecture §4): the client must
+// replay its unconfirmed inputs on top of the authority instead of snapping to
+// it, and the same authority must never be applied twice. Driven directly
+// through LocalPredictor on a real car — the failure mode this guards against
+// (authority re-applied every frame, no replay) is invisible to any test that
+// only looks at the final position of a single snapshot.
+// ---------------------------------------------------------------------------
+
+static std::unique_ptr<IPhysicsWorld> MakeTestWorld(const char* engine, float stepDt) {
+    if (std::strcmp(engine, "nudge") == 0) return std::make_unique<NudgeWorld>();
+    if (std::strcmp(engine, "rpc") == 0) return std::make_unique<RushPhysicsCore>(stepDt);
+    return std::make_unique<Qu3eWorld>(stepDt);
+}
+
+int RunRollbackTestForEngine(const char* engine) {
+    int failures = 0;
+    auto check = [&failures, engine](bool ok, const char* what, float got, float want) {
+        std::printf("[%s] rollback[%s]: %s (got %.4f, target %.4f)\n", ok ? "PASS" : "FAIL", engine,
+                    what, got, want);
+        if (!ok) ++failures;
+    };
+
+    constexpr float dt = 1.f / 240.f;
+    std::unique_ptr<IPhysicsWorld> world = MakeTestWorld(engine, dt);
+    if (!world) {
+        std::printf("[FAIL] rollback[%s]: world\n", engine);
+        return 1;
+    }
+    world->SetGravity({0.f, -9.81f, 0.f});
+
+    BodyDesc ground;
+    ground.halfExtents = Vec3{600.f, 0.5f, 600.f};
+    ground.mass = 0.f;   // static
+    ground.friction = 1.f;
+    ground.transform.position = Vec3{0.f, -0.5f, 0.f};
+    (void)world->CreateBody(ground);
+
+    Vehicle car;
+    Transform spawn;
+    spawn.position = Vec3{0.f, 0.9f, 0.f};
+    car.Spawn(*world, spawn, VehicleParams{});
+
+    // Let the car drop onto its suspension, then drive up to speed so a rollback
+    // has real distance to get wrong (a stationary car would replay trivially).
+    for (int i = 0; i < 240; ++i) {
+        car.Update(CarInput{}, dt);
+        world->Step(dt);
+    }
+
+    LocalPredictor predictor;
+    predictor.Reset(0);
+
+    std::uint32_t tick = 0;
+    std::uint16_t seq = 0;
+    const auto setTransformOf = [&](Transform& out) {
+        out = car.State().transform;
+        if (const auto t = world->GetTransform(car.Chassis())) out = *t;
+    };
+    const auto stepWith = [&](const CarInput& input) {
+        ++tick;
+        ++seq;
+        car.Update(input, dt);
+        world->Step(dt);
+        predictor.Record(tick, seq, input);
+    };
+    const auto buildAuthority = [&](net::CarNetState& carWire, net::SelfState& selfWire) {
+        Transform chassis;
+        setTransformOf(chassis);
+        ToCarNetState(0, chassis, car.State(), 0, 0, false, false, carWire);
+        ToSelfState(car.SaveState(), selfWire);
+    };
+
+    CarInput straight;
+    straight.throttle = 0.85f;
+    for (int i = 0; i < 240; ++i) stepWith(straight);
+
+    // Authority as of the input the host had processed here.
+    net::CarNetState oldCar;
+    net::SelfState oldSelf;
+    buildAuthority(oldCar, oldSelf);
+    const std::uint16_t oldSeq = seq;
+
+    // Sixteen unconfirmed ticks of a different input: the car now sits well past
+    // the authority. The client keeps driving on its own prediction.
+    CarInput turning;
+    turning.throttle = 0.5f;
+    turning.steer = 0.4f;
+    for (int i = 0; i < 16; ++i) stepWith(turning);
+
+    // 1) Real rollback: the sixteen unconfirmed ticks are replayed, so the car
+    //    lands where the prediction already had it instead of jumping back.
+    {
+        Transform before;
+        setTransformOf(before);
+        ReconcileCorrection correction;
+        predictor.PushAuthority(oldCar, &oldSelf, oldSeq, tick - 16);
+        const bool applied = predictor.Reconcile(car, *world, dt, tick, &correction);
+        check(applied, "authority is consumed", applied ? 1.f : 0.f, 1.f);
+        // A snap to the authority is the full distance covered in those 16 ticks
+        // (~0.7 m at this speed); a replay lands within centimetres of it.
+        check(Length(correction.position) < 0.25f, "16 unconfirmed ticks are replayed, not snapped",
+              Length(correction.position), 0.f);
+        check(Length(before.position - car.State().transform.position) < 0.25f,
+              "replay ends next to the predicted pose",
+              Length(before.position - car.State().transform.position), 0.f);
+    }
+
+    // 2) Authority that matches the current state: replay nothing, stay put.
+    {
+        net::CarNetState nowCar;
+        net::SelfState nowSelf;
+        buildAuthority(nowCar, nowSelf);
+        ReconcileCorrection correction;
+        predictor.PushAuthority(nowCar, &nowSelf, seq, tick);
+        const bool applied = predictor.Reconcile(car, *world, dt, tick, &correction);
+        check(applied, "authority is consumed (caught up)", applied ? 1.f : 0.f, 1.f);
+        // Floor: wire quantization (1/32 m per axis) plus the fields the wire
+        // does not carry. Pose get -> set must be the identity.
+        check(Length(correction.position) < 0.02f, "a caught-up authority moves the car < 2 cm",
+              Length(correction.position), 0.f);
+        // The same authority must not be applied a second time: that re-snap is
+        // exactly what pinned the car to a stale pose every frame.
+        predictor.PushAuthority(nowCar, &nowSelf, seq, tick);
+        ReconcileCorrection again;
+        const bool reapplied = predictor.Reconcile(car, *world, dt, tick, &again);
+        check(!reapplied, "repeating an authority is ignored", reapplied ? 1.f : 0.f, 0.f);
+    }
+
+    // 3) Gap fallback: an authority the history no longer remembers is applied
+    //    as-is (the render layer absorbs the jump), not silently ignored.
+    {
+        ReconcileCorrection correction;
+        predictor.PushAuthority(oldCar, &oldSelf, static_cast<std::uint16_t>(seq + 200), tick);
+        const bool applied = predictor.Reconcile(car, *world, dt, tick, &correction);
+        check(applied, "gap authority is consumed", applied ? 1.f : 0.f, 1.f);
+        check(Length(correction.position) > 0.25f, "gap falls back to a snap",
+              Length(correction.position), 0.f);
+    }
+
+    // 4) The render layer absorbs what is left. No world needed.
+    {
+        CorrectionSmoother smoother;
+        smoother.SetTauMs(80.f);
+        ReconcileCorrection small;
+        small.applied = true;
+        small.position = Vec3{0.1f, 0.f, 0.f};
+        small.rotation = Quat::FromAxisAngle(Vec3{0.f, 1.f, 0.f}, 4.f * kDegToRad);
+        smoother.Push(small);
+        check(smoother.Active(), "smoother holds the correction", smoother.Active() ? 1.f : 0.f, 1.f);
+
+        Transform drawn;
+        drawn.position = Vec3{1.f, 2.f, 3.f};
+        smoother.Apply(drawn);
+        check(std::fabs(drawn.position.x - 1.1f) < 1e-4f, "smoother offsets the drawn pose",
+              drawn.position.x, 1.1f);
+
+        for (int i = 0; i < 60; ++i) smoother.Decay(1.f / 60.f);   // 1 s = 12.5 tau
+        check(!smoother.Active(), "smoother decays to zero", smoother.Active() ? 1.f : 0.f, 0.f);
+
+        ReconcileCorrection huge;
+        huge.applied = true;
+        huge.position = Vec3{3.f, 0.f, 0.f};
+        smoother.Push(huge);
+        check(!smoother.Active(), "a >2 m correction snaps instead of drifting",
+              smoother.Active() ? 1.f : 0.f, 0.f);
+
+        smoother.SetTauMs(0.f);
+        smoother.Push(small);
+        smoother.Decay(dt);
+        check(!smoother.Active(), "tau 0 disables smoothing", smoother.Active() ? 1.f : 0.f, 0.f);
+    }
+
+    car.Despawn();
+    return failures;
+}
+
 int RunDriveTest(Config& config) {
     int failures = 0;
     std::printf("=== input recognizers ===\n");
@@ -2167,6 +2344,7 @@ int RunDriveTest(Config& config) {
         std::printf("=== physics backend: %s ===\n", engine);
         const auto start = std::chrono::steady_clock::now();
         failures += RunDriveTestForEngine(config, engine);
+        failures += RunRollbackTestForEngine(engine);
         const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - start;
         std::printf("drive-test[%s] wall time: %.2f s\n", engine, elapsed.count());
     }
@@ -2744,6 +2922,13 @@ int main(int argc, char** argv) {
         const int frames = (netSeconds > 0 ? netSeconds : 10) * 60;
         auto nextFrame = std::chrono::steady_clock::now();
         for (int i = 0; i < frames; ++i) {
+            // Both seats drive: the host's car from this script, the client's car
+            // through the wire. A stationary client car would make the rollback
+            // look perfect no matter how broken it is.
+            InputState drive;
+            drive.throttle = 0.9f;
+            drive.steer = 0.25f * std::sin(static_cast<float>(i) * 0.02f);
+            testInput.set(drive);
             backend.BeginFrame();
             game.Update();
             backend.BeginScene();
