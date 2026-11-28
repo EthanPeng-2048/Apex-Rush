@@ -2120,10 +2120,43 @@ int RunLanNameEntryTest(Config& base) {
     return failures;
 }
 
+// Deep frame full of stack garbage, then a digest: the LAN build signature is
+// compared verbatim between machines, so it must not depend on what the stack
+// happened to hold (the byte-wise signature it replaced did exactly that).
+std::uint32_t DigestFromDirtyFrame(std::uint32_t seed, int depth) {
+    volatile std::uint8_t junk[768];
+    for (int i = 0; i < 768; ++i) junk[i] = static_cast<std::uint8_t>(depth * 37 + i);
+    if (depth > 0) return DigestFromDirtyFrame(seed, depth - 1);
+    return ParamsDigest(VehicleParams{}, seed);
+}
+
+int RunParamsDigestTest() {
+    int failures = 0;
+    auto check = [&failures](bool ok, const char* what) {
+        std::printf("[%s] %s\n", ok ? "PASS" : "FAIL", what);
+        if (!ok) ++failures;
+    };
+
+    constexpr std::uint32_t seed = 2166136261u;
+    const std::uint32_t base = ParamsDigest(VehicleParams{}, seed);
+    check(DigestFromDirtyFrame(seed, 5) == base, "build signature ignores stack state");
+
+    VehicleParams tuned;
+    tuned.suspension.springKf += 1.f;
+    check(ParamsDigest(tuned, seed) != base, "build signature tracks a changed constant");
+
+    VehicleParams others;
+    others.capabilities = CapabilityBit(VehicleCapability::ActiveAero);
+    check(ParamsDigest(others, seed) != base, "build signature tracks a changed capability");
+    return failures;
+}
+
 int RunDriveTest(Config& config) {
     int failures = 0;
     std::printf("=== input recognizers ===\n");
     failures += RunInputTest();
+    std::printf("=== LAN build signature ===\n");
+    failures += RunParamsDigestTest();
     std::printf("=== differential component ===\n");
     failures += RunDifferentialTest();
     std::printf("=== tire align moment ===\n");

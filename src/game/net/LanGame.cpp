@@ -34,17 +34,20 @@ std::uint32_t Fnv1a(const void* data, std::size_t size, std::uint32_t seed = 216
 }
 
 // Build signature: catches "same map, different physics constants" pairs.
+// The digest is value-only (engine-side ParamsDigest); hashing the raw struct
+// here also covered its uninitialised tail padding, which let two machines
+// running the same exe disagree on the signature.
 std::uint32_t BuildSignature() {
-    VehicleParams params{};
-    std::uint32_t h = Fnv1a("apex-rush-lan-v1", 16);
-    h = Fnv1a(&params, sizeof(params), h);
-    return h;
+    return ParamsDigest(VehicleParams{}, Fnv1a("apex-rush-lan-v1", 16));
 }
 
 std::uint32_t HashMapFile(const std::string& mapName) {
     const std::string path = DataPath("assets/maps/" + mapName + ".rushmap");
     std::ifstream in(path, std::ios::binary);
-    if (!in) return Fnv1a(mapName.data(), mapName.size());
+    // No map on this machine = hash 0 (docs/online/protocol.md): the host
+    // rejects it with MAP MISSING OR DIFFERENT instead of admitting a car onto
+    // a track it cannot build.
+    if (!in) return 0;
     std::uint32_t h = 2166136261u;
     char buf[4096];
     while (in.read(buf, sizeof(buf)) || in.gcount() > 0) {
