@@ -131,6 +131,13 @@ if(UNIX AND NOT APPLE AND NOT EMSCRIPTEN)
     set(GLFW_BUILD_WAYLAND ${APEX_GLFW_WAYLAND} CACHE BOOL "" FORCE)
     set(GLFW_BUILD_X11 ON CACHE BOOL "" FORCE)
 endif()
+# Web needs WebGL2 (GLES 3.0): the engine's embedded shaders are `#version 300 es`
+# and raylib defaults to the ES 2.0 / WebGL1 backend, where they cannot compile
+# (the page aborts right after the window opens). ES 3.0 also makes raylib put
+# -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 on the link line.
+if(EMSCRIPTEN)
+    set(OPENGL_VERSION "ES 3.0" CACHE STRING "" FORCE)
+endif()
 # The patch is a CMake script, not PowerShell: the configure step has to work
 # on Linux too (pwsh is not part of a stock distro).
 FetchContent_Declare(
@@ -235,6 +242,9 @@ if(EMSCRIPTEN)
         -sALLOW_MEMORY_GROWTH=1
         -sFORCE_FILESYSTEM=1
         -sEXIT_RUNTIME=1
+        # nudge's solver runs on large stack frames (desktop gets /STACK:8388608);
+        # the wasm default is 64 KB.
+        -sSTACK_SIZE=8388608
         --shell-file ${raylib_SOURCE_DIR}/src/minshell.html
         --preload-file ${CMAKE_SOURCE_DIR}/assets/maps@/assets/maps
     )

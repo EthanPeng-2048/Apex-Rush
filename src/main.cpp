@@ -2965,7 +2965,12 @@ int main(int argc, char** argv) {
     // drains on the main thread. Tests/WASM keep PumpOnce inline instead.
     RaylibInputSource inputSource;
     InputSystem inputSystem(inputSource);
+#if !defined(__EMSCRIPTEN__)
+    // The web build has no pthreads (no COOP/COEP headers), and std::thread
+    // construction throws in -fno-exceptions mode, which aborts the page before
+    // the first frame. Game::UpdatePlayerInput pumps inline when not running.
     inputSystem.Start();
+#endif
 
     // Interactive runs get sound (miniaudio: WASAPI/DirectSound on Windows).
     // Tests and CLI capture paths stay silent and headless.
