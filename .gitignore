@@ -1,4 +1,4 @@
-build/
+build*/
 out/
 dist/
 .vs/
@@ -12,10 +12,6 @@ dist/
 config.ini
 config.rushconf
 .playwright-mcp/
-build-web/
-build-web-single/
 .deps/
-build-tools/
-build-static/
 *.rushmap
 *.rushconf

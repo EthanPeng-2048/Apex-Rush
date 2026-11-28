@@ -1,6 +1,7 @@
 #include "game/Track.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <vector>
 #include <cmath>
 

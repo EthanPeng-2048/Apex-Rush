@@ -1816,13 +1816,19 @@ void Game::ApplySettingStep(const std::string& id, int step) {
         return;
     }
     if (id == "audio_backend") {
-        static const char* kAudioBackends[4] = {"auto", "wasapi", "directsound", "winmm"};
+        // Names must exist in MiniaudioAudio's ParseBackend table.
+#if defined(_WIN32)
+        static const char* kAudioBackends[] = {"auto", "wasapi", "directsound", "winmm"};
+#else
+        static const char* kAudioBackends[] = {"auto", "alsa", "pulse"};
+#endif
+        constexpr int kCount = static_cast<int>(sizeof(kAudioBackends) / sizeof(kAudioBackends[0]));
         const std::string current = config_.GetString("audio", "backend", "auto");
         int idx = 0;
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < kCount; ++i) {
             if (current == kAudioBackends[i]) idx = i;
         }
-        idx = CyclePreset(idx, 4, step);
+        idx = CyclePreset(idx, kCount, step);
         config_.SetString("audio", "backend", kAudioBackends[idx]);
         if (audio_) audio_->SetBackend(kAudioBackends[idx]);
     }

@@ -22,6 +22,13 @@
       }
     },
     {
+      "name": "release-avx2",
+      "displayName": "Clang Release, x86-64-v3 baseline (AVX2+FMA)",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/build-avx2",
+      "cacheVariables": { "APEX_NATIVE_ARCH": "ON" }
+    },
+    {
       "name": "release-static",
       "displayName": "Clang Release + Static CRT (no VC++ redist on target)",
       "inherits": "release",
@@ -43,6 +50,30 @@
       "inherits": "debug",
       "binaryDir": "${sourceDir}/build-tools",
       "cacheVariables": { "APEX_BUILD_TOOLS": "ON" }
+    },
+    {
+      "name": "linux-base",
+      "hidden": true,
+      "displayName": "Linux (compiler from CC/CXX, defaults to the system cc/c++)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-linux",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
+    },
+    {
+      "name": "release-linux",
+      "displayName": "Linux Release (portable x86-64 baseline)",
+      "inherits": "linux-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "APEX_BUILD_TOOLS": "OFF"
+      }
+    },
+    {
+      "name": "release-linux-avx2",
+      "displayName": "Linux Release, x86-64-v3 baseline (AVX2+FMA)",
+      "inherits": "release-linux",
+      "binaryDir": "${sourceDir}/build-linux-avx2",
+      "cacheVariables": { "APEX_NATIVE_ARCH": "ON" }
     },
     {
       "name": "web",
@@ -69,9 +100,12 @@
   ],
   "buildPresets": [
     { "name": "release", "configurePreset": "release", "jobs": 32 },
+    { "name": "release-avx2", "configurePreset": "release-avx2", "jobs": 32 },
     { "name": "release-static", "configurePreset": "release-static", "jobs": 32 },
     { "name": "debug", "configurePreset": "debug", "jobs": 32 },
     { "name": "debug-tools", "configurePreset": "debug-tools", "jobs": 32 },
+    { "name": "release-linux", "configurePreset": "release-linux", "jobs": 32 },
+    { "name": "release-linux-avx2", "configurePreset": "release-linux-avx2", "jobs": 32 },
     { "name": "web", "configurePreset": "web", "jobs": 32 },
     { "name": "web-single", "configurePreset": "web-single", "jobs": 32 }
   ],
@@ -79,6 +113,11 @@
     {
       "name": "release",
       "configurePreset": "release",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "release-linux",
+      "configurePreset": "release-linux",
       "output": { "outputOnFailure": true }
     }
   ]
