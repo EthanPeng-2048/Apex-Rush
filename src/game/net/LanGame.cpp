@@ -16,6 +16,8 @@
 namespace apex {
 namespace {
 
+constexpr std::uint64_t kQueryIntervalMs = 1000;
+
 std::uint64_t NowMs() {
     using clock = std::chrono::steady_clock;
     return static_cast<std::uint64_t>(
@@ -80,6 +82,16 @@ const char* RejectText(net::RejectReason reason) {
 
 // ---------------------------------------------------------------- helpers ---
 
+std::unique_ptr<net::IRoomDiscovery> Game::MakeDiscovery() {
+    net::DiscoveryOptions opts;
+    opts.portSpan = static_cast<std::uint16_t>(
+        std::clamp(config_.GetInt("net", "discovery_port_span", net::kDiscoveryPortSpan), 1, 64));
+    opts.multicast = config_.GetBool("net", "discovery_multicast", true);
+    const std::uint16_t port = static_cast<std::uint16_t>(
+        std::clamp(config_.GetInt("net", "discovery_port", net::kDiscoveryPortDefault), 1, 65535));
+    return net::MakeUdpDiscovery(port, opts);
+}
+
 void Game::EnterLan() {
     if (netRole_ != NetRole::Offline) return;
     // Identity comes first: the seat layout is derived from player ids, so a
@@ -88,9 +100,7 @@ void Game::EnterLan() {
         EnterLanNameEntry();
         return;
     }
-    const std::uint16_t discoPort = static_cast<std::uint16_t>(
-        std::clamp(config_.GetInt("net", "discovery_port", net::kDiscoveryPortDefault), 1, 65535));
-    if (!netDiscovery_) netDiscovery_ = net::MakeUdpDiscovery(discoPort);
+    if (!netDiscovery_) netDiscovery_ = MakeDiscovery();
     (void)netDiscovery_->BeginSearch();
     lanUi_ = LanUi::Root;
     lanScreensStale_ = true;   // reopening LAN refocuses the room browser
@@ -205,14 +215,16 @@ void Game::LanStartHost(std::uint16_t roomCode) {
         LanStop("NETWORK INIT FAILED");
         return;
     }
-    if (!netDiscovery_) netDiscovery_ = net::MakeUdpDiscovery(netConfig_.discoveryPort);
+    if (!netDiscovery_) netDiscovery_ = MakeDiscovery();
     netSession_ = net::CreateHostSession(netConfig_, *netTransport_, *netDiscovery_);
     netRole_ = NetRole::Host;
-    std::printf("[net] hosting room %04u on udp %u (discovery %u) as %s\n",
+    const net::DiscoveryStatus disco =
+        netDiscovery_ ? netDiscovery_->Status() : net::DiscoveryStatus{};
+    std::printf("[net] hosting room %04u on udp %u (discovery %u%s) as %s\n",
                 static_cast<unsigned>(netConfig_.roomCode),
                 static_cast<unsigned>(netConfig_.gamePort),
-                static_cast<unsigned>(netConfig_.discoveryPort),
-                netConfig_.playerName.c_str());
+                static_cast<unsigned>(disco.boundPort),
+                disco.multicast ? "" : " broadcast-only", netConfig_.playerName.c_str());
     netCarCount_ = 1;
     netLobbyCount_ = 0;
     netRoster_ = net::Roster{};
@@ -243,7 +255,7 @@ void Game::LanStartClient(std::uint16_t roomCode, const net::Endpoint& host) {
         LanStop("NETWORK INIT FAILED");
         return;
     }
-    if (!netDiscovery_) netDiscovery_ = net::MakeUdpDiscovery(netConfig_.discoveryPort);
+    if (!netDiscovery_) netDiscovery_ = MakeDiscovery();
     netSession_ = net::CreateClientSession(netConfig_, *netTransport_, *netDiscovery_, host);
     netRole_ = NetRole::Client;
     std::printf("[net] joining room %04u at %u.%u.%u.%u:%u as %s\n",
@@ -583,8 +595,21 @@ void Game::SyncLanScreen() {
             s.widgets.push_back({.kind = UiKind::Button, .id = "room", .label = entry, .size = 26});
         }
         if (s.widgets.empty()) {
-            s.widgets.push_back({.kind = UiKind::Label,
-                                 .label = "NO ROOMS FOUND (check the code / firewall)", .size = 22});
+            // "No rooms" has three different causes; show which one it is, so
+            // the player is not sent after a firewall that was never at fault.
+            const net::DiscoveryStatus status =
+                netDiscovery_ ? netDiscovery_->Status() : net::DiscoveryStatus{};
+            char entry[128];
+            if (status.boundPort == 0) {
+                std::snprintf(entry, sizeof(entry), "NO ROOMS - DISCOVERY SOCKET FAILED");
+            } else {
+                std::snprintf(entry, sizeof(entry), "NO ROOMS FOUND  UDP %u %s  TX %u RX %u",
+                              static_cast<unsigned>(status.boundPort),
+                              status.multicast ? "MCAST" : "BCAST",
+                              static_cast<unsigned>(status.sent),
+                              static_cast<unsigned>(status.received));
+            }
+            s.widgets.push_back({.kind = UiKind::Label, .label = entry, .size = 22});
         }
         // The list is discovered, so its length moves under the focus: keep the
         // cursor inside it instead of trusting last frame's index.
@@ -632,8 +657,8 @@ void Game::LanConfirmRoomCode() {
         LanStartHost(code);
         return;
     }
-    if (netDiscovery_) netDiscovery_->SendQuery(code);
     lanRooms_.clear();
+    lanQueryNextMs_ = 0;   // UpdateLan sends the first query on the next frame
     lanUi_ = LanUi::RoomList;
 }
 
@@ -649,10 +674,18 @@ void Game::UpdateLan() {
 
     // Discovery polling and room filtering are state work, not screen work.
     if (lanUi_ == LanUi::RoomList) {
-        if (netDiscovery_) netDiscovery_->Poll(NowMs());
+        const std::uint16_t code = LanRoomCode();
+        // One query is one point of failure: a dropped datagram - or a host
+        // whose reply crosses a filtered link - leaves the browser empty
+        // forever. While the player is looking, ask once a second.
+        const std::uint64_t now = NowMs();
+        if (netDiscovery_ && now >= lanQueryNextMs_) {
+            lanQueryNextMs_ = now + kQueryIntervalMs;
+            netDiscovery_->SendQuery(code);
+        }
+        if (netDiscovery_) netDiscovery_->Poll(now);
         const std::span<const net::RoomInfo> rooms =
             netDiscovery_ ? netDiscovery_->Rooms() : std::span<const net::RoomInfo>{};
-        const std::uint16_t code = LanRoomCode();
         lanRooms_.clear();
         for (const net::RoomInfo& room : rooms) {
             if (room.announce.protocolVersion != net::kProtocolVersion) continue;

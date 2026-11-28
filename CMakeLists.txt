@@ -211,7 +211,8 @@ target_link_libraries(rpc-ray-index-tests PRIVATE rush-physics-core)
 add_test(NAME rpc-ray-index COMMAND rpc-ray-index-tests)
 
 if(WIN32)
-    target_link_libraries(apex-rush PRIVATE winmm)
+    # iphlpapi: discovery reads the interface table to derive subnet broadcasts.
+    target_link_libraries(apex-rush PRIVATE winmm iphlpapi)
     # nudge's solver uses large stack frames (upstream builds with 8 MB too).
     target_link_options(apex-rush PRIVATE "LINKER:/STACK:8388608")
 elseif(NOT EMSCRIPTEN)

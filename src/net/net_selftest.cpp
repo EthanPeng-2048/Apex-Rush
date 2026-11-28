@@ -5,9 +5,11 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 #include "net/discovery.h"
+#include "net/discovery_plan.h"
 #include "net/identity.h"
 #include "net/protocol/wire.h"
 #include "net/roster.h"
@@ -536,6 +538,89 @@ void TestRealSockets() {
     Check(snapSeen, "snapshot + self block over real UDP");
 }
 
+void TestDiscoveryPlan() {
+    using namespace apex::net;
+    std::printf("[discovery plan]\n");
+
+    // Port preference: configured port first, then the rest of the range.
+    const std::vector<std::uint16_t> ports = PortCandidates(51231, 4);
+    Check(ports.size() == 4, "port range size");
+    Check(ports.front() == 51231 && ports.back() == 51234, "port range bounds");
+    Check(std::is_sorted(ports.begin(), ports.end()), "port range ascending");
+    Check(PortCandidates(51231, 0).empty(), "empty span yields no ports");
+    // A range that would wrap past 65535 stops there instead of wrapping onto
+    // low ports nobody is listening on.
+    Check(PortCandidates(65534, 4).size() == 2, "port range clamps at 65535");
+
+    // Targets: zero dropped, duplicates collapsed, one entry per datagram.
+    const std::uint32_t raw[] = {0xFFFFFFFFu, 0xC0A801FFu, 0xC0A801FFu, 0, 0x7F000001u,
+                                 0xC0A80166u};
+    const std::vector<std::uint32_t> merged = MergeTargets(raw);
+    Check(merged.size() == 4, "targets de-duplicated");
+    Check(std::is_sorted(merged.begin(), merged.end()), "targets sorted");
+    Check(std::find(merged.begin(), merged.end(), 0u) == merged.end(), "0.0.0.0 dropped");
+    Check(std::find(merged.begin(), merged.end(), 0xFFFFFFFFu) != merged.end(),
+          "limited broadcast kept");
+    Check(std::find(merged.begin(), merged.end(), 0x7F000001u) != merged.end(),
+          "loopback kept");
+}
+
+// The discovery layer end to end over real sockets, on one machine: the second
+// instance must not be blocked by the first (that is the whole point of the
+// port range) and must see the room within a couple of announce intervals.
+void TestRealDiscovery() {
+    using namespace apex::net;
+    std::printf("[real discovery]\n");
+
+    auto host = MakeUdpDiscovery(kDiscoveryPortDefault);
+    auto searcher = MakeUdpDiscovery(kDiscoveryPortDefault);
+    Check(host->BeginSearch().has_value(), "host discovery socket");
+    Check(searcher->BeginSearch().has_value(), "searcher discovery socket");
+    Check(host->Status().boundPort != 0, "host bound a port");
+    Check(searcher->Status().boundPort != 0, "searcher bound a port");
+    const auto inRange = [](const DiscoveryStatus& s) {
+        return s.fallbackPort || (s.boundPort >= kDiscoveryPortDefault &&
+                                  s.boundPort < kDiscoveryPortDefault + kDiscoveryPortSpan);
+    };
+    Check(inRange(host->Status()) && inRange(searcher->Status()), "ports come from the range");
+
+    AnnouncePacket ad;
+    ad.roomCode = 4321;
+    ad.gamePort = kGamePortDefault;
+    ad.mapName = "test_circuit";
+    ad.hostName = "SELFTEST-HOST";
+    ad.playerId = apex::MakePlayerId("SELFTEST-HOST");
+    Check(host->Advertise(ad).has_value(), "host advertising");
+    searcher->SendQuery(ad.roomCode);
+
+    using clock = std::chrono::steady_clock;
+    const auto start = clock::now();
+    bool found = false;
+    while (!found && std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - start)
+                            .count() < 4000) {
+        const auto now = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(clock::now().time_since_epoch())
+                .count());
+        host->Poll(now);
+        searcher->Poll(now);
+        for (const RoomInfo& room : searcher->Rooms()) {
+            if (room.announce.roomCode != ad.roomCode) continue;
+            if (room.announce.playerId != ad.playerId) continue;
+            found = room.host.ipv4 != 0 && room.host.port == ad.gamePort;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    Check(found, "announce reaches a second instance on this machine");
+    Check(searcher->Status().received > 0, "searcher counted an announcement");
+    // The room must be one row, not one per interface it arrived on.
+    const auto rooms = searcher->Rooms();
+    const auto dupes = std::count_if(rooms.begin(), rooms.end(), [&](const RoomInfo& r) {
+        return r.announce.roomCode == ad.roomCode && r.announce.playerId == ad.playerId;
+    });
+    Check(dupes == 1, "one row per room despite the multi-target fan-out");
+    host->StopAdvertising();
+}
+
 }  // namespace
 
 namespace apex {
@@ -543,6 +628,8 @@ namespace apex {
 int RunNetSelfTest() {
     std::printf("apex-rush net self-test\n");
     TestCodec();
+    TestDiscoveryPlan();
+    TestRealDiscovery();
     TestIdentityAndSeats();
     TestSessions();
     TestRealSockets();
@@ -552,6 +639,73 @@ int RunNetSelfTest() {
     }
     std::printf("net self-test: %d FAILURE(S)\n", g_failures);
     return 1;
+}
+
+int RunDiscoveryProbe(int seconds, int roomCode) {
+    using namespace apex::net;
+    using clock = std::chrono::steady_clock;
+
+    auto disco = MakeUdpDiscovery(kDiscoveryPortDefault);
+    if (!disco->BeginSearch().has_value()) {
+        std::printf("probe: cannot open a discovery socket\n");
+        return 1;
+    }
+    const DiscoveryStatus opened = disco->Status();
+    std::printf("probe: bound udp %u%s, multicast %s, range %u-%u\n",
+                static_cast<unsigned>(opened.boundPort),
+                opened.fallbackPort ? " (range busy, ephemeral)" : "",
+                opened.multicast ? "joined" : "off",
+                static_cast<unsigned>(kDiscoveryPortDefault),
+                static_cast<unsigned>(kDiscoveryPortDefault + kDiscoveryPortSpan - 1));
+
+    if (roomCode > 0) {
+        AnnouncePacket ad;
+        ad.roomCode = static_cast<std::uint16_t>(roomCode);
+        ad.gamePort = kGamePortDefault;
+        ad.mapName = "probe";
+        ad.hostName = "PROBE-HOST";
+        ad.playerId = apex::MakePlayerId("PROBE-HOST");
+        (void)disco->Advertise(ad);
+        std::printf("probe: advertising room %04d for %d s\n", roomCode, seconds);
+    } else {
+        std::printf("probe: searching for %d s\n", seconds);
+    }
+
+    std::vector<PlayerId> seen;
+    std::uint64_t nextQueryMs = 0;
+    bool found = false;
+    const auto start = clock::now();
+    for (;;) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            clock::now() - start);
+        if (elapsed.count() >= static_cast<long long>(seconds) * 1000) break;
+        const auto now = static_cast<std::uint64_t>(elapsed.count());
+        if (now >= nextQueryMs) {
+            nextQueryMs = now + 1000;
+            disco->SendQuery(static_cast<std::uint16_t>(std::max(roomCode, 0)));
+        }
+        disco->Poll(now);
+        for (const RoomInfo& room : disco->Rooms()) {
+            if (std::find(seen.begin(), seen.end(), room.announce.playerId) != seen.end()) continue;
+            seen.push_back(room.announce.playerId);
+            found = true;
+            std::printf("probe: room %04u '%s' map=%s %u/%u at %u.%u.%u.%u:%u\n",
+                        static_cast<unsigned>(room.announce.roomCode),
+                        room.announce.hostName.c_str(), room.announce.mapName.c_str(),
+                        static_cast<unsigned>(room.announce.players),
+                        static_cast<unsigned>(room.announce.maxPlayers),
+                        (room.host.ipv4 >> 24) & 0xFF, (room.host.ipv4 >> 16) & 0xFF,
+                        (room.host.ipv4 >> 8) & 0xFF, room.host.ipv4 & 0xFF,
+                        static_cast<unsigned>(room.host.port));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    const DiscoveryStatus end = disco->Status();
+    std::printf("probe: sent %u, received %u, failures %u -> %s\n", end.sent, end.received,
+                end.sendFailures, found ? "rooms found" : "NO ROOM SEEN");
+    disco->StopAdvertising();
+    return found ? 0 : 2;
 }
 
 }  // namespace apex

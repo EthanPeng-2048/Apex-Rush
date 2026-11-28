@@ -313,6 +313,19 @@ constexpr std::uint16_t kGamePortDefault = 51230;
 constexpr std::uint8_t kDiscoAnnounce = 1;
 constexpr std::uint8_t kDiscoQuery = 2;
 
+// Discovery occupies a port *range*, not one port. Two instances of this game
+// on one machine must both be able to listen, and the OS can only share a UDP
+// port between processes for multicast - the broadcast/unicast path is
+// exclusive (Winsock gives the last binder the port, WSAEACCES to the loser;
+// Linux SO_REUSEPORT load-balances unicast). So each instance takes the first
+// free port in the range and hosts fan their announcements across all of it.
+constexpr std::uint16_t kDiscoveryPortSpan = 8;
+// One rendezvous group for the whole LAN. Multicast is the channel where every
+// listener on a host receives its own copy, so it carries the normal 1 Hz
+// announce; the broadcast fan-out over the range is the fallback for networks
+// that filter group traffic.
+constexpr char kDiscoveryMulticastGroup[] = "239.255.72.31";
+
 struct AnnouncePacket {
     std::uint16_t roomCode = 0;
     std::uint16_t gamePort = 0;

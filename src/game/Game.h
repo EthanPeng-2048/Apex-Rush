@@ -315,6 +315,7 @@ private:
     void LanStartHost(std::uint16_t roomCode);
     void LanStartClient(std::uint16_t roomCode, const net::Endpoint& host);
     void LanStop(const std::string& message);
+    std::unique_ptr<net::IRoomDiscovery> MakeDiscovery();   // config -> discovery options
     void LanTick();                       // discovery + session pump + events
     void LanHandleEvents();
     void LanRequestRaceLoad();            // host: freeze the roster + build the race
@@ -521,6 +522,7 @@ private:
     NetRole lanLobbyRole_ = NetRole::Offline;   // role the lobby rows were built for
     LanRole lanPendingRole_ = LanRole::None;    // what a confirmed room code does
     std::vector<net::RoomInfo> lanRooms_;       // last filtered discovery result
+    std::uint64_t lanQueryNextMs_ = 0;          // next discovery query (room browser)
 
     // Open the screen a phase change needs (focus reset is a screen open).
     void SyncUiPhase();

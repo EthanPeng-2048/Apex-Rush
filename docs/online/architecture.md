@@ -173,4 +173,6 @@ A1 满房 60 s 无掉线 · A2 `RaceEnd` 逐字段一致 · A3 带宽 ≤15 / �
 
 ## 11. 配置（`[net]`）
 
-`player_name` · `room_code` · `input_hz`(60) · `snapshot_hz`(30) · `interp_buffer_ms`(40，自适应上限 150) · `history_ticks`(32) · `smooth_tau_ms`(80) · `snap_threshold_m`(2.0) · `max_players`(8) · `game_port`(45998) · `discovery_port`(45999) · `enable`(true)。
+`player_name` · `room_code` · `input_hz`(60) · `snapshot_hz`(30) · `interp_buffer_ms`(40，自适应上限 150) · `history_ticks`(32) · `smooth_tau_ms`(80) · `snap_threshold_m`(2.0) · `max_players`(8) · `game_port`(51230) · `discovery_port`(51231) · `discovery_port_span`(8) · `discovery_multicast`(true) · `enable`(true)。
+
+发现端口是一段而非一个：实例绑定 `discovery_port … discovery_port + discovery_port_span - 1` 里的首个空闲端口，主机把 `ANNOUNCE` 同时发到组播组（`239.255.72.31:discovery_port`）与每个网卡的子网广播/网卡地址上的段内全部端口。端口被占用、组播被过滤都不再等于"找不到房间"，真实端口与收发计数显示在房间列表上（见 ADR-07a）。`--net-disco-probe <秒> [房间码]` 可无窗口复现整条发现链路。

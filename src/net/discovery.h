@@ -22,6 +22,27 @@ struct RoomInfo {
     std::uint64_t lastSeenMs = 0;
 };
 
+// What the socket layer actually achieved. Discovery used to fail silently -
+// a bind() that the OS refused looked exactly like "nobody is hosting", which
+// sends the player hunting for a firewall that was never the problem. The UI
+// shows these numbers so "no rooms" can be told apart from "no socket".
+struct DiscoveryStatus {
+    std::uint16_t boundPort = 0;    // 0 = no socket at all
+    bool multicast = false;         // joined the rendezvous group
+    bool fallbackPort = false;      // the whole range was taken: ephemeral port
+    std::uint32_t sent = 0;         // datagrams handed to sendto()
+    std::uint32_t received = 0;     // announcements accepted
+    std::uint32_t sendFailures = 0;
+};
+
+// How much of the network the discovery layer is allowed to use. Both knobs
+// exist for the one case the defaults cannot cover: a machine where group
+// traffic is filtered outright.
+struct DiscoveryOptions {
+    std::uint16_t portSpan = kDiscoveryPortSpan;
+    bool multicast = true;
+};
+
 class IRoomDiscovery {
 public:
     virtual ~IRoomDiscovery() = default;
@@ -40,9 +61,14 @@ public:
     // Live rooms (announcements seen within the TTL). Filtering by room code is
     // the caller's job (it also drives the UI).
     virtual std::span<const RoomInfo> Rooms() const = 0;
+
+    // What the socket layer actually achieved, for the room browser's
+    // diagnostics line and stderr.
+    virtual DiscoveryStatus Status() const = 0;
 };
 
-std::unique_ptr<IRoomDiscovery> MakeUdpDiscovery(std::uint16_t discoveryPort);
+std::unique_ptr<IRoomDiscovery> MakeUdpDiscovery(std::uint16_t discoveryPort,
+                                                DiscoveryOptions opts = {});
 std::unique_ptr<IRoomDiscovery> MakeNullDiscovery();
 
 }  // namespace apex::net

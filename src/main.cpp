@@ -2569,6 +2569,8 @@ int main(int argc, char** argv) {
     double stressSeconds = 20.0;
     const char* stressEngine = "rpc";
     bool netSelfTest = false;
+    int discoProbeSeconds = -1;
+    int discoProbeRoom = 0;
     bool uiSelfTest = false;
     bool netAuto = false;
     int netSeconds = 0;
@@ -2583,6 +2585,10 @@ int main(int argc, char** argv) {
             playerName = argv[++i];
         } else if (std::strcmp(argv[i], "--net-selftest") == 0) {
             netSelfTest = true;
+        } else if (std::strcmp(argv[i], "--net-disco-probe") == 0) {
+            discoProbeSeconds = 10;
+            if (i + 1 < argc && argv[i + 1][0] != '-') discoProbeSeconds = std::atoi(argv[++i]);
+            if (i + 1 < argc && argv[i + 1][0] != '-') discoProbeRoom = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--ui-selftest") == 0) {
             uiSelfTest = true;
         } else if (std::strcmp(argv[i], "--net-auto") == 0) {
@@ -2660,6 +2666,9 @@ int main(int argc, char** argv) {
     // has no pthreads in our build (no COOP/COEP) — always serial there.
     if (netSelfTest) {
         return RunNetSelfTest();
+    }
+    if (discoProbeSeconds >= 0) {
+        return RunDiscoveryProbe(discoProbeSeconds, discoProbeRoom);
     }
     if (uiSelfTest) {
         return RunUiSelfTest();
