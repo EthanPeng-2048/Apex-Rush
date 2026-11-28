@@ -1,4 +1,4 @@
-﻿# pack-single-html.ps1 — combine Emscripten SINGLE_FILE html + .data (+ FileSaver) into one offline HTML.
+# pack-single-html.ps1 — combine Emscripten SINGLE_FILE html + .data (+ FileSaver) into one offline HTML.
 # Does not modify game sources; reads build-web outputs and writes dist/.
 param(
   [string]$BuildDir = (Join-Path $PSScriptRoot "..\build-web"),
@@ -10,6 +10,13 @@ $htmlPath = Join-Path $BuildDir "apex-rush.html"
 $dataPath = Join-Path $BuildDir "apex-rush.data"
 if (-not (Test-Path $htmlPath)) { throw "missing $htmlPath" }
 if (-not (Test-Path $dataPath)) { throw "missing $dataPath" }
+
+# dist/ is also where the FileSaver cache lands, so it has to exist before the
+# first download — a clean checkout has no dist/ at all.
+$outDir = Split-Path -Parent $OutFile
+if ($outDir -and -not (Test-Path $outDir)) { New-Item -ItemType Directory -Force -Path $outDir | Out-Null }
+$fsDir = Split-Path -Parent $FileSaverPath
+if ($fsDir -and -not (Test-Path $fsDir)) { New-Item -ItemType Directory -Force -Path $fsDir | Out-Null }
 
 $html = [System.IO.File]::ReadAllText($htmlPath)
 $dataB64 = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($dataPath))
